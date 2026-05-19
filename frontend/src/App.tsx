@@ -303,7 +303,7 @@ export default function App() {
   const spinnerLabel = isScanOnly ? 'Generating floor plan…' : 'Aligning scan to plan…';
 
   return (
-    <div className="grid h-screen" style={{ gridTemplateColumns: '1fr 380px' }}>
+    <div className="grid h-full" style={{ gridTemplateColumns: '1fr 380px' }}>
       {/* 3D Viewer */}
       <div className="relative overflow-hidden">
         <ViewerScene onReady={(s) => { sceneRef.current = s; }} />

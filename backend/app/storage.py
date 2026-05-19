@@ -40,6 +40,21 @@ def init_db() -> None:
                 elapsed_s      REAL
             )
         """)
+        # Vectorize jobs live in a separate table from alignment jobs — they
+        # have different inputs, different statuses, and different result
+        # payloads.  Sharing one table would be a leaky abstraction.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vectorize_jobs (
+                job_id        TEXT PRIMARY KEY,
+                status        TEXT NOT NULL DEFAULT 'queued',
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                scan_filename TEXT NOT NULL DEFAULT '',
+                params_json   TEXT NOT NULL DEFAULT '{}',
+                result_json   TEXT,
+                error_message TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -152,6 +167,100 @@ def results_dir(job_id: str) -> Path:
     p = get_settings().results_dir / job_id
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ── Vectorize-job CRUD ────────────────────────────────────────────────────────
+# Mirrors the alignment-job helpers above but targets the vectorize_jobs table.
+# Kept side-by-side so the two surfaces never accidentally share state.
+
+def create_vectorize_job(job_id: str, scan_filename: str, params: dict) -> None:
+    now = _now()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO vectorize_jobs "
+            "(job_id, status, created_at, updated_at, scan_filename, params_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, "queued", now, now, scan_filename, json.dumps(params)),
+        )
+        conn.commit()
+
+
+def update_vectorize_status(
+    job_id: str, status: str, error: Optional[str] = None,
+) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE vectorize_jobs "
+            "SET status = ?, updated_at = ?, error_message = ? WHERE job_id = ?",
+            (status, _now(), error, job_id),
+        )
+        conn.commit()
+
+
+def update_vectorize_result(job_id: str, result: dict) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE vectorize_jobs "
+            "SET status = ?, updated_at = ?, result_json = ? WHERE job_id = ?",
+            ("complete", _now(), json.dumps(result), job_id),
+        )
+        conn.commit()
+
+
+def update_vectorize_params(job_id: str, params: dict) -> None:
+    """Replace the stored params (used by reprocess)."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE vectorize_jobs "
+            "SET params_json = ?, updated_at = ?, status = ?, "
+            "    result_json = NULL, error_message = NULL "
+            "WHERE job_id = ?",
+            (json.dumps(params), _now(), "queued", job_id),
+        )
+        conn.commit()
+
+
+def load_vectorize_job(job_id: str) -> dict:
+    """Return a flat dict for the API layer to serialise."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM vectorize_jobs WHERE job_id = ?", (job_id,),
+        ).fetchone()
+    if row is None:
+        raise KeyError(f"Vectorize job {job_id} not found")
+
+    d = dict(row)
+    return {
+        "job_id":         d["job_id"],
+        "status":         d["status"],
+        "created_at":     d["created_at"],
+        "updated_at":     d["updated_at"],
+        "scan_filename":  d["scan_filename"],
+        "params":         json.loads(d.get("params_json") or "{}"),
+        "result":         json.loads(d["result_json"]) if d.get("result_json") else None,
+        "error_message":  d.get("error_message"),
+    }
+
+
+def load_vectorize_result(job_id: str) -> dict:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT result_json FROM vectorize_jobs WHERE job_id = ?", (job_id,),
+        ).fetchone()
+    if row is None or row["result_json"] is None:
+        raise KeyError(f"No result for vectorize job {job_id}")
+    return json.loads(row["result_json"])
+
+
+def list_vectorize_jobs(limit: int = 50) -> list[dict]:
+    """Recent vectorize jobs, newest first.  Used by the history panel."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT job_id, status, created_at, updated_at, scan_filename, error_message "
+            "FROM vectorize_jobs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Storage cleanup ───────────────────────────────────────────────────────────

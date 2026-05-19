@@ -12,6 +12,7 @@ from .config import get_settings
 from .storage import init_db, cleanup_old_jobs
 from .routes.jobs import router as jobs_router
 from .routes.export import router as export_router
+from .routes.vectorize import router as vectorize_router
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ app.add_middleware(
 
 app.include_router(jobs_router)
 app.include_router(export_router)
+app.include_router(vectorize_router)
 
 
 @app.get("/health")
