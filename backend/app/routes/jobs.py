@@ -30,31 +30,40 @@ router = APIRouter(prefix="/api/jobs")
 async def create_job_endpoint(
     bg: BackgroundTasks,
     plan: UploadFile = File(...),
-    scan: UploadFile = File(...),
+    scans: list[UploadFile] = File(...),
     band_low_m: float = Form(default=0.75),
     band_high_m: float = Form(default=1.80),
 ):
-    """Upload a plan + scan, kick off the alignment pipeline."""
+    """Upload a plan + one or more scan files, kick off the alignment pipeline."""
+    if not scans:
+        raise HTTPException(400, "At least one scan file is required")
+
     job_id = str(uuid.uuid4())
     upload_dir = uploads_dir(job_id)
 
-    # Save uploaded files
+    # Save plan
     plan_path = upload_dir / _safe_filename(plan.filename or "plan.dxf")
-    scan_path  = upload_dir / _safe_filename(scan.filename  or "scan.ply")
-
     plan_content = await plan.read()
-    scan_content = await scan.read()
-
     if len(plan_content) == 0:
         raise HTTPException(400, "Plan file is empty")
-    if len(scan_content) == 0:
-        raise HTTPException(400, "Scan file is empty")
-
     plan_path.write_bytes(plan_content)
-    scan_path.write_bytes(scan_content)
 
-    create_job(job_id, scan_path.name, plan_path.name)
-    bg.add_task(run_pipeline, job_id, scan_path, plan_path, band_low_m, band_high_m)
+    # Save all scan files
+    scan_paths: list[Path] = []
+    scan_filenames: list[str] = []
+    for i, scan_file in enumerate(scans):
+        content = await scan_file.read()
+        if len(content) == 0:
+            raise HTTPException(400, f"Scan file {scan_file.filename!r} is empty")
+        # Prefix with index to avoid filename collisions
+        safe_name = f"{i:02d}_{_safe_filename(scan_file.filename or f'scan_{i}.laz')}"
+        path = upload_dir / safe_name
+        path.write_bytes(content)
+        scan_paths.append(path)
+        scan_filenames.append(safe_name)
+
+    create_job(job_id, scan_filenames, plan_path.name)
+    bg.add_task(run_pipeline, job_id, scan_paths, plan_path, band_low_m, band_high_m)
 
     return JobCreate(job_id=job_id, status=JobStatus.queued)
 
@@ -236,11 +245,21 @@ def _find_plan_file(job_id: str) -> Path:
 
 
 def _find_scan_file(job_id: str) -> Path:
+    """Return the first scan file found (used by manual-transform endpoint)."""
     upload_dir = uploads_dir(job_id)
-    for f in upload_dir.iterdir():
+    for f in sorted(upload_dir.iterdir()):
         if f.suffix.lower() in (".las", ".laz", ".ply", ".e57"):
             return f
     raise HTTPException(404, "Scan file not found for this job")
+
+
+def _find_scan_files(job_id: str) -> list[Path]:
+    """Return all scan files for this job."""
+    upload_dir = uploads_dir(job_id)
+    return sorted(
+        f for f in upload_dir.iterdir()
+        if f.suffix.lower() in (".las", ".laz", ".ply", ".e57")
+    )
 
 
 def _safe_filename(name: str) -> str:

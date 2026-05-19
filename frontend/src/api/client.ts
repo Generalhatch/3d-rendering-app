@@ -67,6 +67,8 @@ export interface FullResult {
   plan_bounds: [number, number, number, number];
   overlay_png?: string;
   elapsed_s?: number;
+  num_scans?: number;
+  merge_strategy?: string;
 }
 
 export interface ProgressEvent {
@@ -92,10 +94,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  createJob: async (planFile: File, scanFile: File, bandLow = 0.75, bandHigh = 1.80): Promise<JobCreate> => {
+  createJob: async (planFile: File, scanFiles: File | File[], bandLow = 0.75, bandHigh = 1.80): Promise<JobCreate> => {
     const fd = new FormData();
     fd.append('plan', planFile);
-    fd.append('scan', scanFile);
+    const scansArray = Array.isArray(scanFiles) ? scanFiles : [scanFiles];
+    for (const scan of scansArray) {
+      fd.append('scans', scan);
+    }
     fd.append('band_low_m', String(bandLow));
     fd.append('band_high_m', String(bandHigh));
     return request<JobCreate>('/jobs', { method: 'POST', body: fd });

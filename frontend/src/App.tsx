@@ -126,12 +126,12 @@ export default function App() {
     }
   }, [setFullResult, setRooms, setFixtures, setPhase]);
 
-  const handleFilesReady = useCallback(async (planFile: File, scanFile: File) => {
+  const handleFilesReady = useCallback(async (planFile: File, scanFiles: File[]) => {
     reset();
     setPhase('uploading');
 
     try {
-      const { job_id } = await api.createJob(planFile, scanFile);
+      const { job_id } = await api.createJob(planFile, scanFiles);
       setJobId(job_id);
       setPhase('processing');
 

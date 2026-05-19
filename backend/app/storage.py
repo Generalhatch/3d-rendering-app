@@ -27,6 +27,7 @@ def init_db() -> None:
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
                 scan_filename  TEXT NOT NULL DEFAULT '',
+                scan_filenames TEXT NOT NULL DEFAULT '[]',
                 plan_filename  TEXT NOT NULL DEFAULT '',
                 error_message  TEXT,
                 result_json    TEXT,
@@ -40,13 +41,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def create_job(job_id: str, scan_filename: str, plan_filename: str) -> JobDetail:
+def create_job(job_id: str, scan_filenames: list[str], plan_filename: str) -> JobDetail:
     now = _now()
+    primary = scan_filenames[0] if scan_filenames else ""
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO jobs (job_id, status, created_at, updated_at, scan_filename, plan_filename) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (job_id, JobStatus.queued, now, now, scan_filename, plan_filename),
+            "INSERT INTO jobs (job_id, status, created_at, updated_at, scan_filename, scan_filenames, plan_filename) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (job_id, JobStatus.queued, now, now, primary, json.dumps(scan_filenames), plan_filename),
         )
         conn.commit()
     return load_job(job_id)
@@ -91,6 +93,7 @@ def load_job(job_id: str) -> JobDetail:
         created_at=d["created_at"],
         updated_at=d["updated_at"],
         scan_filename=d["scan_filename"],
+        scan_filenames=json.loads(d.get("scan_filenames") or "[]"),
         plan_filename=d["plan_filename"],
         error_message=d.get("error_message"),
         result=result,

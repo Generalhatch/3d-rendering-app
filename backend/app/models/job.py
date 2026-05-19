@@ -39,6 +39,7 @@ class JobDetail(BaseModel):
     created_at: str
     updated_at: str
     scan_filename: str
+    scan_filenames: list[str] = []
     plan_filename: str
     error_message: Optional[str] = None
     result: Optional[AlignmentResultSchema] = None

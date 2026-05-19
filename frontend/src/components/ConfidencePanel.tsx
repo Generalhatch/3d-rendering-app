@@ -62,6 +62,9 @@ export function ConfidencePanel() {
             <div>{a.residual_rmse_mm.toFixed(1)} mm residual</div>
             <div>{result.rooms.length} rooms</div>
             <div>{result.fixtures.length} fixtures</div>
+            {result.num_scans && result.num_scans > 1 && (
+              <div className="text-rose-300">{result.num_scans} scans merged</div>
+            )}
           </div>
         </div>
 
