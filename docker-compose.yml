@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - AI_REVIEW_MODEL=${AI_REVIEW_MODEL:-anthropic/claude-sonnet-4-6}
+      - DATA_DIR=/app/data
+      - UPLOADS_DIR=/app/data/uploads
+      - ARTIFACTS_DIR=/app/data/artifacts
+      - RESULTS_DIR=/app/data/results
+      - DB_PATH=/app/data/jobs.sqlite
+      - CORS_ORIGINS=http://localhost:5173
+    depends_on: []
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:80"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
