@@ -1,0 +1,17 @@
+{
+  "name": "alignai",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently --names \"BE,FE\" --prefix-colors \"cyan,magenta\" --kill-others-on-fail \"npm run dev:be\" \"npm run dev:fe\"",
+    "dev:be": "cd backend && .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app --log-level info",
+    "dev:fe": "cd frontend && npm run dev",
+    "setup:be": "cd backend && python3 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -e '.[dev]'",
+    "setup:fe": "cd frontend && npm install",
+    "setup": "npm run setup:be && npm run setup:fe",
+    "clean:data": "rm -rf data/uploads/* data/artifacts/* data/results/* data/jobs.sqlite && echo 'Job data cleared.'",
+    "disk": "df -h / && echo '' && du -sh data/ backend/.venv/"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

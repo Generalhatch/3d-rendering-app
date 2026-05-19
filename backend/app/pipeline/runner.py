@@ -1,22 +1,37 @@
-"""Main pipeline runner: orchestrates all stages and emits SSE progress."""
+"""Main pipeline runner: orchestrates all stages and emits SSE progress.
+
+Two modes:
+  - WITH plan (plan_path is not None): full alignment pipeline.
+  - SCAN-ONLY (plan_path is None): merge scans, detect walls, generate a
+    synthetic 2D floor outline from the wall planes, detect fixtures.
+    Alignment is identity (scan is already in its own coordinate frame).
+    ~10–15s faster than aligned mode.
+"""
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
 import numpy as np
 
+from ..limits import JOB_SEMAPHORE
 from ..models.job import JobStatus
 from ..storage import (
     uploads_dir, artifacts_dir, results_dir,
-    update_job_status, update_job_result,
+    load_result_json, update_job_status, update_job_result,
 )
 from ..sse import publish
 from .ingest import write_decimated_ply
 from .merge import merge_scans
-from .slicing import extract_wall_band
+from .slicing import detect_all_floors, detect_floor, extract_wall_band
+from .segment import extract_wall_planes_with_fallback
 from .align import align_scan_to_plan
 from .rooms import extract_rooms, extract_wall_lines, compute_match_quality
+from .scanplan import (
+    generate_plan_from_walls, generate_plan_from_projection,
+    generate_rooms_from_scan, generate_building_outline,
+)
 from .fixtures import detect_fixtures
 from .confidence import compute_confidence_pct
 from .export import write_aligned_json, write_aligned_dxf
@@ -29,184 +44,314 @@ def _emit(job_id: str, stage: str, message: str, progress: float) -> None:
 
 def run_pipeline(
     job_id: str,
-    scan_paths: list[Path],        # ← now a list (one or many scan files)
-    plan_path: Path,
-    band_low_m: float = 0.75,
-    band_high_m: float = 1.80,
+    scan_paths: list[Path],
+    plan_path: Path | None,           # None = scan-only mode
+    band_low_m: float = 1.00,
+    band_high_m: float = 2.00,
 ) -> None:
-    """Full pipeline: ingest → merge → align → rooms → fixtures → export."""
+    """Full pipeline with optional DXF plan."""
     t0 = time.time()
+    scan_only = plan_path is None
 
     try:
         update_job_status(job_id, JobStatus.processing)
         artifact_dir = artifacts_dir(job_id)
+        num = len(scan_paths)
 
         # ── 1. Load + merge scans ──────────────────────────────────────────────
-        num = len(scan_paths)
-        if num == 1:
-            _emit(job_id, "ingest", "Reading scan…", 0.05)
-        else:
-            _emit(job_id, "ingest", f"Loading {num} scan files…", 0.05)
+        mode_label = "scan-only" if scan_only else "aligned"
+        _emit(job_id, "ingest",
+              f"Loading {num} scan{'s' if num > 1 else ''} ({mode_label} mode)…", 0.05)
 
         def _merge_progress(msg: str, p: float):
             _emit(job_id, "ingest", msg, 0.05 + p * 0.15)
 
-        # 3cm voxel for alignment (fast, more than enough density for ICP/RANSAC)
         merge_result = merge_scans(scan_paths, voxel_size=0.03, progress_cb=_merge_progress)
-        scan_pcd = merge_result.merged  # used for alignment + viewer
+        scan_pcd = merge_result.merged
 
-        # 1.5cm voxel cloud for fixture detection — finer resolution catches
-        # small protrusions (outlet boxes, thermostats) that 3cm voxels might merge away.
-        # We build this from the already-merged cloud (cheap re-downsample from raw
-        # is better, but re-downsampling the 3cm result at 1.5cm gives no benefit;
-        # instead we re-run merge at 1.5cm only if scans are few enough to be safe).
-        # For MVP: use the 3cm cloud for fixtures too; note this in the processing log.
-        scan_pcd_fine = scan_pcd  # same cloud — fixture detection threshold is 2cm anyway
         _emit(
             job_id, "ingest",
-            f"{'Merged' if num > 1 else 'Loaded'} {num} scan{'s' if num > 1 else ''}: "
-            f"{merge_result.total_points_after:,} pts at 3cm voxel · "
-            f"originals preserved in uploads/",
+            f"{'Merged' if num > 1 else 'Loaded'}: {merge_result.total_points_after:,} pts "
+            f"· originals preserved",
             0.20,
         )
 
-        # Write decimated PLY for browser viewer
+        # Emit Z-range so we can verify the coordinate frame looks sane
+        _pts = np.asarray(scan_pcd.points)
+        z_min, z_max = float(_pts[:, 2].min()), float(_pts[:, 2].max())
+        y_min, y_max = float(_pts[:, 1].min()), float(_pts[:, 1].max())
+        _emit(job_id, "ingest",
+              f"Coord range — Z: {z_min:.2f}→{z_max:.2f}m  Y: {y_min:.2f}→{y_max:.2f}m",
+              0.21)
+
+        # ── 2. Floor + wall plane detection (needed in both modes) ─────────────
+        _emit(job_id, "align", "Detecting floor plane…", 0.24)
+        all_floors = detect_all_floors(scan_pcd)
+        floor = all_floors[0]
+        if len(all_floors) > 1:
+            _emit(job_id, "align",
+                  f"{len(all_floors)} floor levels detected "
+                  f"(elevations: {', '.join(f'{f.floor_z_estimate:.2f}m' for f in all_floors)})",
+                  0.26)
+        wall_band = extract_wall_band(scan_pcd, floor, band_low_m, band_high_m)
+
+        # Write decimated PLY for browser viewer — filter to wall-height band so
+        # the viewer shows only meaningful structure (walls, doors, windows).
+        # This removes floor reflections, ceiling, outdoor trees, and scan-sweep
+        # artifacts that would otherwise clutter the top-down view.
         decimated_path = artifact_dir / "scan_decimated.ply"
-        write_decimated_ply(scan_pcd, decimated_path, target_points=200_000)
+        _viewer_pcd = _wall_height_slice(scan_pcd, floor.floor_z_estimate, floor.axis_idx)
+        write_decimated_ply(_viewer_pcd, decimated_path, target_points=max(200_000, num * 5_000))
+        del _viewer_pcd
 
-        # ── 2. DXF parsing ────────────────────────────────────────────────────
-        _emit(job_id, "ingest", "Parsing plan…", 0.22)
-        plan_lines = extract_wall_lines(str(plan_path))
-        if len(plan_lines) == 0:
-            raise ValueError("No line entities found in the DXF plan file.")
+        _emit(job_id, "align", "Detecting wall planes…", 0.30)
+        wall_band_pts = len(wall_band.points)
+        _emit(job_id, "align", f"Wall band: {wall_band_pts:,} pts between "
+              f"{floor.floor_z_estimate + band_low_m:.1f}–{floor.floor_z_estimate + band_high_m:.1f} "
+              f"(axis={'Z' if floor.axis_idx == 2 else 'Y'})", 0.32)
 
-        # ── 3. Alignment ──────────────────────────────────────────────────────
-        _emit(job_id, "align", "Detecting floor plane…", 0.28)
-        _emit(job_id, "align", "Extracting wall band…", 0.33)
-        _emit(job_id, "align", "Running RANSAC plane detection…", 0.40)
-        _emit(job_id, "align", "Computing principal axes…", 0.48)
-        _emit(job_id, "align", "Aligning scan to plan…", 0.52)
-
-        result = align_scan_to_plan(
-            scan_pcd,
-            plan_lines,
-            band_low_m=band_low_m,
-            band_high_m=band_high_m,
+        wall_planes, detect_label = extract_wall_planes_with_fallback(
+            wall_band,
+            up_axis_idx=floor.axis_idx,
+            full_cloud=scan_pcd,
+            floor_z=floor.floor_z_estimate,
         )
 
-        _emit(
-            job_id, "align",
-            f"Alignment complete — {compute_confidence_pct(result.confidence)}% confidence, "
-            f"{result.residual_rmse * 1000:.1f}mm residual",
-            0.62,
-        )
+        # ── Per-scan RANSAC fallback ───────────────────────────────────────────
+        # Global RANSAC on a merged building-wide cloud typically returns 0 planes:
+        # with 60+ rooms at all orientations, no single plane dominates enough to
+        # exceed min_inliers.  Per-scan solves this: each file covers 1–2 rooms,
+        # RANSAC finds 4–8 crisp vertical planes, and the pre-registered coordinate
+        # frame means all planes drop directly into the shared floor plan.
+        if not wall_planes and num > 1 and scan_only:
+            _emit(job_id, "align",
+                  f"Global RANSAC found 0 planes — switching to per-scan detection…", 0.34)
+            wall_planes = _per_scan_chest_planes(
+                scan_paths,
+                floor,
+                merge_result.centroid_offset,
+                chest_low=band_low_m,
+                chest_high=band_high_m,
+                emit_cb=lambda msg: _emit(job_id, "align", msg, 0.35),
+            )
+            detect_label = f"per-scan ({len(wall_planes)} planes from {num} scans)"
 
-        # ── 4. Room extraction ────────────────────────────────────────────────
-        _emit(job_id, "rooms", "Extracting rooms…", 0.65)
-        try:
-            rooms = extract_rooms(str(plan_path))
-        except Exception as e:
-            rooms = []
-            _emit(job_id, "rooms", f"Room extraction skipped: {e}", 0.68)
+        _emit(job_id, "align",
+              f"{len(wall_planes)} wall planes detected ({detect_label})", 0.38)
 
-        # Per-room match quality
-        aligned_pts = np.zeros((0, 3))
-        if rooms and len(plan_lines) > 0:
-            T = result.transformation
-            wall_band = extract_wall_band(scan_pcd, result.floor, band_low_m, band_high_m)
-            pts = np.asarray(wall_band.points)
-            pts_h = np.hstack([pts, np.ones((len(pts), 1))])
-            aligned_pts = (T @ pts_h.T).T[:, :3]
-            rooms = compute_match_quality(rooms, aligned_pts, plan_lines)
+        # ── 3a. WITH PLAN: full alignment ──────────────────────────────────────
+        if not scan_only:
+            _emit(job_id, "ingest", "Parsing plan…", 0.40)
+            plan_lines = extract_wall_lines(str(plan_path))
+            if len(plan_lines) == 0:
+                raise ValueError("No line entities found in the DXF plan file.")
 
-        _emit(job_id, "rooms", f"{len(rooms)} rooms extracted", 0.72)
+            _emit(job_id, "align", "Computing principal axes…", 0.44)
+            _emit(job_id, "align", "Aligning scan to plan…", 0.50)
 
-        # ── 5. Fixture detection ──────────────────────────────────────────────
-        _emit(job_id, "fixtures", "Detecting wall fixtures…", 0.75)
-        try:
-            # scan_pcd is already voxel-downsampled by merge_scans (3cm voxel)
-            # Apply alignment transform to it for fixture detection
-            all_pts = np.asarray(scan_pcd_fine.points)
-            all_pts_h = np.hstack([all_pts, np.ones((len(all_pts), 1))])
-            aligned_all = (result.transformation @ all_pts_h.T).T[:, :3]
-            fixtures = detect_fixtures(aligned_all, result.wall_planes)
-        except Exception as e:
-            fixtures = []
-            _emit(job_id, "fixtures", f"Fixture detection skipped: {e}", 0.78)
+            result = align_scan_to_plan(
+                scan_pcd, plan_lines,
+                band_low_m=band_low_m, band_high_m=band_high_m,
+            )
+            transformation = result.transformation
+            confidence     = result.confidence
+            conf_pct       = compute_confidence_pct(confidence)
+            residual_rmse  = result.residual_rmse
+            num_wall_planes = result.num_wall_planes
 
-        _emit(job_id, "fixtures", f"{len(fixtures)} wall fixtures detected", 0.82)
+            _emit(
+                job_id, "align",
+                f"Aligned — {conf_pct}% confidence · {residual_rmse * 1000:.1f}mm residual",
+                0.60,
+            )
 
-        # ── 6. Overlay PNG for AI review ──────────────────────────────────────
-        overlay_path = str(artifact_dir / "overlay.png")
-        try:
-            scan_pts_2d = aligned_pts[:, :2] if len(aligned_pts) > 0 else np.zeros((0, 2))
-            render_overlay_png(scan_pts_2d, plan_lines, overlay_path)
-        except Exception:
-            overlay_path = ""
-
-        # ── 7. Export ─────────────────────────────────────────────────────────
-        _emit(job_id, "export", "Writing results…", 0.88)
-        result_dir = results_dir(job_id)
-
-        conf_pct = compute_confidence_pct(result.confidence)
-        result_payload = {
-            "job_id": job_id,
-            "alignment": {
-                "transformation": result.transformation.tolist(),
-                "residual_rmse": float(result.residual_rmse),
-                "residual_rmse_mm": float(result.residual_rmse * 1000),
-                "confidence": float(result.confidence),
+            alignment_meta = {
+                "transformation": transformation.tolist(),
+                "residual_rmse": float(residual_rmse),
+                "residual_rmse_mm": float(residual_rmse * 1000),
+                "confidence": float(confidence),
                 "confidence_pct": conf_pct,
                 "inlier_ratio": float(result.inlier_ratio),
                 "rotation_candidate_used": int(result.rotation_candidate_used),
                 "iterations": int(result.iterations),
-                "num_wall_planes": int(result.num_wall_planes),
-            },
-            "floor_z": float(result.floor.floor_z_estimate),
-            "num_scans": num,
-            "merge_strategy": merge_result.strategy,
-            "rooms": [
+                "num_wall_planes": int(num_wall_planes),
+                "mode": "aligned",
+            }
+
+        # ── 3b. SCAN-ONLY: generate synthetic plan, identity transform ─────────
+        else:
+            _emit(job_id, "align", "Generating floor plan from scan…", 0.42)
+
+            if len(wall_planes) >= 4:
+                # Enough 3D planes to describe the building — use them
+                synthetic = generate_plan_from_walls(wall_planes, axis_idx=floor.axis_idx)
+                _emit(job_id, "align",
+                      f"Floor plan generated — {synthetic.wall_count} wall segments (3D planes)",
+                      0.60)
+            else:
+                # Too few 3D planes — 2D projection gives better coverage
+                if wall_planes:
+                    _emit(job_id, "align",
+                          f"Only {len(wall_planes)} 3D plane(s) — using 2D projection for full coverage…",
+                          0.44)
+                else:
+                    _emit(job_id, "align",
+                          "No 3D wall planes — projecting to 2D for floor plan…", 0.44)
+                synthetic = generate_plan_from_projection(scan_pcd, floor)
+                _emit(job_id, "align",
+                      f"Floor plan generated — {synthetic.wall_count} wall segments (2D projection)",
+                      0.60)
+
+            plan_lines = synthetic.segments
+            transformation = np.eye(4)   # identity — scan IS the plan
+            conf_pct       = 100
+            residual_rmse  = 0.0
+            num_wall_planes = len(wall_planes)
+
+            alignment_meta = {
+                "transformation": transformation.tolist(),
+                "residual_rmse": 0.0,
+                "residual_rmse_mm": 0.0,
+                "confidence": 1.0,
+                "confidence_pct": 100,
+                "inlier_ratio": 1.0,
+                "rotation_candidate_used": 0,
+                "iterations": 0,
+                "num_wall_planes": int(num_wall_planes),
+                "mode": "scan_only",
+            }
+
+        # ── 4. Room extraction ────────────────────────────────────────────────
+        _emit(job_id, "rooms", "Extracting rooms…", 0.64)
+        rooms_raw: list[dict] = []
+        aligned_pts = np.zeros((0, 3))
+
+        if not scan_only:
+            try:
+                room_objs = extract_rooms(str(plan_path))
+                T = transformation
+                pts = np.asarray(wall_band.points)
+                pts_h = np.hstack([pts, np.ones((len(pts), 1))])
+                aligned_pts = (T @ pts_h.T).T[:, :3]
+                room_objs = compute_match_quality(room_objs, aligned_pts, plan_lines)
+                rooms_raw = [
+                    {
+                        "id": r.id, "label": r.label, "category": r.category,
+                        "polygon_2d": r.polygon_2d, "centroid": list(r.centroid),
+                        "area_m2": float(r.area_m2), "match_quality": r.match_quality,
+                    }
+                    for r in room_objs
+                ]
+            except Exception as e:
+                _emit(job_id, "rooms", f"Room extraction skipped: {e}", 0.68)
+        else:
+            # Scan-only: reconstruct rooms from the synthetic plan
+            aligned_pts = np.asarray(wall_band.points)   # already in scan frame
+            rooms_raw = generate_rooms_from_scan(wall_planes, synthetic, scan_pcd=scan_pcd, floor=floor)  # type: ignore[name-defined]
+
+        _emit(job_id, "rooms", f"{len(rooms_raw)} rooms extracted", 0.72)
+
+        # ── 5. Fixture detection ──────────────────────────────────────────────
+        _emit(job_id, "fixtures", "Detecting wall fixtures…", 0.75)
+        fixtures_raw: list[dict] = []
+        try:
+            all_pts = np.asarray(scan_pcd.points)
+            all_pts_h = np.hstack([all_pts, np.ones((len(all_pts), 1))])
+            aligned_all = (transformation @ all_pts_h.T).T[:, :3]
+            fixtures = detect_fixtures(aligned_all, wall_planes)
+            fixtures_raw = [
                 {
-                    "id": r.id,
-                    "label": r.label,
-                    "category": r.category,
-                    "polygon_2d": r.polygon_2d,
-                    "centroid": list(r.centroid),
-                    "area_m2": float(r.area_m2),
-                    "match_quality": r.match_quality,
-                }
-                for r in rooms
-            ],
-            "fixtures": [
-                {
-                    "id": f.id,
-                    "wall_id": f.wall_id,
+                    "id": f.id, "wall_id": f.wall_id,
                     "centroid": list(f.centroid),
-                    "bbox_min": list(f.bbox_min),
-                    "bbox_max": list(f.bbox_max),
+                    "bbox_min": list(f.bbox_min), "bbox_max": list(f.bbox_max),
                     "protrusion_depth_m": float(f.protrusion_depth_m),
-                    "width_m": float(f.width_m),
-                    "height_m": float(f.height_m),
-                    "point_count": int(f.point_count),
-                    "confidence": float(f.confidence),
+                    "width_m": float(f.width_m), "height_m": float(f.height_m),
+                    "point_count": int(f.point_count), "confidence": float(f.confidence),
                 }
                 for f in fixtures
-            ],
+            ]
+        except Exception as e:
+            _emit(job_id, "fixtures", f"Fixture detection skipped: {e}", 0.78)
+
+        _emit(job_id, "fixtures", f"{len(fixtures_raw)} wall fixtures detected", 0.82)
+
+        # ── 6. Building outline (alphashape) ─────────────────────────────────
+        _emit(job_id, "export", "Computing building outline…", 0.84)
+        building_outline: list[list[float]] = []
+        try:
+            building_outline = generate_building_outline(scan_pcd, floor)
+            _emit(job_id, "export",
+                  f"Building outline: {len(building_outline)} vertices", 0.86)
+        except Exception as _e:
+            _emit(job_id, "export", f"Building outline skipped: {_e}", 0.86)
+
+        # ── 7. Overlay PNG ────────────────────────────────────────────────────
+        overlay_path = str(artifact_dir / "overlay.png")
+        try:
+            scan_pts_2d = (aligned_pts[:, :2] if len(aligned_pts) > 0
+                           else np.zeros((0, 2)))
+            render_overlay_png(scan_pts_2d, plan_lines, overlay_path)
+        except Exception:
+            overlay_path = ""
+
+        # ── 8. Export ─────────────────────────────────────────────────────────
+        _emit(job_id, "export", "Writing results…", 0.88)
+        result_dir = results_dir(job_id)
+
+        # Serialise all detected floor levels for the multi-floor UI (MJ2).
+        # wall_score is the count of points 0.3–3.0 m above the floor — used to
+        # rank floors and let the user see which level has the most wall coverage.
+        _scan_pts = np.asarray(scan_pcd.points)
+        floor_candidates_data = [
+            {
+                "floor_z": float(f.floor_z_estimate),
+                "inlier_count": int(f.inlier_count),
+                "wall_score": int(
+                    ((_scan_pts[:, f.axis_idx] > f.floor_z_estimate + 0.30)
+                     & (_scan_pts[:, f.axis_idx] < f.floor_z_estimate + 3.00)).sum()
+                ),
+                "axis_idx": int(f.axis_idx),
+            }
+            for f in all_floors
+        ]
+
+        result_payload = {
+            "job_id": job_id,
+            "alignment": alignment_meta,
+            "floor_z": float(floor.floor_z_estimate),
+            "floor_axis_idx": int(floor.axis_idx),
+            # MJ2: all detected floor levels sorted by wall-content score
+            "floor_candidates": floor_candidates_data,
+            "scan_only": scan_only,
+            "num_scans": num,
+            "merge_strategy": merge_result.strategy,
+            "rooms": rooms_raw,
+            "fixtures": fixtures_raw,
             "plan_bounds": _compute_plan_bounds(plan_lines),
+            # Store the actual wall segments so the viewer can render them
+            "plan_segments": _segments_to_list(plan_lines),
             "overlay_png": overlay_path,
+            # Building exterior hull (alphashape concave polygon) — [[x, y], ...]
+            "building_outline": building_outline,
+            # Path to the merged+decimated PLY — used by the manual-transform
+            # endpoint so multi-scan jobs re-align against the full merged cloud,
+            # not just the first raw scan file.
+            "merged_ply": str(decimated_path),
         }
 
-        json_path = result_dir / "aligned.json"
-        write_aligned_json(result_payload, json_path)
-        write_aligned_dxf(plan_path, result.transformation, result_dir / "aligned.dxf")
+        write_aligned_json(result_payload, result_dir / "aligned.json")
+        if not scan_only and plan_path is not None:
+            write_aligned_dxf(plan_path, transformation, result_dir / "aligned.dxf")
 
         elapsed = time.time() - t0
         update_job_result(job_id, result_payload, elapsed)
 
+        suffix = "· no plan required" if scan_only else f"· {conf_pct}% confidence"  # type: ignore[possibly-undefined]
         _emit(
             job_id, "complete",
-            f"Done in {elapsed:.1f}s — {conf_pct}% confidence · "
-            f"{len(rooms)} rooms · {len(fixtures)} fixtures · {num} scan{'s' if num > 1 else ''} merged",
+            f"Done in {elapsed:.1f}s {suffix} · "
+            f"{len(rooms_raw)} rooms · {len(fixtures_raw)} fixtures · "
+            f"{num} scan{'s' if num > 1 else ''} merged",
             1.0,
         )
 
@@ -223,8 +368,381 @@ def _compute_plan_bounds(plan_lines: np.ndarray) -> list[float]:
         return [0.0, 0.0, 1.0, 1.0]
     pts = plan_lines.reshape(-1, 2)
     return [
-        float(pts[:, 0].min()),
-        float(pts[:, 1].min()),
-        float(pts[:, 0].max()),
-        float(pts[:, 1].max()),
+        float(pts[:, 0].min()), float(pts[:, 1].min()),
+        float(pts[:, 0].max()), float(pts[:, 1].max()),
     ]
+
+
+def _segments_to_list(plan_lines: np.ndarray) -> list:
+    """Convert (N,2,2) or (N,4) segment array to JSON-serialisable list of [[x1,y1],[x2,y2]]."""
+    if len(plan_lines) == 0:
+        return []
+    arr = np.asarray(plan_lines)
+    # Normalise to (N, 2, 2)
+    if arr.ndim == 2 and arr.shape[1] == 4:
+        arr = arr.reshape(-1, 2, 2)
+    elif arr.ndim == 3 and arr.shape[1] == 2 and arr.shape[2] == 2:
+        pass  # already (N, 2, 2)
+    else:
+        # Fallback: reshape as pairs of 2D points
+        flat = arr.reshape(-1, 2)
+        n_seg = len(flat) // 2
+        arr = flat[: n_seg * 2].reshape(n_seg, 2, 2)
+    return arr.tolist()
+
+
+def _per_scan_chest_planes(
+    scan_paths: list[Path],
+    floor: "FloorReference",
+    centroid_offset: "np.ndarray",
+    chest_low: float = 1.00,
+    chest_high: float = 2.00,
+    emit_cb: "Callable[[str], None] | None" = None,
+) -> "list[WallPlane]":
+    """Run RANSAC wall-plane detection on each scan's chest-height band.
+
+    Why this works when global RANSAC fails
+    ----------------------------------------
+    Global RANSAC on the merged 115m-wide cloud sees hundreds of wall planes at
+    all orientations.  Open3D's segment_plane finds only the single most-dominant
+    plane per call; after 40 calls it gives up, often returning 0 usable planes.
+
+    Per-scan: each file covers 1–2 rooms → 4–8 cleanly-vertical planes.
+    RANSAC trivially finds all of them on the first few iterations.  The result
+    is sub-centimeter wall positions limited only by scanner hardware precision,
+    not algorithm noise.
+
+    Coordinate frame
+    ----------------
+    Raw scans are in the pre-registered shared frame.  ``centroid_offset`` is
+    the 3D mean that ``_center_cloud`` subtracted during the merge step; applying
+    the same subtraction here puts per-scan points in the same centered frame as
+    ``floor.floor_z_estimate``.
+    """
+    import open3d as o3d
+    from .ingest import load_point_cloud
+    from .segment import extract_wall_planes_with_fallback, WallPlane
+
+    fl_z = floor.floor_z_estimate
+    ax   = floor.axis_idx
+    all_planes: list[WallPlane] = []
+
+    for i, path in enumerate(scan_paths):
+        try:
+            if emit_cb:
+                emit_cb(f"Per-scan wall detection {i + 1}/{len(scan_paths)}: {path.name}…")
+            pcd = load_point_cloud(path)
+            pts_raw = np.asarray(pcd.points, dtype=np.float64)
+            del pcd
+
+            # Apply the same centering offset used during merge_scans so that
+            # fl_z (in the centered frame) can be used directly.
+            pts = pts_raw - centroid_offset
+
+            mask = (pts[:, ax] > fl_z + chest_low) & (pts[:, ax] < fl_z + chest_high)
+            pts_band = pts[mask]
+            if len(pts_band) < 50:
+                continue
+
+            band_pcd = o3d.geometry.PointCloud()
+            band_pcd.points = o3d.utility.Vector3dVector(pts_band)
+
+            planes, _ = extract_wall_planes_with_fallback(
+                band_pcd, up_axis_idx=ax, floor_z=fl_z,
+            )
+            for p in planes:
+                p.id = f"s{i:02d}-{p.id}"
+            all_planes.extend(planes)
+        except Exception:
+            continue
+
+    return all_planes
+
+
+def _wall_height_slice(
+    pcd: object,
+    floor_z: float,
+    axis_idx: int,
+    low_offset: float = 0.20,
+    high_offset: float = 2.50,
+) -> object:
+    """Return only points in the wall-height band for the browser viewer.
+
+    Filters to [floor_z + low_offset, floor_z + high_offset] along the
+    vertical axis.  This removes:
+      - Floor reflections / laser floor returns
+      - Ceiling scans
+      - Outdoor trees and sky captured through windows
+      - Furniture tops above head height
+    leaving mostly wall surfaces, doors, window frames — exactly what you
+    need to understand the building layout from above.
+    """
+    import open3d as o3d
+    pts = np.asarray(pcd.points)
+    low  = floor_z + low_offset
+    high = floor_z + high_offset
+    mask = (pts[:, axis_idx] > low) & (pts[:, axis_idx] < high)
+    indices = np.where(mask)[0]
+    if len(indices) < 1000:
+        # Not enough points in band — fall back to full cloud so we show something
+        return pcd
+    sliced = pcd.select_by_index(indices.tolist())
+    return sliced
+
+
+async def run_pipeline_guarded(
+    job_id: str,
+    scan_paths: list[Path],
+    plan_path: Path | None,
+    band_low_m: float = 1.00,
+    band_high_m: float = 2.00,
+) -> None:
+    """Semaphore-guarded async wrapper: at most 2 pipeline runs at once.
+
+    Jobs that arrive while both slots are occupied queue here and run as
+    soon as a slot is released.  The job stays in 'queued' status until
+    the semaphore is acquired, then transitions to 'processing' inside
+    run_pipeline().
+    """
+    async with JOB_SEMAPHORE:
+        await asyncio.to_thread(
+            run_pipeline, job_id, scan_paths, plan_path, band_low_m, band_high_m
+        )
+
+
+# ── MJ2 / MJ3: Live Re-processing ────────────────────────────────────────────
+
+def reprocess_rooms(
+    job_id: str,
+    merged_ply_path: Path,
+    plan_path: Path | None,
+    floor_z_override: float | None = None,
+    band_low_m: float = 1.00,
+    band_high_m: float = 2.00,
+    min_wall_length_m: float = 2.0,
+    hough_threshold: int = 35,
+) -> None:
+    """Re-run room/wall extraction using the already-merged scan.
+
+    Skips the expensive scan-loading and merge stages (typically 10–15 min)
+    and re-runs only:
+      floor detection → wall band → wall planes → plan generation → rooms
+      → fixtures → building outline → update stored result
+
+    Parameters
+    ----------
+    job_id : str
+        Job to update.  SSE progress events are published on this channel.
+    merged_ply_path : Path
+        Path to the decimated merged PLY written during the original pipeline run.
+    plan_path : Path | None
+        DXF plan file (aligned mode) or None (scan-only mode).
+    floor_z_override : float | None
+        If set, bypasses floor detection and uses this elevation directly.
+        Use to switch to a different building level (MJ2 multi-floor).
+    band_low_m / band_high_m : float
+        Wall-band height offsets above the floor (MJ3 parameter tuning).
+    min_wall_length_m : float
+        Minimum wall segment length for Hough-line filtering (MJ3).
+    hough_threshold : int
+        Minimum Hough vote count (MJ3).
+    """
+    from .ingest import load_point_cloud
+    from .slicing import FloorReference
+
+    t0 = time.time()
+
+    try:
+        _emit(job_id, "reprocess", "Loading merged point cloud for re-processing…", 0.05)
+        scan_pcd = load_point_cloud(merged_ply_path)
+
+        # ── Floor detection (or use provided override) ─────────────────────────
+        if floor_z_override is not None:
+            # Build a minimal FloorReference from the user-chosen floor elevation.
+            # Axis index is inferred from the stored result if available.
+            try:
+                stored = load_result_json(job_id)
+                ax = int(stored.get("floor_axis_idx", 2))
+            except Exception:
+                ax = 2
+            up = np.zeros(3)
+            up[ax] = 1.0
+            floor = FloorReference(
+                plane_eq=np.array([up[0], up[1], up[2], -floor_z_override]),
+                up_normal=up,
+                floor_z_estimate=floor_z_override,
+                inlier_count=0,
+                axis_idx=ax,
+            )
+            _emit(job_id, "reprocess",
+                  f"Using selected floor at z={floor_z_override:.2f} m", 0.10)
+        else:
+            _emit(job_id, "reprocess", "Re-detecting floor plane…", 0.10)
+            floor = detect_floor(scan_pcd)
+            _emit(job_id, "reprocess",
+                  f"Floor detected at z={floor.floor_z_estimate:.2f} m", 0.14)
+
+        # ── Wall band + wall planes ────────────────────────────────────────────
+        _emit(job_id, "reprocess", "Extracting wall band…", 0.18)
+        wall_band = extract_wall_band(scan_pcd, floor, band_low_m, band_high_m)
+
+        _emit(job_id, "reprocess", "Detecting wall planes…", 0.26)
+        wall_planes, detect_label = extract_wall_planes_with_fallback(
+            wall_band,
+            up_axis_idx=floor.axis_idx,
+            full_cloud=scan_pcd,
+            floor_z=floor.floor_z_estimate,
+        )
+        _emit(job_id, "reprocess",
+              f"{len(wall_planes)} wall planes ({detect_label})", 0.38)
+
+        # ── Plan generation + room extraction ─────────────────────────────────
+        scan_only = plan_path is None
+        if scan_only:
+            _emit(job_id, "reprocess", "Generating floor plan from scan…", 0.42)
+            if len(wall_planes) >= 4:
+                synthetic = generate_plan_from_walls(wall_planes, axis_idx=floor.axis_idx)
+            else:
+                synthetic = generate_plan_from_projection(
+                    scan_pcd, floor,
+                    min_wall_length_m=min_wall_length_m,
+                )
+            plan_lines = synthetic.segments
+            _emit(job_id, "reprocess",
+                  f"Plan: {synthetic.wall_count} wall segments", 0.55)
+
+            _emit(job_id, "reprocess", "Extracting rooms…", 0.60)
+            rooms_raw = generate_rooms_from_scan(
+                wall_planes, synthetic, scan_pcd=scan_pcd, floor=floor
+            )
+            aligned_pts = np.asarray(wall_band.points)
+            transformation = np.eye(4)
+
+        else:
+            _emit(job_id, "reprocess", "Aligning to plan…", 0.42)
+            plan_lines_dxf = extract_wall_lines(str(plan_path))
+            result_align = align_scan_to_plan(
+                scan_pcd, plan_lines_dxf,
+                band_low_m=band_low_m, band_high_m=band_high_m,
+            )
+            transformation = result_align.transformation
+            plan_lines = plan_lines_dxf
+            conf_pct = compute_confidence_pct(result_align.confidence)
+            _emit(job_id, "reprocess",
+                  f"Re-aligned: {conf_pct}% confidence", 0.56)
+
+            _emit(job_id, "reprocess", "Extracting rooms…", 0.62)
+            room_objs = extract_rooms(str(plan_path))
+            T = transformation
+            pts = np.asarray(wall_band.points)
+            pts_h = np.hstack([pts, np.ones((len(pts), 1))])
+            aligned_pts = (T @ pts_h.T).T[:, :3]
+            room_objs = compute_match_quality(room_objs, aligned_pts, plan_lines)
+            rooms_raw = [
+                {
+                    "id": r.id, "label": r.label, "category": r.category,
+                    "polygon_2d": r.polygon_2d, "centroid": list(r.centroid),
+                    "area_m2": float(r.area_m2), "match_quality": r.match_quality,
+                }
+                for r in room_objs
+            ]
+
+        _emit(job_id, "reprocess", f"{len(rooms_raw)} rooms extracted", 0.68)
+
+        # ── Fixtures ──────────────────────────────────────────────────────────
+        _emit(job_id, "reprocess", "Detecting fixtures…", 0.72)
+        fixtures_raw: list[dict] = []
+        try:
+            all_pts = np.asarray(scan_pcd.points)
+            all_pts_h = np.hstack([all_pts, np.ones((len(all_pts), 1))])
+            aligned_all = (transformation @ all_pts_h.T).T[:, :3]
+            fixtures_list = detect_fixtures(aligned_all, wall_planes)
+            fixtures_raw = [
+                {
+                    "id": f.id, "wall_id": f.wall_id,
+                    "centroid": list(f.centroid),
+                    "bbox_min": list(f.bbox_min), "bbox_max": list(f.bbox_max),
+                    "protrusion_depth_m": float(f.protrusion_depth_m),
+                    "width_m": float(f.width_m), "height_m": float(f.height_m),
+                    "point_count": int(f.point_count), "confidence": float(f.confidence),
+                }
+                for f in fixtures_list
+            ]
+        except Exception as e:
+            _emit(job_id, "reprocess", f"Fixture detection skipped: {e}", 0.76)
+
+        # ── Building outline ──────────────────────────────────────────────────
+        _emit(job_id, "reprocess", "Computing building outline…", 0.80)
+        building_outline: list[list[float]] = []
+        try:
+            building_outline = generate_building_outline(scan_pcd, floor)
+        except Exception:
+            pass
+
+        # ── Overlay PNG ───────────────────────────────────────────────────────
+        artifact_dir = artifacts_dir(job_id)
+        overlay_path = str(artifact_dir / "overlay.png")
+        try:
+            scan_pts_2d = aligned_pts[:, :2] if len(aligned_pts) > 0 else np.zeros((0, 2))
+            render_overlay_png(scan_pts_2d, plan_lines, overlay_path)
+        except Exception:
+            overlay_path = ""
+
+        # ── Merge into stored result ──────────────────────────────────────────
+        _emit(job_id, "reprocess", "Saving results…", 0.90)
+        try:
+            stored = load_result_json(job_id)
+        except Exception:
+            stored = {}
+
+        stored["rooms"] = rooms_raw
+        stored["fixtures"] = fixtures_raw
+        stored["plan_bounds"] = _compute_plan_bounds(plan_lines)
+        stored["plan_segments"] = _segments_to_list(plan_lines)
+        stored["building_outline"] = building_outline
+        stored["floor_z"] = float(floor.floor_z_estimate)
+        stored["floor_axis_idx"] = int(floor.axis_idx)
+        if overlay_path:
+            stored["overlay_png"] = overlay_path
+
+        if not scan_only:
+            stored["alignment"]["transformation"] = transformation.tolist()
+            stored["alignment"]["residual_rmse"] = float(result_align.residual_rmse)  # type: ignore[name-defined]
+            stored["alignment"]["residual_rmse_mm"] = float(result_align.residual_rmse * 1000)  # type: ignore[name-defined]
+            stored["alignment"]["confidence"] = float(result_align.confidence)         # type: ignore[name-defined]
+            stored["alignment"]["confidence_pct"] = int(compute_confidence_pct(result_align.confidence))  # type: ignore[name-defined]
+
+        elapsed = time.time() - t0
+        update_job_result(job_id, stored, elapsed)
+
+        _emit(
+            job_id, "complete",
+            f"Re-processing done in {elapsed:.1f}s · "
+            f"{len(rooms_raw)} rooms · {len(fixtures_raw)} fixtures",
+            1.0,
+        )
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        _emit(job_id, "error", f"Re-processing failed: {exc}", 1.0)
+
+
+async def reprocess_rooms_guarded(
+    job_id: str,
+    merged_ply_path: Path,
+    plan_path: Path | None,
+    floor_z_override: float | None = None,
+    band_low_m: float = 1.00,
+    band_high_m: float = 2.00,
+    min_wall_length_m: float = 2.0,
+    hough_threshold: int = 35,
+) -> None:
+    """Semaphore-guarded wrapper for reprocess_rooms."""
+    async with JOB_SEMAPHORE:
+        await asyncio.to_thread(
+            reprocess_rooms,
+            job_id, merged_ply_path, plan_path,
+            floor_z_override, band_low_m, band_high_m,
+            min_wall_length_m, hough_threshold,
+        )

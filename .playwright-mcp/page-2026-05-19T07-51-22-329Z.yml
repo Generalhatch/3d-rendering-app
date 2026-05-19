@@ -1,0 +1,72 @@
+- generic [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e6]:
+      - button "⊤ Top" [ref=e7] [cursor=pointer]
+      - button "⊞ Fit" [ref=e8] [cursor=pointer]
+    - paragraph [ref=e74]: Aligning scan to plan…
+  - generic [ref=e10]:
+    - generic [ref=e11]:
+      - generic [ref=e12]:
+        - heading "AlignAI" [level=1] [ref=e13]
+        - paragraph [ref=e14]: Scan-to-Plan Alignment
+      - button "New job" [ref=e75] [cursor=pointer]
+    - generic [ref=e15]:
+      - generic:
+        - generic: 📁
+        - generic:
+          - paragraph: Drop files here or click to browse
+          - paragraph: "Plan: .dxf · Scans: .las / .laz / .ply / .e57 (multiple OK)"
+      - generic [ref=e21] [cursor=pointer]:
+        - generic [ref=e22]: 📐
+        - generic [ref=e23]:
+          - generic [ref=e24]: Plan (DXF) — optional
+          - generic [ref=e25]: Without a plan, floor layout is generated from the scan
+      - generic [ref=e32]: No DXF? No problem — floor plan will be generated directly from the scan.
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - generic [ref=e28]: Scans (6)
+          - button "+ Add scans" [ref=e29] [cursor=pointer]
+        - generic [ref=e30]:
+          - generic [ref=e33]:
+            - generic [ref=e34]: 🔴
+            - generic [ref=e35]:
+              - generic [ref=e36]: 180LJ2-220-ef6d4e3c-51a1-42c3-821a-3ec916b7c971.laz
+              - generic [ref=e37]: 648.5 MB
+            - button "✕" [ref=e38] [cursor=pointer]
+          - generic [ref=e39]:
+            - generic [ref=e40]: 🔴
+            - generic [ref=e41]:
+              - generic [ref=e42]: 180LJ2-240-250-b86d622b-32a7-4072-9e56-04b826815ed6.laz
+              - generic [ref=e43]: 657.4 MB
+            - button "✕" [ref=e44] [cursor=pointer]
+          - generic [ref=e45]:
+            - generic [ref=e46]: 🔴
+            - generic [ref=e47]:
+              - generic [ref=e48]: 180LJ2-260-db3e29bd-1879-467b-971f-deeffdcb31cd.laz
+              - generic [ref=e49]: 498.9 MB
+            - button "✕" [ref=e50] [cursor=pointer]
+          - generic [ref=e51]:
+            - generic [ref=e52]: 🔴
+            - generic [ref=e53]:
+              - generic [ref=e54]: 180LJ2-CORE-62e9589e-baca-4848-a888-f110a376dbde.laz
+              - generic [ref=e55]: 584.3 MB
+            - button "✕" [ref=e56] [cursor=pointer]
+          - generic [ref=e57]:
+            - generic [ref=e58]: 🔴
+            - generic [ref=e59]:
+              - generic [ref=e60]: 180LJ2-RR-f8a435d6-cc0d-44a1-a603-d130e3e1f9f3.laz
+              - generic [ref=e61]: 238.8 MB
+            - button "✕" [ref=e62] [cursor=pointer]
+          - generic [ref=e63]:
+            - generic [ref=e64]: 🔴
+            - generic [ref=e65]:
+              - generic [ref=e66]: 180LJ2-SCAN1-5d83cd6b-8480-45f3-949a-2ce1c47b6b6c.laz
+              - generic [ref=e67]: 982.3 MB
+            - button "✕" [ref=e68] [cursor=pointer]
+      - generic [ref=e69]: 6 scans will be merged into one unified floor point cloud
+      - button "Processing…" [disabled] [ref=e76]
+    - generic [ref=e77]:
+      - button "Processing Log ▲" [ref=e78] [cursor=pointer]:
+        - generic [ref=e79]: Processing Log
+        - generic [ref=e81]: ▲
+      - paragraph [ref=e84]: Waiting for progress…

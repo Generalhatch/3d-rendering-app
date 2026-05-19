@@ -8,7 +8,7 @@ import { loadPointCloudFromUrl } from './three/pointCloudLoader';
 import { planGeoJSONToSegments } from './three/planLoader';
 import { useJobStore } from './state/jobStore';
 import { api } from './api/client';
-import type { FullResult, Room, Fixture } from './api/client';
+import type { FullResult, Room, Fixture, ReprocessParams } from './api/client';
 
 import { UploadZone } from './components/UploadZone';
 import { ProcessingPanel } from './components/ProcessingPanel';
@@ -17,6 +17,7 @@ import { ConfidencePanel } from './components/ConfidencePanel';
 import { RoomDetailPanel } from './components/RoomDetailPanel';
 import { FixturePanel } from './components/FixturePanel';
 import { ManualControls } from './components/ManualControls';
+import { JobHistoryPanel } from './components/JobHistoryPanel';
 import { CATEGORY_COLORS, CATEGORY_LABELS } from './three/roomColors';
 import { DEPTH_COLOR_LEGEND } from './three/fixtureColors';
 
@@ -30,7 +31,8 @@ export default function App() {
     setFullResult, setRooms, setFixtures,
     selectedRoomId, selectedFixtureId,
     showFixtures, showRooms, scanOpacity, roomOpacity,
-    jobId,
+    jobId, isScanOnly, setScanOnly, addJobToHistory,
+    setFloorCandidates, setReprocessing,
   } = useJobStore();
 
   // Sync scene visibility/opacity when store changes
@@ -57,22 +59,59 @@ export default function App() {
 
   const loadResultIntoScene = useCallback(async (jId: string) => {
     const scene = sceneRef.current;
-    if (!scene) return;
+    if (!scene) {
+      console.error('[viewer] sceneRef is null — ViewerScene not mounted yet');
+      return;
+    }
 
     try {
-      // Load scan PLY
-      const scanData = await loadPointCloudFromUrl(api.getScanUrl(jId));
+      // ── 1. Load decimated PLY ──────────────────────────────────────────────
+      let scanData: Awaited<ReturnType<typeof loadPointCloudFromUrl>>;
+      try {
+        scanData = await loadPointCloudFromUrl(api.getScanUrl(jId));
+        console.log(`[viewer] PLY loaded: ${scanData.positions.length / 3} pts, colors=${!!scanData.colors}`);
+      } catch (e) {
+        console.error('[viewer] PLY load failed', e);
+        throw e;
+      }
       scene.loadScan(scanData.positions, scanData.colors);
 
-      // Load plan lines
-      const geojson = await api.getPlanGeoJSON(jId);
-      const segments = planGeoJSONToSegments(geojson as Parameters<typeof planGeoJSONToSegments>[0]);
+      // ── 2. Load plan GeoJSON + building outline (in parallel) ─────────────
+      let segments: Float32Array;
+      const [planResult, outlineResult] = await Promise.allSettled([
+        api.getPlanGeoJSON(jId),
+        api.getOutlineGeoJSON(jId),
+      ]);
+
+      if (planResult.status === 'fulfilled') {
+        segments = planGeoJSONToSegments(planResult.value as Parameters<typeof planGeoJSONToSegments>[0]);
+        console.log(`[viewer] plan loaded: ${segments.length / 6} line segments`);
+      } else {
+        console.error('[viewer] plan GeoJSON failed', planResult.reason);
+        segments = new Float32Array(0);
+      }
       scene.loadPlan(segments);
 
-      // Load full result
-      const jobDetail = await api.getJob(jId);
-      // Re-fetch the rooms and fixtures
-      const [roomsResp, fixturesResp] = await Promise.all([
+      if (outlineResult.status === 'fulfilled') {
+        const feature = outlineResult.value.features?.[0];
+        const ring = feature?.geometry?.coordinates?.[0];
+        if (ring && ring.length > 0) {
+          const outlinePts = new Float32Array(ring.length * 3);
+          ring.forEach(([x, y], i) => {
+            outlinePts[i * 3]     = x;
+            outlinePts[i * 3 + 1] = y;
+            outlinePts[i * 3 + 2] = 0;  // floor_z applied inside loadOutline
+          });
+          console.log(`[viewer] outline loaded: ${ring.length} vertices`);
+          scene.loadOutline(outlinePts, 0);  // floor_z set after jobDetail fetch below
+        }
+      } else {
+        console.debug('[viewer] building outline not available for this job');
+      }
+
+      // ── 3. Fetch job metadata + rooms/fixtures ─────────────────────────────
+      const [jobDetail, roomsResp, fixturesResp] = await Promise.all([
+        api.getJob(jId),
         api.getRooms(jId),
         api.getFixtures(jId),
       ]);
@@ -80,38 +119,79 @@ export default function App() {
       const rooms: Room[] = roomsResp.rooms;
       const fixtures: Fixture[] = fixturesResp.fixtures;
 
-      // Build the FullResult from jobDetail
+      const floorZ = jobDetail.floor_z ?? 0;
+
+      // Re-apply correct floor_z to the outline now that we have it from jobDetail
+      if (outlineResult.status === 'fulfilled') {
+        const feature = outlineResult.value.features?.[0];
+        const ring = feature?.geometry?.coordinates?.[0];
+        if (ring && ring.length > 0) {
+          const outlinePts = new Float32Array(ring.length * 3);
+          ring.forEach(([x, y], i) => {
+            outlinePts[i * 3]     = x;
+            outlinePts[i * 3 + 1] = y;
+            outlinePts[i * 3 + 2] = 0;
+          });
+          scene.loadOutline(outlinePts, floorZ);
+        }
+      }
+
       const fullResult: FullResult = {
         job_id: jId,
         alignment: jobDetail.result!,
-        floor_z: 0,
+        floor_z: floorZ,
+        scan_only: jobDetail.scan_only ?? false,
         rooms,
         fixtures,
-        plan_bounds: [0, 0, 100, 100],
+        plan_bounds: (jobDetail.plan_bounds as [number, number, number, number]) ?? [0, 0, 100, 100],
       };
       setFullResult(fullResult);
       setRooms(rooms);
       setFixtures(fixtures);
 
-      // Fit camera first (unaligned view)
+      // Update history entry with final status + elapsed time
+      addJobToHistory({
+        jobId: jId,
+        status: jobDetail.status,
+        createdAt: jobDetail.created_at,
+        scanCount: (jobDetail as { scan_filenames?: string[] }).scan_filenames?.length ?? 1,
+        scanOnly: jobDetail.scan_only ?? false,
+        elapsed_s: jobDetail.elapsed_s,
+      });
+
+      // MJ2: populate floor candidates in store so ConfidencePanel can show them
+      if (jobDetail.floor_candidates && jobDetail.floor_candidates.length > 0) {
+        setFloorCandidates(jobDetail.floor_candidates);
+      } else {
+        // Fallback: fetch from the dedicated endpoint for older jobs
+        try {
+          const floors = await api.getFloors(jId);
+          setFloorCandidates(floors);
+        } catch {
+          setFloorCandidates([]);
+        }
+      }
+
+      // ── 4. Fit camera to the loaded scene ─────────────────────────────────
       scene.fitToScene();
 
-      // The snap: scan starts at identity, moves to alignment matrix
+      // ── 5. Snap animation (identity→alignment transform) ──────────────────
       const flatMatrix = jobDetail.result!.transformation.flat();
       const targetMatrix = new THREE.Matrix4().fromArray(flatMatrix).transpose();
 
       playSnapAnimation({
         scene,
-        fromMatrix: new THREE.Matrix4(),  // identity = unaligned
+        fromMatrix: new THREE.Matrix4(),
         toMatrix: targetMatrix,
         durationMs: 1500,
         onComplete: () => {
-          // Rooms fade in after snap
+          // Re-fit camera after scan has been transformed to its aligned position
+          scene.fitToScene();
+
           const overlay = new RoomOverlay(rooms, fullResult.floor_z);
           roomOverlayRef.current = overlay;
           scene.addRoomOverlay(overlay);
 
-          // Fixtures fade in shortly after
           setTimeout(() => {
             const markers = new FixtureMarkers(fixtures);
             fixtureMarkersRef.current = markers;
@@ -122,18 +202,30 @@ export default function App() {
         },
       });
     } catch (err) {
-      console.error('Failed to load result into scene', err);
+      console.error('[viewer] loadResultIntoScene failed', err);
+      setPhase('failed');
     }
-  }, [setFullResult, setRooms, setFixtures, setPhase]);
+  }, [setFullResult, setRooms, setFixtures, setPhase, addJobToHistory, setFloorCandidates]);
 
-  const handleFilesReady = useCallback(async (planFile: File, scanFiles: File[]) => {
+  const handleFilesReady = useCallback(async (scanFiles: File[], planFile: File | null, bandLow: number, bandHigh: number) => {
     reset();
+    setScanOnly(planFile === null);
     setPhase('uploading');
 
     try {
-      const { job_id } = await api.createJob(planFile, scanFiles);
+      const { job_id } = await api.createJob(scanFiles, planFile, bandLow, bandHigh);
       setJobId(job_id);
       setPhase('processing');
+
+      // Record as "processing" in history immediately so it shows up even if the
+      // user refreshes before it completes
+      addJobToHistory({
+        jobId: job_id,
+        status: 'processing',
+        createdAt: new Date().toISOString(),
+        scanCount: scanFiles.length,
+        scanOnly: planFile === null,
+      });
 
       const sse = api.subscribeProgress(job_id, (event) => {
         appendLog(event);
@@ -143,6 +235,13 @@ export default function App() {
         } else if (event.stage === 'error') {
           sse.close();
           setPhase('failed');
+          addJobToHistory({
+            jobId: job_id,
+            status: 'failed',
+            createdAt: new Date().toISOString(),
+            scanCount: scanFiles.length,
+            scanOnly: planFile === null,
+          });
         }
       });
     } catch (err) {
@@ -154,9 +253,54 @@ export default function App() {
         job_id: '',
       });
     }
-  }, [reset, setPhase, setJobId, appendLog, loadResultIntoScene]);
+  }, [reset, setPhase, setJobId, appendLog, loadResultIntoScene, setScanOnly, addJobToHistory]);
+
+  // Called when the user clicks "Load" on a history entry to restore a past job
+  const handleResumeJob = useCallback(async (resumeJobId: string) => {
+    reset();
+    setJobId(resumeJobId);
+    setPhase('processing');
+    try {
+      const jobDetail = await api.getJob(resumeJobId);
+      setScanOnly(jobDetail.scan_only ?? false);
+      await loadResultIntoScene(resumeJobId);
+    } catch {
+      setPhase('failed');
+    }
+  }, [reset, setJobId, setPhase, setScanOnly, loadResultIntoScene]);
+
+  // MJ2/MJ3: trigger re-processing with new parameters, subscribe to SSE, reload scene on complete
+  const handleReprocess = useCallback(async (params: ReprocessParams) => {
+    if (!jobId) return;
+    setReprocessing(true);
+    try {
+      await api.reprocessJob(jobId, params);
+      // Subscribe to SSE for progress events — same channel as the original pipeline
+      const sse = api.subscribeProgress(jobId, (event) => {
+        appendLog(event);
+        if (event.stage === 'complete') {
+          sse.close();
+          setReprocessing(false);
+          // Reload rooms, plan, and outline from the updated result
+          loadResultIntoScene(jobId);
+        } else if (event.stage === 'error') {
+          sse.close();
+          setReprocessing(false);
+        }
+      });
+    } catch (err) {
+      setReprocessing(false);
+      appendLog({
+        stage: 'error',
+        message: err instanceof Error ? err.message : 'Re-process request failed',
+        progress: 1,
+        job_id: jobId,
+      });
+    }
+  }, [jobId, setReprocessing, appendLog, loadResultIntoScene]);
 
   const isProcessing = phase === 'processing' || phase === 'uploading';
+  const spinnerLabel = isScanOnly ? 'Generating floor plan…' : 'Aligning scan to plan…';
 
   return (
     <div className="grid h-screen" style={{ gridTemplateColumns: '1fr 380px' }}>
@@ -175,15 +319,16 @@ export default function App() {
           <div className="absolute bottom-4 left-4 space-y-3">
             <RoomLegend />
             <FixtureLegend />
+            <OutlineLegend />
           </div>
         )}
 
         {/* Processing overlay */}
-        {isProcessing && phase !== 'aligned' && (
+        {isProcessing && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900/60 backdrop-blur-sm">
             <div className="flex flex-col items-center gap-4">
               <div className="w-12 h-12 rounded-full border-4 border-blue-400 border-t-transparent animate-spin" />
-              <p className="text-blue-300 font-medium text-sm">Aligning scan to plan…</p>
+              <p className="text-blue-300 font-medium text-sm">{spinnerLabel}</p>
             </div>
           </div>
         )}
@@ -213,11 +358,16 @@ export default function App() {
             <UploadZone onFilesReady={handleFilesReady} disabled={isProcessing} />
           )}
 
+          {/* Job history — shown only on idle/failed so it doesn't compete with results */}
+          {(phase === 'idle' || phase === 'failed') && (
+            <JobHistoryPanel onResumeJob={handleResumeJob} />
+          )}
+
           {/* Processing log */}
           <ProcessingPanel />
 
           {/* Confidence + controls */}
-          <ConfidencePanel />
+          <ConfidencePanel onReprocess={handleReprocess} />
 
           {/* Room detail */}
           {selectedRoomId && <RoomDetailPanel />}
@@ -277,9 +427,37 @@ function FixtureLegend() {
   );
 }
 
+function OutlineLegend() {
+  return (
+    <div className="rounded-lg bg-gray-900/80 border border-gray-700 px-3 py-2 backdrop-blur-sm">
+      <div className="flex items-center gap-2 text-xs">
+        <span className="w-4 h-0.5 flex-shrink-0" style={{ backgroundColor: '#f59e0b' }} />
+        <span className="text-gray-300">Building outline</span>
+      </div>
+    </div>
+  );
+}
+
 function _clearScene(scene: AlignmentScene) {
-  if (scene.scanCloud) { scene.scene.remove(scene.scanCloud); scene.scanCloud = null; }
-  if (scene.planLines) { scene.scene.remove(scene.planLines); scene.planLines = null; }
-  if (scene.roomOverlay) { scene.scene.remove(scene.roomOverlay.group); scene.roomOverlay = null; }
-  if (scene.fixtureMarkers) { scene.scene.remove(scene.fixtureMarkers.group); scene.fixtureMarkers = null; }
+  const disposeObj = (obj: THREE.Points | THREE.LineSegments | THREE.LineLoop | null) => {
+    if (!obj) return;
+    scene.scene.remove(obj);
+    obj.geometry.dispose();
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    mats.forEach((m) => (m as THREE.Material).dispose());
+  };
+  disposeObj(scene.scanCloud);
+  scene.scanCloud = null;
+  disposeObj(scene.planLines);
+  scene.planLines = null;
+  disposeObj(scene.outlineLines);
+  scene.outlineLines = null;
+  if (scene.roomOverlay) {
+    scene.scene.remove(scene.roomOverlay.group);
+    scene.roomOverlay = null;
+  }
+  if (scene.fixtureMarkers) {
+    scene.scene.remove(scene.fixtureMarkers.group);
+    scene.fixtureMarkers = null;
+  }
 }

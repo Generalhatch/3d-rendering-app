@@ -13,7 +13,7 @@ import numpy as np
 import open3d as o3d
 
 from .slicing import detect_floor, extract_wall_band, FloorReference
-from .segment import extract_wall_planes, WallPlane
+from .segment import extract_wall_planes, extract_wall_planes_with_fallback, WallPlane
 from .axes import principal_axes_from_walls, principal_axes_from_lines
 
 
@@ -49,7 +49,12 @@ def align_scan_to_plan(
     scan_ds = wall_band.voxel_down_sample(voxel_size)
 
     # 3. RANSAC wall plane detection on the clean slice
-    wall_planes = extract_wall_planes(scan_ds, voxel_size=voxel_size)
+    wall_planes, _ = extract_wall_planes_with_fallback(
+        scan_ds,
+        up_axis_idx=floor.axis_idx,
+        full_cloud=scan_pcd,
+        floor_z=floor.floor_z_estimate,
+    )
 
     if len(wall_planes) < 2:
         raise ValueError(

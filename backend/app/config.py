@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     results_dir: Path = Path("../data/results")
     db_path: Path = Path("../data/jobs.sqlite")
 
+    # Storage cleanup
+    cleanup_enabled: bool = True           # run automatic cleanup on startup + every 24 h
+    cleanup_max_age_days: int = 30         # remove upload files for jobs older than this
+    cleanup_uploads_only: bool = True      # if True, only raw uploads are removed (artifacts/results kept)
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

@@ -63,7 +63,7 @@ The MVP targets the Alignment Technician persona. Everything else is v2+.
 Explicitly out of scope to keep MVP tight:
 
 - Multi-floor stacking (separate scans of different floors of the same building)
-- Multi-scan registration (combining 3+ scans of one space)
+- **Multi-scan registration for isolated rooms** (combining scans with no shared visual content — requires room-topology graph matching, shape/wall-length heuristics). _Scans with doorway overlap or from professional pre-registered exports are fully supported in v1._
 - Per-room **dimensional measurements** (room areas, wall lengths, corner coordinates). Per-room *visualization* IS in v1; quantitative measurements are v2.
 - **Classified fixture identification** ("this is an electrical panel" vs "this is a door trim"). Fixture *detection and marking* IS in v1; AI-driven labeling is v2.
 - **Accurate fixture dimensions** (exact size, mounting heights, model identification). Approximate bounding boxes are shown in v1 for visualization only.
@@ -76,7 +76,13 @@ Explicitly out of scope to keep MVP tight:
 - Batch processing of >1 building at a time
 - Persistent project history beyond the current session
 
-These appear on the roadmap (section 11) for context.
+**Shipped beyond original v1 scope (added during development):**
+
+- **Scan-only mode** — users can upload LiDAR scans with no DXF plan. The pipeline auto-generates a 2D floor plan via wall-plane detection + 2D projection line RANSAC. Confidence is 100% (the plan IS the scan). This enables the "no DXF required" demo flow.
+- **Multi-scan merging** — up to N LAZ/LAS/PLY/E57 files per job, one per room. Pre-registered scans are detected (centroid spread + spatial overlap check) and concatenated. Unregistered scans fall back to FPFH + ICP pairwise registration.
+- **Height-filtered viewer PLY** — only wall-band points (0.2–2.5m above floor) are sent to the browser viewer, removing floor reflections, ceiling data, and outdoor trees captured through windows.
+
+These are now in scope for v1 and implemented.
 
 ---
 
@@ -203,7 +209,7 @@ These are not commitments — they're framing for the client conversation about 
 
 **v2 (next 2–4 weeks after MVP signoff):**
 - Multi-floor stacking
-- Multi-scan registration (3+ scans aligned to one plan)
+- **Room-topology stitching for isolated scans** — when scans have no overlap (truly independent room captures), use wall-length + doorway-opening graph matching to stitch rooms together without ICP. Requires: (1) detecting wall openings (doorways) in each room scan, (2) building a topology graph, (3) combinatorial search for the layout that satisfies all adjacency constraints. ~3–4 weeks engineering effort.
 - Per-room **dimensional measurements** — room areas, wall lengths, corner coordinates with reported error bounds (the room polygons from v1 become the input to per-room geometric extraction)
 - Wall corner extraction with reported coordinates
 - **AI-driven fixture classification** — vision model labels detected protrusions (electrical panel, outlet, door trim, thermostat, fire extinguisher, HVAC return, etc.) with confidence scores

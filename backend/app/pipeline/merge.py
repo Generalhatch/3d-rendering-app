@@ -40,11 +40,13 @@ class MergeResult:
     total_points_before_ds: int   # sum of points in each scan after initial downsample
     total_points_after: int       # final merged+downsampled count
     strategy: str                 # "concatenate" | "icp_registered" | "single"
+    centroid_offset: np.ndarray   # 3-vector subtracted by _center_cloud; add it back
+                                  # to convert centered coords → original scan frame
 
 
-# If any centroid is more than this far from the others, scans are probably
-# in different coordinate frames (or on different floors / buildings).
-_SAME_FRAME_RADIUS_M = 300.0
+# Minimum centroid spread (metres) that indicates scans are in a shared large-scale
+# coordinate frame rather than each sitting at their own local origin.
+_SHARED_FRAME_SPREAD_M = 5.0
 
 
 def merge_scans(
@@ -72,6 +74,9 @@ def merge_scans(
         _emit("Downsampling…", 0.5)
         ds = pcd.voxel_down_sample(voxel_size)
         del pcd  # free full-res immediately
+        ds, _ = ds.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        centroid_offset = np.asarray(ds.points, dtype=np.float64).mean(axis=0)
+        ds = _center_cloud(ds)
         _emit(f"Loaded: {len(ds.points):,} points", 1.0)
         return MergeResult(
             merged=ds,
@@ -79,9 +84,14 @@ def merge_scans(
             total_points_before_ds=pts_raw,
             total_points_after=len(ds.points),
             strategy="single",
+            centroid_offset=centroid_offset,
         )
 
-    # ── Step 1: Stream-load and immediately downsample each scan ─────────────
+    # ── Step 1: Stream-load, downsample, and clean each scan ─────────────────
+    # Statistical outlier removal runs per-scan before merging.
+    # This removes: floating scan artifacts, scanner motion blur, tree foliage,
+    # and any isolated noise points captured through windows or open doors.
+    # nb_neighbors=20 / std_ratio=2.0 is conservative — removes only clear outliers.
     downsampled: list[o3d.geometry.PointCloud] = []
     total_pts_ds = 0
 
@@ -91,6 +101,7 @@ def merge_scans(
         pcd = load_point_cloud(path)
         ds = pcd.voxel_down_sample(voxel_size)
         del pcd   # free full-resolution cloud immediately
+        ds, _ = ds.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         total_pts_ds += len(ds.points)
         downsampled.append(ds)
         _emit(f"  → {len(ds.points):,} points after downsample", (i + 0.9) / n * 0.55)
@@ -116,6 +127,14 @@ def merge_scans(
     _emit("Final downsample…", 0.90)
     merged = merged.voxel_down_sample(voxel_size)
 
+    # ── Step 5: Center the merged cloud at origin for numerical stability ─────
+    # Geographic/UTM coordinates (e.g. X=500000, Y=4500000) cause issues with
+    # Open3D's RANSAC. We center once here so all downstream code works with
+    # coordinates near the origin, while preserving relative scan positions.
+    # Store the offset so per-scan re-loading can apply the same transform.
+    centroid_offset = np.asarray(merged.points, dtype=np.float64).mean(axis=0)
+    merged = _center_cloud(merged)
+
     _emit(
         f"Merge complete — {len(merged.points):,} pts from {n} scans "
         f"({'pre-registered' if pre_registered else 'ICP-registered'})",
@@ -128,22 +147,48 @@ def merge_scans(
         total_points_before_ds=total_pts_ds,
         total_points_after=len(merged.points),
         strategy=strategy,
+        centroid_offset=centroid_offset,
     )
 
 
 # ── Coordinate-frame detection ────────────────────────────────────────────────
 
+def _center_cloud(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+    """Subtract the centroid so the cloud is centred near origin.
+
+    Called once on the fully-merged cloud to ensure all downstream pipeline
+    code (RANSAC, ICP, projection) works with coordinates near 0,0,0.
+    Colors are preserved.
+    """
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    centroid = pts.mean(axis=0)
+    centered = o3d.geometry.PointCloud()
+    centered.points = o3d.utility.Vector3dVector(pts - centroid)
+    if pcd.has_colors():
+        centered.colors = pcd.colors
+    return centered
+
+
 def _scans_share_coordinate_frame(clouds: list[o3d.geometry.PointCloud]) -> bool:
     """Return True if all scans appear to be in the same coordinate frame.
 
-    Method: compute each scan's centroid. If ALL centroids are within
-    _SAME_FRAME_RADIUS_M of the group centroid, the scans are almost certainly
-    pre-registered (same site frame). This is far more reliable than bbox
-    overlap for large floors where adjacent-room scans may not overlap at all.
+    Two-stage check:
 
-    Professional LiDAR software (Leica Cyclone, FARO SCENE, NavVis, Matterport
-    Pro3) always exports pre-registered LAZ in world coordinates, so this
-    check will pass for virtually all real-world client data.
+    Stage 1 — centroid spread.  If scan centroids are spread out (>5m apart on
+    average), they're almost certainly pre-registered professional exports
+    (Leica Cyclone, FARO SCENE, NavVis, Matterport Pro3 all output scans in a
+    common site frame).
+
+    Stage 2 — spatial overlap.  If all centroids are suspiciously close to each
+    other (<5m apart), it could mean either:
+      (a) Pre-registered scans of a very compact space, OR
+      (b) Unregistered scans — each scan is in its own local frame starting
+          near 0,0,0 (e.g. exported without global registration).
+
+    To distinguish (a) from (b) we check voxel overlap: if a meaningful
+    fraction of voxels from scan A land within tolerance of voxels from scan B,
+    the scans genuinely share space → pre-registered.  If no overlap is found,
+    treat as unregistered.
     """
     centroids = np.array([
         np.asarray(c.points).mean(axis=0)
@@ -155,7 +200,42 @@ def _scans_share_coordinate_frame(clouds: list[o3d.geometry.PointCloud]) -> bool
 
     group_centroid = centroids.mean(axis=0)
     max_dist = float(np.linalg.norm(centroids - group_centroid, axis=1).max())
-    return max_dist <= _SAME_FRAME_RADIUS_M
+
+    # Clear sign of a shared large-scale coordinate frame: centroids are spread
+    # meaningfully across the floor footprint.  5m spread is a conservative lower
+    # bound — a 10 m × 10 m office would have room centroids ≥3–4 m apart.
+    if max_dist >= 5.0:
+        return True
+
+    # Centroids are all very close — could be pre-registered compact space OR
+    # unregistered (each scan sitting at its own local origin).  Verify by
+    # checking actual voxel overlap between the first pair of scans.
+    return _clouds_have_spatial_overlap(clouds[0], clouds[1], voxel_size=0.20)
+
+
+def _clouds_have_spatial_overlap(
+    a: o3d.geometry.PointCloud,
+    b: o3d.geometry.PointCloud,
+    voxel_size: float = 0.20,
+    min_overlap_fraction: float = 0.05,
+) -> bool:
+    """Return True if at least min_overlap_fraction of scan A's voxels are
+    occupied by scan B (i.e. the scans genuinely share physical space).
+
+    Uses a simple 3D hash set comparison at coarse resolution.
+    """
+    def _voxel_set(pcd: o3d.geometry.PointCloud) -> set:
+        pts = np.asarray(pcd.points)
+        keys = (pts / voxel_size).astype(np.int32)
+        return {(int(k[0]), int(k[1]), int(k[2])) for k in keys}
+
+    set_a = _voxel_set(a)
+    set_b = _voxel_set(b)
+    if not set_a:
+        return False
+    overlap = len(set_a & set_b)
+    fraction = overlap / len(set_a)
+    return fraction >= min_overlap_fraction
 
 
 # ── Pairwise ICP registration (fallback for unregistered scans) ───────────────

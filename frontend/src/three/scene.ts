@@ -11,6 +11,7 @@ export class AlignmentScene {
 
   scanCloud: THREE.Points | null = null;
   planLines: THREE.LineSegments | null = null;
+  outlineLines: THREE.LineLoop | null = null;
   roomOverlay: RoomOverlay | null = null;
   fixtureMarkers: FixtureMarkers | null = null;
 
@@ -19,8 +20,12 @@ export class AlignmentScene {
   private _onFixturePick: ((id: string | null) => void) | null = null;
   private _raycaster = new THREE.Raycaster();
   private _pointer = new THREE.Vector2();
+  private _resizeHandler!: () => void;
+  private _canvas!: HTMLCanvasElement;
 
   constructor(canvas: HTMLCanvasElement) {
+    this._canvas = canvas;
+
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x111827);
 
@@ -44,8 +49,9 @@ export class AlignmentScene {
     // Default to top-down view
     this.controls.enableRotate = true;
 
+    this._resizeHandler = () => this._onResize(canvas);
     canvas.addEventListener('click', this._onClick);
-    window.addEventListener('resize', () => this._onResize(canvas));
+    window.addEventListener('resize', this._resizeHandler);
   }
 
   loadScan(positions: Float32Array, colors?: Float32Array) {
@@ -55,15 +61,49 @@ export class AlignmentScene {
     }
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    if (colors) geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    const mat = new THREE.PointsMaterial({
-      size: 0.05,
-      color: colors ? 0xffffff : 0xe11d48,
-      vertexColors: !!colors,
-      transparent: true,
-      opacity: 0.8,
-      sizeAttenuation: true,
-    });
+
+    let mat: THREE.PointsMaterial;
+    if (colors) {
+      geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      mat = new THREE.PointsMaterial({
+        size: 0.12,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.85,
+        sizeAttenuation: true,
+        depthWrite: false,
+      });
+    } else {
+      // No vertex colors — compute a height-gradient so the user can perceive
+      // floor vs. wall vs. ceiling depth without any RGB scanner data.
+      // Gradient: deep navy (floor) → sky blue (low wall) → cyan (mid wall) → pale blue-white (ceiling)
+      geom.computeBoundingBox();
+      const bbox = geom.boundingBox!;
+      const zMin = bbox.min.z;
+      const zRange = Math.max(bbox.max.z - zMin, 0.001);
+
+      const n = positions.length / 3;
+      const gradientColors = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) {
+        const z = positions[i * 3 + 2];
+        const t = Math.max(0, Math.min(1, (z - zMin) / zRange));
+        const [r, g, b] = _heightToColor(t);
+        gradientColors[i * 3]     = r;
+        gradientColors[i * 3 + 1] = g;
+        gradientColors[i * 3 + 2] = b;
+      }
+      geom.setAttribute('color', new THREE.BufferAttribute(gradientColors, 3));
+
+      mat = new THREE.PointsMaterial({
+        size: 0.12,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.85,
+        sizeAttenuation: true,
+        depthWrite: false,
+      });
+    }
+
     this.scanCloud = new THREE.Points(geom, mat);
     this.scene.add(this.scanCloud);
   }
@@ -73,17 +113,47 @@ export class AlignmentScene {
       this.scene.remove(this.planLines);
       this.planLines.geometry.dispose();
     }
+    if (segments.length === 0) return;
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(segments, 3));
-    const mat = new THREE.LineBasicMaterial({ color: 0xd1d5db, linewidth: 1 });
+    // Bright white plan lines so wall outlines are clearly legible over the point cloud
+    const mat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
     this.planLines = new THREE.LineSegments(geom, mat);
+    // Render plan lines on top of the point cloud
+    this.planLines.renderOrder = 1;
     this.scene.add(this.planLines);
+  }
+
+  loadOutline(polygon: Float32Array, floorZ = 0) {
+    if (this.outlineLines) {
+      this.scene.remove(this.outlineLines);
+      this.outlineLines.geometry.dispose();
+      (this.outlineLines.material as THREE.Material).dispose();
+      this.outlineLines = null;
+    }
+    if (polygon.length < 6) return;  // need at least 3 XYZ vertices
+
+    const geom = new THREE.BufferGeometry();
+    // Lift the outline slightly above floor_z so it's never clipped by the cloud
+    const lifted = new Float32Array(polygon.length);
+    for (let i = 0; i < polygon.length; i += 3) {
+      lifted[i]     = polygon[i];
+      lifted[i + 1] = polygon[i + 1];
+      lifted[i + 2] = floorZ + 0.05;
+    }
+    geom.setAttribute('position', new THREE.BufferAttribute(lifted, 3));
+    // Bright amber outline — distinct from white plan lines and room fill colours
+    const mat = new THREE.LineBasicMaterial({ color: 0xf59e0b, linewidth: 2 });
+    this.outlineLines = new THREE.LineLoop(geom, mat);
+    this.outlineLines.renderOrder = 2;
+    this.scene.add(this.outlineLines);
   }
 
   setScanTransform(matrix: THREE.Matrix4) {
     if (!this.scanCloud) return;
     this.scanCloud.matrixAutoUpdate = false;
     this.scanCloud.matrix.copy(matrix);
+    this.scanCloud.matrixWorldNeedsUpdate = true;
   }
 
   setScanOpacity(opacity: number) {
@@ -116,16 +186,21 @@ export class AlignmentScene {
   }
 
   fitToScene() {
-    const box = new THREE.Box3().setFromObject(this.scene);
+    const target = this.scanCloud ?? this.planLines;
+    if (!target) return;
+    const box = new THREE.Box3().setFromObject(target);
     if (box.isEmpty()) return;
     const center = new THREE.Vector3();
     const size = new THREE.Vector3();
     box.getCenter(center);
     box.getSize(size);
-    const maxDim = Math.max(size.x, size.y, size.z);
+    // For floor-plan scans (Z-up, XY spread), the widest dimensions are X and Y.
+    // Position camera above the scene looking straight down.
+    const maxDim = Math.max(size.x, size.y);
     const fov = this.camera.fov * (Math.PI / 180);
     const dist = (maxDim / 2) / Math.tan(fov / 2) * 1.5;
-    this.camera.position.set(center.x, center.y + dist * 0.01, center.z + dist);
+    this.camera.position.set(center.x, center.y, center.z + dist);
+    this.camera.up.set(0, 1, 0);
     this.camera.lookAt(center);
     this.controls.target.copy(center);
     this.controls.update();
@@ -163,6 +238,8 @@ export class AlignmentScene {
 
   dispose() {
     this.stopRenderLoop();
+    window.removeEventListener('resize', this._resizeHandler);
+    this._canvas.removeEventListener('click', this._onClick);
     this.renderer.dispose();
   }
 
@@ -196,4 +273,29 @@ export class AlignmentScene {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
   };
+}
+
+// Height-gradient color stops: floor (dark navy) → wall mid (cyan) → ceiling (pale blue-white)
+const _HEIGHT_STOPS: Array<{ t: number; r: number; g: number; b: number }> = [
+  { t: 0.00, r: 0.07, g: 0.12, b: 0.40 },  // floor: deep navy
+  { t: 0.30, r: 0.10, g: 0.47, b: 0.82 },  // low wall: medium blue
+  { t: 0.60, r: 0.22, g: 0.74, b: 0.88 },  // mid wall: cyan
+  { t: 1.00, r: 0.78, g: 0.94, b: 1.00 },  // ceiling: pale blue-white
+];
+
+function _heightToColor(t: number): [number, number, number] {
+  for (let i = 1; i < _HEIGHT_STOPS.length; i++) {
+    const lo = _HEIGHT_STOPS[i - 1];
+    const hi = _HEIGHT_STOPS[i];
+    if (t <= hi.t) {
+      const f = (t - lo.t) / (hi.t - lo.t);
+      return [
+        lo.r + f * (hi.r - lo.r),
+        lo.g + f * (hi.g - lo.g),
+        lo.b + f * (hi.b - lo.b),
+      ];
+    }
+  }
+  const last = _HEIGHT_STOPS[_HEIGHT_STOPS.length - 1];
+  return [last.r, last.g, last.b];
 }

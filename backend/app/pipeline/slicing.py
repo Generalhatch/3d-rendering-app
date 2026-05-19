@@ -21,23 +21,26 @@ class FloorReference:
     axis_idx: int               # 2 for Z-up, 1 for Y-up
 
 
-def detect_floor(scan: o3d.geometry.PointCloud) -> FloorReference:
-    """Find the dominant horizontal plane (the floor).
+def _collect_floor_candidates(
+    scan: o3d.geometry.PointCloud,
+) -> tuple[list[FloorReference], np.ndarray]:
+    """Run iterative RANSAC to find all horizontal planes in the scan.
 
-    Handles both Z-up (standard LiDAR) and Y-up (some workflows).
-    Picks the candidate with the lowest centroid so desks/ledges don't win.
+    Returns (candidates_sorted_by_wall_score, pts_array).  The first entry
+    in the list is the best floor candidate (highest wall-content score).
+
+    Internal helper shared by detect_floor() and detect_all_floors().
     """
     scan_ds = scan.voxel_down_sample(0.1)
     pts = np.asarray(scan_ds.points)
     if len(pts) < 1000:
-        # Very sparse — try the original
         pts = np.asarray(scan.points)
         scan_ds = scan
 
-    candidates: list[tuple[float, np.ndarray, np.ndarray, int, int]] = []
+    raw: list[tuple[float, np.ndarray, np.ndarray, int, int]] = []
     remaining = scan_ds
 
-    for _ in range(8):
+    for _ in range(12):
         if len(remaining.points) < 500:
             break
         try:
@@ -51,7 +54,8 @@ def detect_floor(scan: o3d.geometry.PointCloud) -> FloorReference:
         normal = np.array(plane[:3])
         norm_len = np.linalg.norm(normal)
         if norm_len < 1e-9:
-            break
+            remaining = remaining.select_by_index(inliers, invert=True)
+            continue
         normal = normal / norm_len
 
         for axis_idx in [2, 1]:  # Z-up first, then Y-up
@@ -62,28 +66,71 @@ def detect_floor(scan: o3d.geometry.PointCloud) -> FloorReference:
                 centroid = inlier_pts.mean(axis=0)
                 floor_h = float(centroid[axis_idx])
                 up = axis if float(np.dot(normal, axis)) > 0 else -axis
-                candidates.append((floor_h, np.array(plane), up, len(inliers), axis_idx))
+                raw.append((floor_h, np.array(plane), up, len(inliers), axis_idx))
                 break
 
         remaining = remaining.select_by_index(inliers, invert=True)
 
-    if not candidates:
-        raise ValueError(
-            "No horizontal floor plane detected. "
-            "The scan may be too sparse, have no flat floor, or use an unusual coordinate convention."
+    if not raw:
+        # Hard fallback: histogram peak of the vertical axis
+        for axis_idx in [2, 1]:
+            z_col = pts[:, axis_idx]
+            hist, edges = np.histogram(z_col, bins=200)
+            floor_h = float(edges[int(np.argmax(hist))])
+            axis = np.zeros(3)
+            axis[axis_idx] = 1.0
+            dummy_plane = np.array([axis[0], axis[1], axis[2], -floor_h])
+            raw.append((floor_h, dummy_plane, axis, 1, axis_idx))
+            break
+
+    def _wall_score(floor_h: float, ax: int) -> int:
+        z = pts[:, ax]
+        return int(((z > floor_h + 0.30) & (z < floor_h + 3.00)).sum())
+
+    refs = [
+        FloorReference(
+            plane_eq=plane_eq,
+            up_normal=up,
+            floor_z_estimate=floor_h,
+            inlier_count=count,
+            axis_idx=axis_idx,
         )
+        for floor_h, plane_eq, up, count, axis_idx in raw
+    ]
+    refs.sort(key=lambda r: -_wall_score(r.floor_z_estimate, r.axis_idx))
+    return refs, pts
 
-    # Pick the lowest centroid — desks/ceiling planes are above the floor
-    candidates.sort(key=lambda c: c[0])
-    floor_z, plane_eq, up, count, axis_idx = candidates[0]
 
-    return FloorReference(
-        plane_eq=plane_eq,
-        up_normal=up,
-        floor_z_estimate=floor_z,
-        inlier_count=count,
-        axis_idx=axis_idx,
-    )
+def detect_floor(scan: o3d.geometry.PointCloud) -> FloorReference:
+    """Find the dominant horizontal plane (the floor).
+
+    Handles both Z-up (standard LiDAR) and Y-up (some workflows).
+
+    Selection strategy: among all detected horizontal planes, pick the one whose
+    height maximises the number of *wall-type* points directly above it (0.3–3 m
+    band).  This reliably selects the indoor building floor over outdoor terrain,
+    sub-floors, or parking structures — even when those lower surfaces have large
+    RANSAC inlier counts.
+    """
+    candidates, _ = _collect_floor_candidates(scan)
+    return candidates[0]
+
+
+def detect_all_floors(scan: o3d.geometry.PointCloud) -> list[FloorReference]:
+    """Return all detected horizontal floor planes sorted by wall-content score.
+
+    The first entry matches what detect_floor() returns.  Subsequent entries
+    represent additional levels (upper floors, mezzanines, parking decks, etc.)
+    that were found by the iterative RANSAC pass.
+
+    Each ``FloorReference.floor_z_estimate`` gives the elevation of that level
+    in the scan's local coordinate frame.
+
+    Useful for multi-floor buildings: call this once, persist the result, then
+    let the user select which level to generate rooms for.
+    """
+    candidates, _ = _collect_floor_candidates(scan)
+    return candidates
 
 
 def extract_wall_band(

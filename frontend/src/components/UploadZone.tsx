@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react';
 
 interface UploadZoneProps {
-  onFilesReady: (plan: File, scans: File[]) => void;
+  onFilesReady: (scans: File[], plan: File | null, bandLow: number, bandHigh: number) => void;
   disabled?: boolean;
 }
 
@@ -9,6 +9,9 @@ export function UploadZone({ onFilesReady, disabled }: UploadZoneProps) {
   const [planFile, setPlanFile] = useState<File | null>(null);
   const [scanFiles, setScanFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [bandLow, setBandLow] = useState(0.75);
+  const [bandHigh, setBandHigh] = useState(1.80);
 
   const addFiles = useCallback(
     (files: File[]) => {
@@ -52,10 +55,10 @@ export function UploadZone({ onFilesReady, disabled }: UploadZoneProps) {
     setScanFiles((prev) => prev.filter((f) => f.name !== name));
 
   const handleAlign = () => {
-    if (planFile && scanFiles.length > 0) onFilesReady(planFile, scanFiles);
+    if (scanFiles.length > 0) onFilesReady(scanFiles, planFile, bandLow, bandHigh);
   };
 
-  const ready = !!planFile && scanFiles.length > 0 && !disabled;
+  const ready = scanFiles.length > 0 && !disabled;
 
   return (
     <div className="flex flex-col gap-3">
@@ -89,15 +92,23 @@ export function UploadZone({ onFilesReady, disabled }: UploadZoneProps) {
         </div>
       </div>
 
-      {/* Plan slot */}
+      {/* Plan slot — optional */}
       <SingleFileSlot
-        label="Plan (DXF)"
+        label="Plan (DXF) — optional"
+        sublabel={planFile ? undefined : "Without a plan, floor layout is generated from the scan"}
         file={planFile}
         accept=".dxf"
         onFile={setPlanFile}
         color="blue"
         icon="📐"
       />
+
+      {/* No-plan info badge */}
+      {!planFile && scanFiles.length > 0 && (
+        <div className="rounded-lg bg-blue-950/30 border border-blue-800 px-3 py-2 text-xs text-blue-300">
+          No DXF? No problem — floor plan will be generated directly from the scan.
+        </div>
+      )}
 
       {/* Scan files list */}
       <div className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
@@ -155,6 +166,42 @@ export function UploadZone({ onFilesReady, disabled }: UploadZoneProps) {
         </div>
       )}
 
+      {/* Advanced settings accordion */}
+      <div className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="w-full flex items-center justify-between px-3 py-2 text-xs font-semibold text-gray-500 hover:text-gray-300 transition-colors"
+        >
+          <span>Advanced settings</span>
+          <span className="text-gray-600">{showAdvanced ? '▲' : '▼'}</span>
+        </button>
+        {showAdvanced && (
+          <div className="px-3 pb-3 space-y-3 border-t border-gray-700">
+            <p className="text-xs text-gray-500 pt-2">
+              Wall detection band — vertical range above floor to use for wall extraction.
+              Adjust for non-standard ceiling heights or raised floors.
+            </p>
+            <BandInput
+              label="Band low (m)"
+              value={bandLow}
+              min={0.1}
+              max={bandHigh - 0.1}
+              step={0.05}
+              onChange={setBandLow}
+            />
+            <BandInput
+              label="Band high (m)"
+              value={bandHigh}
+              min={bandLow + 0.1}
+              max={5.0}
+              step={0.05}
+              onChange={setBandHigh}
+            />
+          </div>
+        )}
+      </div>
+
       {/* Align button */}
       <button
         onClick={handleAlign}
@@ -168,18 +215,21 @@ export function UploadZone({ onFilesReady, disabled }: UploadZoneProps) {
       >
         {disabled
           ? 'Processing…'
-          : ready
+          : !ready
+          ? 'Drop scan files to begin'
+          : planFile
           ? `⚡ Align${scanFiles.length > 1 ? ` (${scanFiles.length} scans)` : ''}`
-          : 'Drop a plan + scan(s) to begin'}
+          : `🔍 Generate Floor Plan${scanFiles.length > 1 ? ` (${scanFiles.length} scans)` : ''}`}
       </button>
     </div>
   );
 }
 
 function SingleFileSlot({
-  label, file, accept, onFile, color, icon,
+  label, sublabel, file, accept, onFile, color, icon,
 }: {
   label: string;
+  sublabel?: string;
   file: File | null;
   accept: string;
   onFile: (f: File | null) => void;
@@ -208,7 +258,9 @@ function SingleFileSlot({
       <span className="text-base">{icon}</span>
       <div className="min-w-0 flex-1">
         <div className="font-semibold">{label}</div>
-        <div className="truncate">{file ? file.name : 'Not selected'}</div>
+        <div className="truncate">
+          {file ? file.name : (sublabel ?? 'Not selected')}
+        </div>
         {file && <div className="text-gray-500">{(file.size / 1024 / 1024).toFixed(1)} MB</div>}
       </div>
       {file && (
@@ -219,6 +271,33 @@ function SingleFileSlot({
           ✕
         </button>
       )}
+    </div>
+  );
+}
+
+function BandInput({
+  label, value, min, max, step, onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-gray-400 w-28 flex-shrink-0">{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="flex-1 accent-blue-500"
+      />
+      <span className="text-xs text-gray-300 w-10 text-right font-mono">{value.toFixed(2)}</span>
     </div>
   );
 }

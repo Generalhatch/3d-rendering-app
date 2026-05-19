@@ -19,6 +19,7 @@ export interface AlignmentResult {
   rotation_candidate_used: number;
   iterations: number;
   num_wall_planes: number;
+  mode?: 'aligned' | 'scan_only';
 }
 
 export interface Room {
@@ -29,6 +30,29 @@ export interface Room {
   centroid: [number, number];
   area_m2: number;
   match_quality: number | null;
+  // Shape analysis from watershed regionprops
+  eccentricity?: number;       // 0=square, 1=line (>0.8 suggests corridor)
+  orientation_deg?: number;    // major axis angle
+  solidity?: number;           // 1=convex, <0.7=highly irregular
+  // MJ1: classifier confidence — 0.30 (weak) to 0.99 (strong match)
+  classification_confidence?: number;
+}
+
+/** One detected floor level in the scan (MJ2 multi-floor support). */
+export interface FloorCandidate {
+  floor_z: number;        // elevation in scan's local coordinate frame (m)
+  inlier_count: number;   // RANSAC inlier count
+  wall_score: number;     // points 0.3–3 m above — higher = indoor floor with walls
+  axis_idx: number;       // 2 = Z-up, 1 = Y-up
+}
+
+/** Body for POST /api/jobs/:id/reprocess (MJ2 + MJ3). */
+export interface ReprocessParams {
+  floor_z?: number | null;        // null = auto-detect
+  band_low_m?: number;            // default 0.75
+  band_high_m?: number;           // default 1.80
+  min_wall_length_m?: number;     // default 2.0
+  hough_threshold?: number;       // default 35
 }
 
 export interface Fixture {
@@ -51,17 +75,22 @@ export interface JobDetail {
   updated_at: string;
   scan_filename: string;
   plan_filename: string;
+  scan_only?: boolean;
   error_message?: string | null;
   result?: AlignmentResult | null;
+  plan_bounds?: [number, number, number, number] | null;
   num_rooms?: number | null;
   num_fixtures?: number | null;
   elapsed_s?: number | null;
+  floor_z?: number;
+  floor_candidates?: FloorCandidate[];   // MJ2: all detected levels
 }
 
 export interface FullResult {
   job_id: string;
-  alignment: AlignmentResult;
+  alignment: AlignmentResult & { mode?: 'aligned' | 'scan_only' };
   floor_z: number;
+  scan_only?: boolean;
   rooms: Room[];
   fixtures: Fixture[];
   plan_bounds: [number, number, number, number];
@@ -69,6 +98,8 @@ export interface FullResult {
   elapsed_s?: number;
   num_scans?: number;
   merge_strategy?: string;
+  // MJ2: multiple floor levels detected in the scan
+  floor_candidates?: FloorCandidate[];
 }
 
 export interface ProgressEvent {
@@ -94,13 +125,16 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  createJob: async (planFile: File, scanFiles: File | File[], bandLow = 0.75, bandHigh = 1.80): Promise<JobCreate> => {
+  createJob: async (
+    scanFiles: File | File[],
+    planFile?: File | null,
+    bandLow = 0.75,
+    bandHigh = 1.80,
+  ): Promise<JobCreate> => {
     const fd = new FormData();
-    fd.append('plan', planFile);
+    if (planFile) fd.append('plan', planFile);
     const scansArray = Array.isArray(scanFiles) ? scanFiles : [scanFiles];
-    for (const scan of scansArray) {
-      fd.append('scans', scan);
-    }
+    for (const scan of scansArray) fd.append('scans', scan);
     fd.append('band_low_m', String(bandLow));
     fd.append('band_high_m', String(bandHigh));
     return request<JobCreate>('/jobs', { method: 'POST', body: fd });
@@ -113,6 +147,11 @@ export const api = {
   getFixtures: (jobId: string) => request<{ fixtures: Fixture[] }>(`/jobs/${jobId}/fixtures`),
 
   getPlanGeoJSON: (jobId: string) => request<{ type: string; features: unknown[] }>(`/jobs/${jobId}/plan`),
+
+  getOutlineGeoJSON: (jobId: string) =>
+    request<{ type: string; features: Array<{ geometry: { type: string; coordinates: number[][][] } }> }>(
+      `/jobs/${jobId}/outline`,
+    ),
 
   getScanUrl: (jobId: string) => `${BASE}/jobs/${jobId}/scan`,
 
@@ -128,21 +167,67 @@ export const api = {
 
   exportJsonUrl: (jobId: string) => `${BASE}/jobs/${jobId}/export/json`,
   exportDxfUrl: (jobId: string) => `${BASE}/jobs/${jobId}/export/dxf`,
+  getOverlayUrl: (jobId: string) => `${BASE}/jobs/${jobId}/overlay`,
+
+  /** MJ2: list all detected floor levels for this job. */
+  getFloors: (jobId: string) => request<FloorCandidate[]>(`/jobs/${jobId}/floors`),
+
+  /** MJ2/MJ3: trigger re-processing with new parameters. */
+  reprocessJob: (jobId: string, params: ReprocessParams) =>
+    request<{ job_id: string; status: string }>(
+      `/jobs/${jobId}/reprocess`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      },
+    ),
 
   subscribeProgress: (
     jobId: string,
     onEvent: (event: ProgressEvent) => void,
     onError?: (err: Event) => void,
-  ): EventSource => {
-    const es = new EventSource(`${BASE}/jobs/${jobId}/sse`);
-    es.onmessage = (e) => {
-      try {
-        onEvent(JSON.parse(e.data) as ProgressEvent);
-      } catch {
-        // ignore parse errors
-      }
+  ): { close: () => void } => {
+    let es: EventSource | null = null;
+    let closed = false;
+    let retryDelay = 1000;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      if (closed) return;
+      es = new EventSource(`${BASE}/jobs/${jobId}/sse`);
+
+      es.onmessage = (e) => {
+        retryDelay = 1000; // reset backoff on successful message
+        try {
+          onEvent(JSON.parse(e.data) as ProgressEvent);
+        } catch {
+          // ignore parse errors
+        }
+      };
+
+      es.onerror = (err) => {
+        if (closed) return;
+        es?.close();
+        es = null;
+        if (onError) onError(err);
+        // Exponential backoff: 1s → 2s → 4s → 8s → 16s → 30s max
+        retryTimer = setTimeout(() => {
+          retryDelay = Math.min(retryDelay * 2, 30_000);
+          connect();
+        }, retryDelay);
+      };
     };
-    if (onError) es.onerror = onError;
-    return es;
+
+    connect();
+
+    return {
+      close: () => {
+        closed = true;
+        if (retryTimer !== null) clearTimeout(retryTimer);
+        es?.close();
+        es = null;
+      },
+    };
   },
 };

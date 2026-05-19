@@ -40,6 +40,26 @@ export function RoomDetailPanel() {
           valueClass={mqColor}
         />
         <Stat label="Room ID" value={room.id} />
+        {room.classification_confidence !== undefined && (
+          <Stat
+            label="Type Confidence"
+            value={`${Math.round(room.classification_confidence * 100)}%`}
+            valueClass={
+              room.classification_confidence >= 0.80 ? 'text-green-400' :
+              room.classification_confidence >= 0.60 ? 'text-yellow-400' :
+              'text-gray-400'
+            }
+          />
+        )}
+        {room.eccentricity !== undefined && (
+          <Stat
+            label="Shape"
+            value={
+              room.eccentricity > 0.80 ? 'Elongated' :
+              room.eccentricity < 0.30 ? 'Compact' : 'Regular'
+            }
+          />
+        )}
       </div>
 
       {mq !== null && (
@@ -55,6 +75,30 @@ export function RoomDetailPanel() {
                 mq >= 0.70 ? 'bg-yellow-500' : 'bg-red-500'
               }`}
               style={{ width: `${Math.round(mq * 100)}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {room.classification_confidence !== undefined && (
+        <div className="space-y-1">
+          <div className="flex justify-between text-xs text-gray-500">
+            <span>Classification confidence</span>
+            <span className={
+              room.classification_confidence >= 0.80 ? 'text-green-400' :
+              room.classification_confidence >= 0.60 ? 'text-yellow-400' :
+              'text-gray-400'
+            }>
+              {Math.round(room.classification_confidence * 100)}%
+            </span>
+          </div>
+          <div className="h-1.5 rounded-full bg-gray-700">
+            <div
+              className={`h-full rounded-full ${
+                room.classification_confidence >= 0.80 ? 'bg-green-500' :
+                room.classification_confidence >= 0.60 ? 'bg-yellow-500' : 'bg-gray-500'
+              }`}
+              style={{ width: `${Math.round(room.classification_confidence * 100)}%` }}
             />
           </div>
         </div>

@@ -1,0 +1,25 @@
+- generic [ref=e3]:
+  - generic [ref=e6]:
+    - button "⊤ Top" [ref=e7] [cursor=pointer]
+    - button "⊞ Fit" [ref=e8] [cursor=pointer]
+  - generic [ref=e10]:
+    - generic [ref=e12]:
+      - heading "AlignAI" [level=1] [ref=e13]
+      - paragraph [ref=e14]: Scan-to-Plan Alignment
+    - generic [ref=e15]:
+      - generic [ref=e16] [cursor=pointer]:
+        - generic [ref=e17]: 📁
+        - generic [ref=e18]:
+          - paragraph [ref=e19]: Drop files here or click to browse
+          - paragraph [ref=e20]: "Plan: .dxf · Scans: .las / .laz / .ply / .e57 (multiple OK)"
+      - generic [ref=e21] [cursor=pointer]:
+        - generic [ref=e22]: 📐
+        - generic [ref=e23]:
+          - generic [ref=e24]: Plan (DXF) — optional
+          - generic [ref=e25]: Without a plan, floor layout is generated from the scan
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - generic [ref=e28]: Scans (0)
+          - button "+ Add scans" [ref=e29] [cursor=pointer]
+        - generic [ref=e30]: No scans yet — drop .laz files here
+      - button "Drop scan files to begin" [disabled] [ref=e31]
