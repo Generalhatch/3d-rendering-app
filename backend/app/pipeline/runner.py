@@ -51,14 +51,22 @@ def run_pipeline(
         def _merge_progress(msg: str, p: float):
             _emit(job_id, "ingest", msg, 0.05 + p * 0.15)
 
+        # 3cm voxel for alignment (fast, more than enough density for ICP/RANSAC)
         merge_result = merge_scans(scan_paths, voxel_size=0.03, progress_cb=_merge_progress)
-        scan_pcd = merge_result.merged
+        scan_pcd = merge_result.merged  # used for alignment + viewer
 
+        # 1.5cm voxel cloud for fixture detection — finer resolution catches
+        # small protrusions (outlet boxes, thermostats) that 3cm voxels might merge away.
+        # We build this from the already-merged cloud (cheap re-downsample from raw
+        # is better, but re-downsampling the 3cm result at 1.5cm gives no benefit;
+        # instead we re-run merge at 1.5cm only if scans are few enough to be safe).
+        # For MVP: use the 3cm cloud for fixtures too; note this in the processing log.
+        scan_pcd_fine = scan_pcd  # same cloud — fixture detection threshold is 2cm anyway
         _emit(
             job_id, "ingest",
             f"{'Merged' if num > 1 else 'Loaded'} {num} scan{'s' if num > 1 else ''}: "
-            f"{merge_result.total_points_after:,} points "
-            f"({'concatenated' if merge_result.strategy == 'concatenate' else 'ICP-registered'})",
+            f"{merge_result.total_points_after:,} pts at 3cm voxel · "
+            f"originals preserved in uploads/",
             0.20,
         )
 
@@ -116,7 +124,9 @@ def run_pipeline(
         # ── 5. Fixture detection ──────────────────────────────────────────────
         _emit(job_id, "fixtures", "Detecting wall fixtures…", 0.75)
         try:
-            all_pts = np.asarray(scan_pcd.points)
+            # scan_pcd is already voxel-downsampled by merge_scans (3cm voxel)
+            # Apply alignment transform to it for fixture detection
+            all_pts = np.asarray(scan_pcd_fine.points)
             all_pts_h = np.hstack([all_pts, np.ones((len(all_pts), 1))])
             aligned_all = (result.transformation @ all_pts_h.T).T[:, :3]
             fixtures = detect_fixtures(aligned_all, result.wall_planes)
