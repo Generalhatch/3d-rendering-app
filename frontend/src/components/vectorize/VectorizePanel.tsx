@@ -16,7 +16,7 @@ export function VectorizePanel() {
   const {
     phase, jobId, scanFile, params, job, logs, overallProgress,
     setPhase, setJobId, setScanFile, patchParams, setParams,
-    setJob, appendLog, clearLogs, reset,
+    setJob, appendLog, setOverallProgress, clearLogs, reset,
   } = useVectorizeStore();
 
   const sseHandle = useRef<{ close: () => void } | null>(null);
@@ -74,7 +74,12 @@ export function VectorizePanel() {
     clearLogs();
     setPhase('uploading');
     try {
-      const created = await vectorizeApi.create(scanFile, params);
+      // Map upload bytes to the first 5 % of the overall bar. The backend's
+      // first real emit ("Loading scan…") lands at 0.05, so the handoff is
+      // seamless — bar never goes backwards.
+      const created = await vectorizeApi.create(scanFile, params, (fraction) => {
+        setOverallProgress(fraction * 0.05);
+      });
       setJobId(created.job_id);
       setPhase('processing');
 
@@ -102,7 +107,7 @@ export function VectorizePanel() {
         job_id: 'local',
       });
     }
-  }, [scanFile, params, setPhase, setJobId, appendLog, clearLogs]);
+  }, [scanFile, params, setPhase, setJobId, appendLog, setOverallProgress, clearLogs]);
 
   const refreshJob = useCallback(async (id: string) => {
     try {
@@ -147,10 +152,21 @@ export function VectorizePanel() {
     }
   }, [jobId, params, setPhase, appendLog, clearLogs, refreshJob]);
 
-  const startNew = () => {
+  const startNew = useCallback(() => {
+    // If a job is mid-flight or there are unsaved results visible, confirm
+    // before nuking — otherwise just reset silently.
+    const hasSomething = jobId !== null || phase !== 'idle' || scanFile !== null;
+    const isRunning = phase === 'uploading' || phase === 'processing';
+    if (hasSomething && isRunning) {
+      const ok = window.confirm(
+        'A job is currently running. Clear it and start over? The backend job will keep running but you will lose progress in this view.',
+      );
+      if (!ok) return;
+    }
     sseHandle.current?.close();
+    sseHandle.current = null;
     reset();
-  };
+  }, [jobId, phase, scanFile, reset]);
 
   return (
     <div className="flex flex-col gap-4 p-5 text-gray-200">
@@ -159,12 +175,13 @@ export function VectorizePanel() {
           <h1 className="text-lg font-bold text-white">Vectorize</h1>
           <p className="text-xs text-gray-500">Scan → CAD line geometry (DXF)</p>
         </div>
-        {phase !== 'idle' && (
+        {(phase !== 'idle' || jobId !== null || scanFile !== null) && (
           <button
             onClick={startNew}
-            className="text-xs text-gray-500 hover:text-gray-300"
+            title="Clear everything and start a new submission"
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-gray-700 bg-gray-800/60 hover:bg-gray-700 hover:border-gray-600 text-xs text-gray-300 transition-colors"
           >
-            New job
+            <span aria-hidden>✕</span> Clear
           </button>
         )}
       </div>
@@ -227,6 +244,17 @@ export function VectorizePanel() {
         <div className="rounded-lg bg-rose-950/40 border border-rose-800 px-3 py-2 text-xs text-rose-300">
           {job?.error_message ?? logs[logs.length - 1]?.message ?? 'Pipeline failed — check backend logs'}
         </div>
+      )}
+
+      {/* Always-visible bottom clear — only when there's actually something
+          to clear. Mirrors the header button but harder to miss. */}
+      {(jobId !== null || phase !== 'idle' || scanFile !== null) && (
+        <button
+          onClick={startNew}
+          className="w-full py-2.5 rounded-lg border border-gray-700 bg-gray-800/40 hover:bg-gray-800 hover:border-gray-600 text-sm font-medium text-gray-300 transition-colors"
+        >
+          ✕ Clear & start a new submission
+        </button>
       )}
     </div>
   );
@@ -326,7 +354,7 @@ function ParamsPanel({
               <InfoTip>
                 <p className="font-semibold text-gray-100 mb-1">What it does</p>
                 <p>The height of the horizontal slice through your scan that we look for walls in.</p>
-                <p className="mt-2"><span className="text-emerald-300">Leave blank (auto):</span> we detect the floor and slice at floor + 1.4&nbsp;m (chest height) — above furniture, below ceiling fixtures.</p>
+                <p className="mt-2"><span className="text-emerald-300">Leave blank (auto):</span> we detect the floor and slice at floor + 1.6&nbsp;m (shoulder height) — above desks, filing cabinets, and most cubicle dividers, below ducts and ceiling fixtures.</p>
                 <p className="mt-1"><span className="text-emerald-300">Set a number:</span> slice at exactly that elevation. Use for multi-storey scans or when auto picks the wrong floor.</p>
               </InfoTip>
             </label>
@@ -334,7 +362,7 @@ function ParamsPanel({
               <button
                 onClick={onReset}
                 className="text-[11px] text-gray-500 hover:text-gray-300"
-                title="Auto-detect floor + 1.4 m"
+                title="Auto-detect floor + 1.6 m"
               >
                 use auto
               </button>
@@ -345,7 +373,7 @@ function ParamsPanel({
               type="number"
               step={0.05}
               value={params.elevation_m ?? ''}
-              placeholder="auto (floor + 1.4)"
+              placeholder="auto (floor + 1.6)"
               onChange={(e) =>
                 onPatch({ elevation_m: e.target.value === '' ? null : parseFloat(e.target.value) })
               }
@@ -353,7 +381,7 @@ function ParamsPanel({
             />
           </div>
           <p className="text-[11px] text-gray-500">
-            Leave blank to auto-pick chest height above the detected floor.
+            Leave blank to auto-pick shoulder height above the detected floor.
           </p>
         </div>
 
@@ -400,9 +428,9 @@ function ParamsPanel({
             <>
               <p className="font-semibold text-gray-100 mb-1">Shortest wall we'll keep</p>
               <p>Anything shorter than this — in real-world metres — is dropped from the final DXF.</p>
-              <p className="mt-2"><span className="text-emerald-300">Low (0.10–0.50&nbsp;m):</span> keeps door jambs, columns, closet returns. More noise.</p>
-              <p className="mt-1"><span className="text-emerald-300">Default (~1.4&nbsp;m):</span> balanced — real walls, most furniture-edge noise removed.</p>
-              <p className="mt-1"><span className="text-emerald-300">High (2–5&nbsp;m):</span> structural walls only. Very clean, but you'll lose short real walls.</p>
+              <p className="mt-2"><span className="text-emerald-300">Low (0.10–0.30&nbsp;m):</span> keeps door jambs, narrow closet returns, scanner stubs. More noise.</p>
+              <p className="mt-1"><span className="text-emerald-300">0.40&nbsp;m (default):</span> balanced — keeps short partitions and closet walls, drops most fragment noise.</p>
+              <p className="mt-1"><span className="text-emerald-300">High (1.0–5.0&nbsp;m):</span> structural walls only. Very clean DXF, but you'll lose interior partitions and short real walls.</p>
             </>
           }
         />
@@ -436,6 +464,51 @@ function ParamsPanel({
             </>
           }
         />
+        <Toggle
+          label="Remove speckle"
+          help="Pre-filter isolated scanner noise + furniture stippling before detection."
+          checked={params.remove_speckle}
+          onChange={(v) => onPatch({ remove_speckle: v })}
+          tip={
+            <>
+              <p className="font-semibold text-gray-100 mb-1">Clean up the raster before detection</p>
+              <p>Runs a small morphological OPEN (3-px elliptical kernel) on the raster — any blob smaller than ~3&nbsp;cm is erased. Wipes out scanner lint and the stippling left by chairs, plants, monitors, and other furniture that intersected the slab.</p>
+              <p className="mt-2"><span className="text-emerald-300">On (default):</span> dramatically fewer "white-without-overlay" zones; cleaner DXF.</p>
+              <p className="mt-1"><span className="text-emerald-300">Off:</span> only useful on very sparse scans where every pixel matters, or when debugging why the detector missed something.</p>
+              <p className="mt-1 text-gray-500">Safe for any real wall ≥ 3&nbsp;cm thick at 1&nbsp;cm/px resolution.</p>
+            </>
+          }
+        />
+        <Toggle
+          label="Multi-elevation slicing"
+          help="OR-merge three slabs (elevation ± 0.4 m) for higher wall recall."
+          checked={params.multi_elevation}
+          onChange={(v) => onPatch({ multi_elevation: v })}
+          tip={
+            <>
+              <p className="font-semibold text-gray-100 mb-1">Catch walls that one slice would miss</p>
+              <p>Instead of slicing the cloud at a single height, we slice at <b>three</b> — elevation − 0.4&nbsp;m, elevation, and elevation + 0.4&nbsp;m — then bitwise-OR the rasters before detection. Any pixel that's a wall at <i>any</i> of those heights becomes a wall pixel in the merged image.</p>
+              <p className="mt-2"><span className="text-emerald-300">On (default):</span> recovers walls hidden by tall furniture (cubicle dividers, filing cabinets), captures doorway headers, and picks up half-height partitions. Typical recall lift: +10–20 % wall pixels covered.</p>
+              <p className="mt-1"><span className="text-emerald-300">Off:</span> classic single-slice. ~10–15 s faster, but you'll miss walls that aren't visible at the chosen height.</p>
+              <p className="mt-1 text-gray-500">Open the "Show coverage gaps" overlay in the editor to verify recall after a run.</p>
+            </>
+          }
+        />
+        <Toggle
+          label="Detect openings (doors)"
+          help="Scan each wall for door-shaped gaps; emit them on a separate DXF layer."
+          checked={params.detect_openings}
+          onChange={(v) => onPatch({ detect_openings: v })}
+          tip={
+            <>
+              <p className="font-semibold text-gray-100 mb-1">Promote the deliverable past walls-only</p>
+              <p>After regularization, we sample the raster along every kept wall in 2&nbsp;cm steps. Runs of pixels with no wall support that are <b>0.7–1.2&nbsp;m</b> wide and sit at least 30&nbsp;cm away from a wall endpoint become openings — they land on the <span className="font-mono text-amber-300">OPENINGS</span> layer in the DXF (yellow) and as dashed yellow segments in the editor.</p>
+              <p className="mt-2"><span className="text-emerald-300">On (default):</span> conservative — won't false-fire on wall terminations / corners.</p>
+              <p className="mt-1"><span className="text-emerald-300">Off:</span> wall-only output, identical to pre-Phase-4 behaviour.</p>
+              <p className="mt-1 text-gray-500">Operators can still add or edit openings manually in the editor — press <span className="font-mono text-gray-300">O</span> to draw a new opening.</p>
+            </>
+          }
+        />
 
         {/* Advanced */}
         <div>
@@ -454,14 +527,14 @@ function ParamsPanel({
                 value={params.slab_thickness_m}
                 min={0.05} max={1.00} step={0.05}
                 onChange={(v) => onPatch({ slab_thickness_m: v })}
-                help="How thick a horizontal slice we flatten into an image. 0.20 m is the sweet spot."
+                help="How thick a horizontal slice we flatten into an image. 0.10 m is the sweet spot for clean scans."
                 tip={
                   <>
                     <p className="font-semibold text-gray-100 mb-1">Slice thickness around the elevation</p>
                     <p>We grab a horizontal slab this tall, centred on the elevation plane, then squash it down into a 2D image for the detector to work on.</p>
-                    <p className="mt-2"><span className="text-emerald-300">Thinner (≤ 0.10&nbsp;m):</span> crisper corners, but sparse scans go dashed and walls get missed.</p>
-                    <p className="mt-1"><span className="text-emerald-300">0.20&nbsp;m (default):</span> the sweet spot.</p>
-                    <p className="mt-1"><span className="text-emerald-300">Thicker (≥ 0.30&nbsp;m):</span> dense image, reliable detection, but rounded corners and possible fake walls from beams/door tops.</p>
+                    <p className="mt-2"><span className="text-emerald-300">0.10&nbsp;m (default):</span> crisp cross-section of wall surfaces; least bleed-through from furniture / ducts.</p>
+                    <p className="mt-1"><span className="text-emerald-300">Thinner (≤ 0.05&nbsp;m):</span> sparse scans go dashed and short walls get missed.</p>
+                    <p className="mt-1"><span className="text-emerald-300">Thicker (0.20–0.30&nbsp;m):</span> denser image, more reliable on noisy/sparse scans, at the cost of rounded corners and fake walls from beams/door tops.</p>
                   </>
                 }
               />
@@ -689,22 +762,42 @@ function ProgressLog({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [logs.length]);
 
-  const isRunning = phase === 'processing' || phase === 'uploading';
+  const isUploading = phase === 'uploading';
+  const isProcessing = phase === 'processing';
+  const isRunning = isUploading || isProcessing;
   const recent = useMemo(() => logs.slice(-20), [logs]);
+
+  const headerLabel = isUploading
+    ? 'Uploading…'
+    : isProcessing
+    ? 'Processing…'
+    : 'Log';
+
+  // Empty-state copy depends on which stage we're in. During upload the bar is
+  // already moving (driven by XHR bytes), so don't say "waiting".
+  const emptyLabel = isUploading
+    ? `Uploading scan… ${(progress * 100).toFixed(0)}%`
+    : isProcessing
+    ? 'Starting pipeline…'
+    : 'Waiting for progress…';
 
   return (
     <div className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
       <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between">
-        <span className="text-xs font-semibold text-emerald-300">
-          {isRunning ? 'Processing…' : 'Log'}
-        </span>
+        <span className="text-xs font-semibold text-emerald-300">{headerLabel}</span>
         <span className="text-xs font-mono text-gray-400">{(progress * 100).toFixed(0)}%</span>
       </div>
-      <div className="h-1.5 bg-gray-900">
+      <div className="h-1.5 bg-gray-900 relative overflow-hidden">
         <div
           className="h-full bg-emerald-500 transition-all duration-300"
           style={{ width: `${progress * 100}%` }}
         />
+        {/* Indeterminate shimmer while we're between bytes-uploaded and the
+            first backend emit — covers the brief gap where the bar would
+            otherwise look frozen. */}
+        {isRunning && progress < 0.05 && (
+          <div className="absolute inset-0 pointer-events-none animate-progress-shimmer bg-gradient-to-r from-transparent via-emerald-400/40 to-transparent" />
+        )}
       </div>
       <div
         ref={scrollRef}
@@ -717,7 +810,7 @@ function ProgressLog({
           </div>
         ))}
         {recent.length === 0 && (
-          <div className="text-gray-600 italic">Waiting for progress…</div>
+          <div className="text-gray-600 italic">{emptyLabel}</div>
         )}
       </div>
     </div>
@@ -733,7 +826,33 @@ function ResultPanel({ jobId, job }: { jobId: string; job: NonNullable<ReturnTyp
       </div>
       <div className="px-3 py-3 space-y-2 text-xs">
         <Stat label="Wall segments" value={m.segments_after_regularize} hint={`(${m.segments_detected} raw)`} />
-        <Stat label="Elevation" value={`${m.elevation_m.toFixed(2)} m`} />
+        {typeof m.openings_detected === 'number' && (
+          <Stat
+            label="Openings"
+            value={m.openings_detected}
+            hint={m.openings_detected === 0
+              ? '(none detected — try the editor to draw any the scan missed)'
+              : '(doors / door-shaped wall gaps)'}
+          />
+        )}
+        {m.coverage_pct !== null && m.coverage_pct !== undefined && (
+          <CoverageStat
+            pct={m.coverage_pct}
+            radius_m={m.coverage_radius_m ?? null}
+            foreground={m.foreground_px ?? null}
+            uncovered={m.uncovered_px ?? null}
+            multi={(m.elevations_used_m?.length ?? 1) > 1}
+          />
+        )}
+        <Stat
+          label="Elevation"
+          value={
+            m.elevations_used_m && m.elevations_used_m.length > 1
+              ? `${m.elevations_used_m.map((e) => e.toFixed(2)).join(' / ')} m`
+              : `${m.elevation_m.toFixed(2)} m`
+          }
+          hint={m.elevations_used_m && m.elevations_used_m.length > 1 ? '(3-slab OR-merged)' : undefined}
+        />
         <Stat label="Detector" value={m.detector.toUpperCase()} />
         <Stat label="Raster" value={`${m.raster_width_px}×${m.raster_height_px} px`} hint={`(${m.raster_world_width_m.toFixed(1)}×${m.raster_world_height_m.toFixed(1)} m)`} />
         <Stat label="Points in slab" value={m.points_in_slab.toLocaleString()} hint={`(${m.raw_points.toLocaleString()} total)`} />
@@ -746,6 +865,61 @@ function ResultPanel({ jobId, job }: { jobId: string; job: NonNullable<ReturnTyp
           ⬇ Download DXF
         </a>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Wall-coverage stat with a colour-coded pill.
+ *
+ * The metric: of every "wall-foreground" pixel in the raster, what fraction
+ * lies within COVERAGE_RADIUS_M of a kept segment.  It's a recall *proxy*,
+ * not a perfect signal — the denominator includes any non-wall clutter
+ * (furniture, ducts) that survived speckle removal, so 100 % is only
+ * achievable on completely sterile scans.
+ *
+ * Threshold logic depends on which slicing mode produced the raster:
+ *
+ *   single-slice (fewer, cleaner pixels in the denominator):
+ *      ≥ 85 % green · 70–85 % amber · < 70 % red
+ *
+ *   multi-slice (3 slabs OR-merged: ~40 % more pixels — includes more
+ *   furniture at the ±0.4 m offsets, so a slightly lower % is normal):
+ *      ≥ 70 % green · 55–70 % amber · < 55 % red
+ *
+ * In both modes, the visual overlay in the editor is the ground truth —
+ * toggle "Show coverage gaps" to see whether the uncovered pixels are
+ * furniture (ignore) or actually-missed walls (manually add).
+ */
+function CoverageStat({
+  pct, radius_m, foreground, uncovered, multi,
+}: { pct: number; radius_m: number | null; foreground: number | null; uncovered: number | null; multi: boolean }) {
+  const pctInt = Math.round(pct * 1000) / 10;
+  const [greenAt, amberAt] = multi ? [0.70, 0.55] : [0.85, 0.70];
+  const tone =
+    pct >= greenAt ? 'text-emerald-300 bg-emerald-900/40 border-emerald-700/60'
+    : pct >= amberAt ? 'text-amber-300 bg-amber-900/40 border-amber-700/60'
+    : 'text-rose-300 bg-rose-950/50 border-rose-800/60';
+  const hint = uncovered !== null && foreground !== null
+    ? `(${uncovered.toLocaleString()} of ${foreground.toLocaleString()} px)`
+    : undefined;
+  const tooltip = [
+    radius_m !== null && `Coverage radius: ${(radius_m * 100).toFixed(0)} cm`,
+    multi
+      ? 'Multi-slice mode: 70 %+ is healthy. Lower coverage just means the ±0.4 m slabs picked up more furniture — toggle "Show coverage gaps" in the editor to see whether the red blobs are real walls or furniture.'
+      : 'Single-slice mode: 85 %+ is healthy. Lower coverage usually means the detector missed walls — toggle "Show coverage gaps" in the editor.',
+  ].filter(Boolean).join('\n');
+  return (
+    <div className="flex items-baseline justify-between">
+      <span className="text-gray-400" title={tooltip}>
+        Wall coverage
+      </span>
+      <span className="font-mono flex items-baseline gap-2">
+        <span className={`px-1.5 py-0.5 rounded border text-[10px] leading-none ${tone}`}>
+          {pctInt.toFixed(1)}%
+        </span>
+        {hint && <span className="text-gray-600 text-[10px]">{hint}</span>}
+      </span>
     </div>
   );
 }

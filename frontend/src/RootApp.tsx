@@ -56,7 +56,7 @@ export default function RootApp() {
         />
         <div className="flex-1" />
         <div className="px-4 text-[11px] text-gray-600 font-mono select-none">
-          stevenson-vectorize · phase 1
+          beehive automations L.L.C · phase 1
         </div>
       </div>
 

@@ -9,8 +9,14 @@ Endpoints
 - ``GET    /api/vectorize/{job_id}/slice``      Slice PNG (raw, pre-cleanup)
 - ``GET    /api/vectorize/{job_id}/overlay``    Detected lines overlay PNG
 - ``GET    /api/vectorize/{job_id}/overlay/raw`` Raw detector overlay PNG
+- ``GET    /api/vectorize/{job_id}/coverage``   RGBA gaps mask (uncovered walls)
 - ``GET    /api/vectorize/{job_id}/dxf``        Download the vectorized DXF
 - ``POST   /api/vectorize/{job_id}/reprocess``  Re-run with new params
+- ``GET    /api/vectorize/{job_id}/segments``           Editable segment list
+- ``GET    /api/vectorize/{job_id}/rejected-segments``  Ghost candidates the pipeline dropped
+- ``POST   /api/vectorize/{job_id}/find-duplicates``    Suggest near-duplicate pairs to merge
+- ``GET    /api/vectorize/{job_id}/edits/log``          Edit history (append-only)
+- ``POST   /api/vectorize/{job_id}/edits``              Save edits + re-emit DXF
 - ``GET    /api/vectorize``                     List recent jobs
 """
 from __future__ import annotations
@@ -27,6 +33,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from ..models.vectorize_job import (
     DetectorName,
+    DuplicatePair,
+    FindDuplicatesRequest,
+    FindDuplicatesResponse,
     SaveEditsRequest,
     SaveEditsResponse,
     VectorizeJobCreate,
@@ -69,13 +78,17 @@ async def create_vectorize(
     scan: UploadFile = File(..., description="LAS/LAZ/PLY/E57 scan file"),
     # Params come in as form fields rather than a nested JSON blob so the
     # upload + params fit in a single multipart request (browser-friendly).
+    # Defaults MUST mirror VectorizeParams.model_fields — keep them in sync.
     elevation_m: float | None = Form(default=None),
-    slab_thickness_m: float = Form(default=0.20),
+    slab_thickness_m: float = Form(default=0.10),
     resolution_m_per_px: float = Form(default=0.01),
-    detector: DetectorName = Form(default=DetectorName.fld),
-    min_wall_length_m: float = Form(default=0.50),
+    detector: DetectorName = Form(default=DetectorName.both),
+    min_wall_length_m: float = Form(default=0.40),
     manhattan_snap: bool = Form(default=True),
     merge_collinear: bool = Form(default=True),
+    remove_speckle: bool = Form(default=True),
+    multi_elevation: bool = Form(default=True),
+    detect_openings: bool = Form(default=True),
 ):
     """Upload a scan and start a vectorize job.
 
@@ -124,6 +137,9 @@ async def create_vectorize(
         min_wall_length_m=min_wall_length_m,
         manhattan_snap=manhattan_snap,
         merge_collinear=merge_collinear,
+        remove_speckle=remove_speckle,
+        multi_elevation=multi_elevation,
+        detect_openings=detect_openings,
     )
 
     create_vectorize_job(job_id, safe_name, params.model_dump(mode="json"))
@@ -161,6 +177,8 @@ async def get_vectorize(job_id: str):
         has_raster=(artifact_dir / "slice_cleaned.png").exists(),
         has_overlay=(artifact_dir / "overlay.png").exists(),
         has_dxf=(result_dir / "vectorized.dxf").exists(),
+        has_coverage=(artifact_dir / "coverage_gaps.png").exists(),
+        has_rejected=(result_dir / "rejected_segments.json").exists(),
     )
 
 
@@ -211,6 +229,21 @@ async def get_overlay_raw(job_id: str):
     if not path.exists():
         raise HTTPException(404, "Raw overlay not ready yet")
     return FileResponse(str(path), media_type="image/png", filename="overlay_raw.png")
+
+
+@router.get("/{job_id}/coverage")
+async def get_coverage_gaps(job_id: str):
+    """RGBA PNG marking wall pixels that no kept segment covers.
+
+    Transparent everywhere except over "missed wall" pixels, which are drawn
+    in semi-opaque red.  The editor blends this directly over the raster as a
+    diagnostic overlay — bright red = recall failure (or furniture clutter
+    the operator should ignore).
+    """
+    path = artifacts_dir(job_id) / "coverage_gaps.png"
+    if not path.exists():
+        raise HTTPException(404, "Coverage diagnostic not ready yet")
+    return FileResponse(str(path), media_type="image/png", filename="coverage_gaps.png")
 
 
 @router.get("/{job_id}/dxf")
@@ -270,6 +303,98 @@ async def get_segments(job_id: str):
         return edits_mod.load_segments(r_dir)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+
+
+@router.get("/{job_id}/rejected-segments")
+async def get_rejected_segments(job_id: str):
+    """Segments the pipeline's regularizer dropped, with provenance.
+
+    The editor renders these as ghost candidates the operator can rescue —
+    useful when the Manhattan filter or short-length cutoff was too
+    aggressive.  Empty payload (not 404) if the job ran before the feature
+    was added, so the editor can fall back gracefully.
+    """
+    r_dir = results_dir(job_id)
+    path = r_dir / "rejected_segments.json"
+    if not path.exists():
+        return {"version": 1, "units": "metres", "rejected": []}
+    return json.loads(path.read_text())
+
+
+@router.post("/{job_id}/find-duplicates", response_model=FindDuplicatesResponse)
+async def find_duplicates(job_id: str, body: FindDuplicatesRequest | None = None):
+    """Suggest pairs of segments that look like near-duplicates of the same wall.
+
+    Reads the *current* (post-edit) ``segments.json`` so suggestions reflect
+    everything the operator has done in this session.  Returns a list of
+    ``DuplicatePair`` — the editor sidebar walks through them one at a time
+    with [Merge] / [Skip] / [Skip all].
+    """
+    if body is None:
+        body = FindDuplicatesRequest()
+
+    r_dir = results_dir(job_id)
+    try:
+        payload = edits_mod.load_segments(r_dir)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+    raw = payload.get("segments", [])
+    if len(raw) < 2:
+        return FindDuplicatesResponse(suggestions=[])
+
+    import numpy as np
+    from ..vectorize import regularize as reg_mod
+
+    arr = np.array(
+        [[[s["x1"], s["y1"]], [s["x2"], s["y2"]]] for s in raw], dtype=np.float64,
+    )
+    pairs = reg_mod.find_near_duplicate_pairs(
+        arr,
+        perp_distance_m=body.perp_distance_m,
+        parallel_tol_deg=body.parallel_tol_deg,
+        endpoint_gap_m=body.endpoint_gap_m,
+    )
+
+    suggestions: list[DuplicatePair] = []
+    for i, j in pairs:
+        merged = reg_mod.merge_segment_group(arr[[i, j]])
+        # Re-derive the per-pair metrics so the UI can sort / explain them.
+        a, b = arr[i], arr[j]
+        da = a[1] - a[0]
+        db = b[1] - b[0]
+        ang_a = float(np.degrees(np.arctan2(da[1], da[0])) % 180.0)
+        ang_b = float(np.degrees(np.arctan2(db[1], db[0])) % 180.0)
+        d_ang = abs(ang_a - ang_b)
+        d_ang = min(d_ang, 180.0 - d_ang)
+        len_a = float(np.linalg.norm(da)) or 1.0
+        dir_a = da / len_a
+        perp = np.array([-dir_a[1], dir_a[0]])
+        ca = (a[0] + a[1]) / 2.0
+        cb = (b[0] + b[1]) / 2.0
+        perp_dist = abs(float(np.dot(cb - ca, perp)))
+        t_a0 = float(np.dot(a[0] - ca, dir_a))
+        t_a1 = float(np.dot(a[1] - ca, dir_a))
+        t_b0 = float(np.dot(b[0] - ca, dir_a))
+        t_b1 = float(np.dot(b[1] - ca, dir_a))
+        a_lo, a_hi = min(t_a0, t_a1), max(t_a0, t_a1)
+        b_lo, b_hi = min(t_b0, t_b1), max(t_b0, t_b1)
+        gap = max(0.0, max(a_lo, b_lo) - min(a_hi, b_hi))
+        suggestions.append(DuplicatePair(
+            a_id=raw[i]["id"],
+            b_id=raw[j]["id"],
+            perp_distance_m=perp_dist,
+            angle_diff_deg=d_ang,
+            endpoint_gap_m=gap,
+            merged_x1=float(merged[0, 0]),
+            merged_y1=float(merged[0, 1]),
+            merged_x2=float(merged[1, 0]),
+            merged_y2=float(merged[1, 1]),
+        ))
+
+    # Show the most-clearly-duplicate pairs first.
+    suggestions.sort(key=lambda p: (p.perp_distance_m, p.endpoint_gap_m))
+    return FindDuplicatesResponse(suggestions=suggestions)
 
 
 @router.get("/{job_id}/edits/log")
@@ -346,6 +471,11 @@ def _enqueue_run(
             update_vectorize_status(job_id, "failed", error=err)
         except Exception:
             pass
+
+    # Drop any prior replay buffer so a re-process doesn't immediately replay
+    # the last run's "complete" event to fresh subscribers.
+    from ..sse import clear_history
+    clear_history(job_id)
 
     update_vectorize_status(job_id, "processing")
     bg.add_task(

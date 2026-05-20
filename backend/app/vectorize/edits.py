@@ -157,24 +157,31 @@ def save_edits(
     with edits_log_path(result_dir).open("a") as f:
         f.write(json.dumps(save_record) + "\n")
 
-    # 5. re-emit DXF
-    if segments:
-        arr = np.array(
-            [
-                [[s.x1, s.y1], [s.x2, s.y2]]
-                for s in segments
-                if s.layer == "walls"
-            ],
-            dtype=np.float64,
+    # 5. re-emit DXF — multi-layer (walls + openings + any future classes).
+    # Group the operator's saved segments by ``layer`` and write one DXF that
+    # mirrors the pipeline's layered output.
+    by_layer: dict[str, list[list[list[float]]]] = {}
+    for s in segments:
+        by_layer.setdefault(s.layer or "walls", []).append(
+            [[s.x1, s.y1], [s.x2, s.y2]]
         )
-    else:
-        arr = np.zeros((0, 2, 2), dtype=np.float64)
 
+    segments_by_class: dict[str, np.ndarray] = {}
+    for layer, segs in by_layer.items():
+        segments_by_class[layer] = np.array(segs, dtype=np.float64)
+    # Ensure walls + openings always appear in the DXF (with their layer
+    # slots) even when the operator deleted everything on one of them.
+    for required in ("walls", "openings"):
+        segments_by_class.setdefault(required, np.zeros((0, 2, 2), dtype=np.float64))
+
+    counts = " ".join(
+        f"{layer}={len(arr)}" for layer, arr in segments_by_class.items() if len(arr)
+    ) or "empty"
     annotation = (
-        f"Stevenson Vectorize | job={job_id} | edit_version={version} | "
-        f"walls={len(arr)} (operator-edited)"
+        f"Beehive Automations L.L.C. Vectorize | job={job_id} | "
+        f"edit_version={version} | {counts} (operator-edited)"
     )
-    dxf_writer.write_walls_dxf(arr, current_dxf, annotation_text=annotation)
+    dxf_writer.write_dxf(segments_by_class, current_dxf, annotation_text=annotation)
 
     return SaveResult(
         edit_version=version,

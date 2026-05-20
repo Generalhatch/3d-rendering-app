@@ -399,6 +399,11 @@ async def reprocess_job(job_id: str, body: ReprocessRequest, bg: BackgroundTasks
     except HTTPException:
         pass   # scan-only mode — plan_path stays None
 
+    # Drop any prior replay buffer so a re-process doesn't immediately replay
+    # the last run's "complete" event to fresh subscribers.
+    from ..sse import clear_history
+    clear_history(job_id)
+
     bg.add_task(
         reprocess_rooms_guarded,
         job_id,

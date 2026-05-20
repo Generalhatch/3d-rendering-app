@@ -64,6 +64,8 @@ interface VectorizeState {
   patchParams: (patch: Partial<VectorizeParams>) => void;
   setJob: (job: VectorizeJobDetail | null) => void;
   appendLog: (event: VectorizeProgressEvent) => void;
+  /** Update the progress bar without appending a log entry — used for upload bytes. */
+  setOverallProgress: (progress: number) => void;
   clearLogs: () => void;
   setOverlayMode: (mode: 'clean' | 'raw' | 'raster') => void;
   reset: () => void;
@@ -106,8 +108,13 @@ export const useVectorizeStore = create<VectorizeState>((set) => ({
           timestamp: Date.now(),
         },
       ],
-      overallProgress: event.progress,
+      // Never let upload-byte progress get overwritten by a stale, lower
+      // backend value if events arrive out of order; progress should be
+      // monotonic.
+      overallProgress: Math.max(s.overallProgress, event.progress),
     })),
+  setOverallProgress: (overallProgress) =>
+    set((s) => ({ overallProgress: Math.max(s.overallProgress, overallProgress) })),
   clearLogs: () => set({ logs: [], overallProgress: 0 }),
   setOverlayMode: (overlayMode) => set({ overlayMode }),
   reset: () => {

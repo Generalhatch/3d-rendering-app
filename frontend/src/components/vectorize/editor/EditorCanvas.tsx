@@ -21,20 +21,29 @@
  * below — change one, change the other.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useEditorStore, type EditorSegment } from '../../../state/editorStore';
-import { vectorizeApi, type RasterAffine } from '../../../api/vectorize';
+import {
+  styleForLayer,
+  useEditorStore,
+  type EditorSegment,
+} from '../../../state/editorStore';
+import type { RasterAffine, RejectedSegmentPayload } from '../../../api/vectorize';
 
 const HIT_TOLERANCE_PX = 6;          // mouse must be within this many svg-pixels of a segment to hit it
 const ENDPOINT_PICK_PX = 10;         // distance to grab an endpoint vs the body of the segment
-const SNAP_RADIUS_PX = 12;           // snap radius (in svg-pixels) when dragging an endpoint
+const SNAP_RADIUS_PX = 12;           // snap radius (in svg-pixels) for endpoint-to-endpoint
+const BODY_SNAP_RADIUS_PX = 10;      // additional snap radius for endpoint-to-wall-body
+const AXIS_SNAP_TOLERANCE_DEG = 8;   // during draw, snap to nearest cardinal axis if within this many degrees
+const GHOST_HIT_RADIUS_PX = 6;       // hit radius for clicking a ghost candidate
 
 interface Props {
   jobId: string;
   affine: RasterAffine;
   rasterUrl: string;
+  /** Optional coverage-gaps RGBA overlay (red where uncovered). */
+  coverageUrl?: string | null;
 }
 
-export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
+export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
 
@@ -52,6 +61,22 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
   const clearSelection = useEditorStore((s) => s.clearSelection);
   const setHover = useEditorStore((s) => s.setHover);
   const moveEndpoint = useEditorStore((s) => s.moveEndpoint);
+  const mode = useEditorStore((s) => s.mode);
+  const setMode = useEditorStore((s) => s.setMode);
+  const addSegment = useEditorStore((s) => s.addSegment);
+  const drawLayer = useEditorStore((s) => s.drawLayer);
+  const layerVisibility = useEditorStore((s) => s.layerVisibility);
+  const ghosts = useEditorStore((s) => s.ghosts);
+  const ghostsVisible = useEditorStore((s) => s.ghostsVisible);
+  const promoteGhost = useEditorStore((s) => s.promoteGhost);
+  const mergeSuggestions = useEditorStore((s) => s.mergeSuggestions);
+  const mergeCursor = useEditorStore((s) => s.mergeCursor);
+
+  /** Helper: is this layer currently visible?  Defaults to true. */
+  const isLayerVisible = useCallback(
+    (layer: string) => layerVisibility[layer] !== false,
+    [layerVisibility],
+  );
 
   // ── World ↔ SVG-pixel conversions ───────────────────────────────────────
   const worldToPx = useCallback(
@@ -149,6 +174,7 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
 
       for (const seg of segments) {
         if (seg.status !== 'active') continue;
+        if (!isLayerVisible(seg.layer ?? 'walls')) continue;
         const [x1, y1] = worldToPx(seg.x1, seg.y1);
         const [x2, y2] = worldToPx(seg.x2, seg.y2);
 
@@ -179,7 +205,32 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
       }
       return best;
     },
-    [segments, view.scale, worldToPx],
+    [segments, view.scale, worldToPx, isLayerVisible],
+  );
+
+  /** Hit-test ghosts only (rejected candidates).  Returns the topmost ghost
+   *  whose body is within ``GHOST_HIT_RADIUS_PX`` of the cursor, or null. */
+  const hitTestGhost = useCallback(
+    (col: number, row: number): RejectedSegmentPayload | null => {
+      const tol = GHOST_HIT_RADIUS_PX / view.scale;
+      let best: { d: number; ghost: RejectedSegmentPayload } | null = null;
+      for (const g of ghosts) {
+        const [x1, y1] = worldToPx(g.x1, g.y1);
+        const [x2, y2] = worldToPx(g.x2, g.y2);
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq < 1e-9) continue;
+        let t = ((col - x1) * dx + (row - y1) * dy) / lenSq;
+        t = Math.max(0, Math.min(1, t));
+        const px = x1 + t * dx;
+        const py = y1 + t * dy;
+        const d = Math.hypot(col - px, row - py);
+        if (d < tol && (!best || d < best.d)) best = { d, ghost: g };
+      }
+      return best?.ghost ?? null;
+    },
+    [ghosts, view.scale, worldToPx],
   );
 
   // ── Drag state for endpoint editing ─────────────────────────────────────
@@ -187,6 +238,16 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
     | null
     | { segId: string; endpoint: 0 | 1; cursorPx: [number, number] }
   >(null);
+
+  // ── Draw-new-wall state ────────────────────────────────────────────────
+  // ``drawAnchor`` is the svg-pixel position where the draw began; the live
+  // endpoint follows the cursor in ``drawCursor`` (snapped to the same kinds
+  // of targets as endpoint-drag, plus axis snap to nearest cardinal).
+  const [drawAnchor, setDrawAnchor] = useState<[number, number] | null>(null);
+  const [drawCursor, setDrawCursor] = useState<[number, number] | null>(null);
+
+  // ── Coverage overlay toggle (the "did we miss anything?" diagnostic) ────
+  const [showCoverage, setShowCoverage] = useState(false);
 
   // ── Pointer event handlers ──────────────────────────────────────────────
   const onPointerDown = (e: React.PointerEvent) => {
@@ -200,6 +261,24 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
     if (e.button !== 0) return;
 
     const [col, row] = screenToSvg(e.clientX, e.clientY);
+
+    // ── Draw mode: anchor + start sketching a new wall ───────────────────
+    if (mode === 'draw') {
+      const snapped = snapDrawPoint(col, row, segments, null, worldToPx, view.scale);
+      setDrawAnchor(snapped);
+      setDrawCursor(snapped);
+      return;
+    }
+
+    // ── Ghost click takes priority over normal hit test ─────────────────
+    if (ghostsVisible) {
+      const ghost = hitTestGhost(col, row);
+      if (ghost) {
+        promoteGhost(ghost);
+        return;
+      }
+    }
+
     const hit = hitTest(col, row);
 
     if (!hit) {
@@ -231,11 +310,26 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
       return;
     }
 
+    if (drawAnchor) {
+      const [col, row] = screenToSvg(e.clientX, e.clientY);
+      const snapped = snapDrawPoint(col, row, segments, drawAnchor, worldToPx, view.scale);
+      setDrawCursor(snapped);
+      return;
+    }
+
     if (dragging) {
       const [col, row] = screenToSvg(e.clientX, e.clientY);
-      // Snap to nearest other-segment endpoint within SNAP_RADIUS_PX.
-      const snap = nearestEndpoint(col, row, segments, dragging.segId, worldToPx, SNAP_RADIUS_PX / view.scale);
-      setDragging({ ...dragging, cursorPx: snap ? snap : [col, row] });
+      // Snap to: (a) nearest other-segment endpoint, then (b) nearest other-
+      // segment body (project onto line).  Endpoint wins on ties.
+      const epSnap = nearestEndpoint(
+        col, row, segments, dragging.segId, worldToPx, SNAP_RADIUS_PX / view.scale,
+      );
+      const bodySnap = epSnap
+        ? null
+        : nearestSegmentBody(
+            col, row, segments, dragging.segId, worldToPx, BODY_SNAP_RADIUS_PX / view.scale,
+          );
+      setDragging({ ...dragging, cursorPx: epSnap ?? bodySnap ?? [col, row] });
       return;
     }
 
@@ -246,6 +340,21 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
   };
 
   const onPointerUp = (e: React.PointerEvent) => {
+    if (drawAnchor && drawCursor) {
+      const [c1, r1] = drawAnchor;
+      const [c2, r2] = drawCursor;
+      // Discard near-zero-length draws (operator misclick).
+      const lenPx = Math.hypot(c2 - c1, r2 - r1);
+      if (lenPx >= 6 / view.scale) {
+        const [x1w, y1w] = pxToWorld(c1, r1);
+        const [x2w, y2w] = pxToWorld(c2, r2);
+        addSegment(x1w, y1w, x2w, y2w, drawLayer);
+      }
+      setDrawAnchor(null);
+      setDrawCursor(null);
+      return;
+    }
+
     if (dragging) {
       const [col, row] = dragging.cursorPx;
       const [xw, yw] = pxToWorld(col, row);
@@ -277,14 +386,54 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
     });
   }, [segments, worldToPx]);
 
+  const projectedGhosts = useMemo(() => {
+    if (!ghostsVisible) return [] as { ghost: RejectedSegmentPayload; x1: number; y1: number; x2: number; y2: number }[];
+    return ghosts.map((g) => {
+      const [x1, y1] = worldToPx(g.x1, g.y1);
+      const [x2, y2] = worldToPx(g.x2, g.y2);
+      return { ghost: g, x1, y1, x2, y2 };
+    });
+  }, [ghosts, ghostsVisible, worldToPx]);
+
+  // Active merge suggestion preview (the pair the operator is about to act on).
+  const currentSuggestion = useMemo(() => {
+    if (!mergeSuggestions.length || mergeCursor >= mergeSuggestions.length) return null;
+    const pair = mergeSuggestions[mergeCursor];
+    const a = segments.find((s) => s.id === pair.a_id);
+    const b = segments.find((s) => s.id === pair.b_id);
+    if (!a || !b) return null;
+    const [ax1, ay1] = worldToPx(a.x1, a.y1);
+    const [ax2, ay2] = worldToPx(a.x2, a.y2);
+    const [bx1, by1] = worldToPx(b.x1, b.y1);
+    const [bx2, by2] = worldToPx(b.x2, b.y2);
+    const [mx1, my1] = worldToPx(pair.merged_x1, pair.merged_y1);
+    const [mx2, my2] = worldToPx(pair.merged_x2, pair.merged_y2);
+    return { pair, ax1, ay1, ax2, ay2, bx1, by1, bx2, by2, mx1, my1, mx2, my2 };
+  }, [mergeSuggestions, mergeCursor, segments, worldToPx]);
+
+  // ── Esc cancels in-progress draw (without leaving draw mode) ────────────
+  useEffect(() => {
+    if (!drawAnchor) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setDrawAnchor(null);
+        setDrawCursor(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [drawAnchor]);
+
   // ── Cursor logic ────────────────────────────────────────────────────────
   const cursor = panning
     ? 'grabbing'
-    : dragging
+    : drawAnchor || mode === 'draw'
       ? 'crosshair'
-      : hoverId
-        ? 'pointer'
-        : 'grab';
+      : dragging
+        ? 'crosshair'
+        : hoverId
+          ? 'pointer'
+          : 'grab';
 
   return (
     <div
@@ -316,10 +465,33 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
       >
         <image href={rasterUrl} x={0} y={0} width={W} height={H} preserveAspectRatio="none" />
 
+        {/* Coverage-gaps overlay: red where wall pixels weren't covered by any kept segment. */}
+        {showCoverage && coverageUrl && (
+          <image
+            href={coverageUrl}
+            x={0} y={0}
+            width={W} height={H}
+            preserveAspectRatio="none"
+            style={{ mixBlendMode: 'screen' }}
+          />
+        )}
+
         {/* Faint border so the raster bounds are visible even when zoomed in. */}
         <rect x={0} y={0} width={W} height={H} fill="none" stroke="#1f2937" strokeWidth={1 / view.scale} />
 
-        {/* Rejected segments — drawn faded behind the active ones. */}
+        {/* Pipeline-rejected ghost candidates — render faintly, clickable to promote. */}
+        {projectedGhosts.map(({ ghost, x1, y1, x2, y2 }) => (
+          <line
+            key={`ghost-${ghost.id}`}
+            x1={x1} y1={y1} x2={x2} y2={y2}
+            stroke={ghostStroke(ghost.dropped_by)}
+            strokeOpacity={0.55}
+            strokeDasharray={`${5 / view.scale} ${3 / view.scale}`}
+            strokeWidth={1.5 / view.scale}
+          />
+        ))}
+
+        {/* Operator-rejected segments — drawn faded behind the active ones. */}
         {projected
           .filter((p) => p.seg.status === 'rejected')
           .map((p) => (
@@ -333,14 +505,21 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
             />
           ))}
 
-        {/* Active segments. */}
+        {/* Active segments — colour, dash, and stroke pulled from the layer style. */}
         {projected
-          .filter((p) => p.seg.status === 'active')
+          .filter((p) => p.seg.status === 'active' && isLayerVisible(p.seg.layer ?? 'walls'))
           .map((p) => {
             const isSelected = selectedIds.has(p.seg.id);
             const isHover = hoverId === p.seg.id;
-            const stroke = isSelected ? '#facc15' : isHover ? '#34d399' : '#22c55e';
-            const sw = (isSelected ? 2.5 : isHover ? 2 : 1.5) / view.scale;
+            const style = styleForLayer(p.seg.layer ?? 'walls');
+            const stroke = isSelected ? style.selectedColor : isHover ? style.hoverColor : style.color;
+            const sw = (isSelected ? 2.8 : isHover ? 2.2 : 1.8) / view.scale;
+            const dash = style.dashArray
+              ? style.dashArray
+                  .split(/\s+/)
+                  .map((n) => (Number(n) / view.scale).toString())
+                  .join(' ')
+              : undefined;
             return (
               <g key={p.seg.id}>
                 <line
@@ -348,6 +527,7 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
                   stroke={stroke}
                   strokeWidth={sw}
                   strokeLinecap="round"
+                  strokeDasharray={dash}
                 />
                 {isSelected && (
                   <>
@@ -380,6 +560,55 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
             </g>
           );
         })()}
+
+        {/* Live preview of the new segment being drawn — uses the active draw-layer style. */}
+        {drawAnchor && drawCursor && (() => {
+          const previewStyle = styleForLayer(drawLayer);
+          const previewDash = previewStyle.dashArray
+            ? previewStyle.dashArray
+                .split(/\s+/)
+                .map((n) => (Number(n) / view.scale).toString())
+                .join(' ')
+            : undefined;
+          return (
+            <g pointerEvents="none">
+              <line
+                x1={drawAnchor[0]} y1={drawAnchor[1]}
+                x2={drawCursor[0]} y2={drawCursor[1]}
+                stroke={previewStyle.color}
+                strokeWidth={2.5 / view.scale}
+                strokeLinecap="round"
+                strokeDasharray={previewDash}
+              />
+              <circle cx={drawAnchor[0]} cy={drawAnchor[1]} r={4 / view.scale} fill={previewStyle.color} />
+              <circle cx={drawCursor[0]} cy={drawCursor[1]} r={5 / view.scale} fill={previewStyle.color} />
+            </g>
+          );
+        })()}
+
+        {/* Merge-suggestion highlight: the two source segments + the proposed centreline. */}
+        {currentSuggestion && (
+          <g pointerEvents="none">
+            <line
+              x1={currentSuggestion.ax1} y1={currentSuggestion.ay1}
+              x2={currentSuggestion.ax2} y2={currentSuggestion.ay2}
+              stroke="#a855f7" strokeWidth={3 / view.scale}
+              strokeOpacity={0.85}
+            />
+            <line
+              x1={currentSuggestion.bx1} y1={currentSuggestion.by1}
+              x2={currentSuggestion.bx2} y2={currentSuggestion.by2}
+              stroke="#a855f7" strokeWidth={3 / view.scale}
+              strokeOpacity={0.85}
+            />
+            <line
+              x1={currentSuggestion.mx1} y1={currentSuggestion.my1}
+              x2={currentSuggestion.mx2} y2={currentSuggestion.my2}
+              stroke="#fbbf24" strokeWidth={2 / view.scale}
+              strokeDasharray={`${6 / view.scale} ${4 / view.scale}`}
+            />
+          </g>
+        )}
       </svg>
 
       {/* Top-right view controls. */}
@@ -387,21 +616,125 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl }: Props) {
         <button
           onClick={fit}
           className="px-3 py-1.5 rounded-lg bg-gray-900/80 hover:bg-gray-800 border border-gray-700 text-xs text-gray-300 backdrop-blur-sm transition-colors"
-          title="Fit raster to viewport (F)"
+          title="Fit raster to viewport"
         >
           ⊞ Fit
         </button>
+        {coverageUrl && (
+          <button
+            onClick={() => setShowCoverage((v) => !v)}
+            className={`px-3 py-1.5 rounded-lg border text-xs backdrop-blur-sm transition-colors ${
+              showCoverage
+                ? 'bg-rose-600/80 hover:bg-rose-600 border-rose-500 text-white'
+                : 'bg-gray-900/80 hover:bg-gray-800 border-gray-700 text-gray-300'
+            }`}
+            title="Highlight raster pixels not covered by any kept segment — i.e. potentially missed walls"
+          >
+            {showCoverage ? '◉ Hide coverage gaps' : '○ Show coverage gaps'}
+          </button>
+        )}
         <div className="px-3 py-1 rounded-md bg-gray-900/80 backdrop-blur-sm border border-gray-700 text-[11px] text-gray-400 font-mono">
           {(view.scale * 100).toFixed(0)}%
         </div>
       </div>
 
-      {/* Bottom-left help. */}
+      {/* Bottom-left help — mode-aware. */}
       <div className="absolute bottom-3 left-3 rounded-lg bg-gray-900/80 backdrop-blur-sm border border-gray-700 px-3 py-1.5 text-[11px] text-gray-400 pointer-events-none">
-        click select · shift+click multi · delete = reject · drag endpoints · scroll = zoom · right-drag = pan
+        {mode === 'draw'
+          ? (
+              <span>
+                <span className="text-sky-300">draw mode</span> · click-drag = new {styleForLayer(drawLayer).label.toLowerCase()} ·
+                {' '}snaps to endpoints/walls/axes · D=wall · O=opening · esc cancel
+              </span>
+            )
+          : <span>click select · shift+click multi · delete = reject · drag endpoints · scroll = zoom · right-drag = pan · D draw wall · O draw opening · M merge · G ghosts · F duplicates</span>}
+      </div>
+
+      {/* Draw-mode banner at top centre — colour matches the active draw layer. */}
+      {mode === 'draw' && (() => {
+        const drawStyle = styleForLayer(drawLayer);
+        return (
+          <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-auto">
+            <div
+              className="rounded-full backdrop-blur-sm border px-4 py-1.5 text-xs text-white font-semibold flex items-center gap-3 shadow-lg"
+              style={{
+                backgroundColor: drawStyle.color + 'e6',  // ~90% opacity
+                borderColor: drawStyle.color,
+              }}
+            >
+              <span>✎ Drawing new {drawStyle.label.toLowerCase().replace(/s$/, '')}</span>
+              <button
+                onClick={() => { setMode('select'); setDrawAnchor(null); setDrawCursor(null); }}
+                className="text-white/90 hover:text-white text-[10px] underline"
+              >
+                exit (D)
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Merge-suggestion footer when there are pending suggestions. */}
+      {mergeSuggestions.length > 0 && mergeCursor < mergeSuggestions.length && (
+        <MergeSuggestionStrip />
+      )}
+    </div>
+  );
+}
+
+/** Footer that walks the operator through queued merge suggestions. */
+function MergeSuggestionStrip() {
+  const mergeSuggestions = useEditorStore((s) => s.mergeSuggestions);
+  const mergeCursor = useEditorStore((s) => s.mergeCursor);
+  const accept = useEditorStore((s) => s.acceptCurrentMergeSuggestion);
+  const skip = useEditorStore((s) => s.skipCurrentMergeSuggestion);
+  const clearAll = useEditorStore((s) => s.clearMergeSuggestions);
+  const current = mergeSuggestions[mergeCursor];
+  if (!current) return null;
+
+  return (
+    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 pointer-events-auto">
+      <div className="rounded-xl bg-purple-950/90 backdrop-blur-sm border border-purple-700 px-4 py-2.5 text-xs shadow-xl flex items-center gap-3 text-purple-100">
+        <span className="text-purple-300 font-mono text-[10px]">
+          {mergeCursor + 1}/{mergeSuggestions.length}
+        </span>
+        <span className="text-purple-200">
+          Near-duplicate · <span className="font-mono text-amber-300">{(current.perp_distance_m * 100).toFixed(1)} cm</span> apart
+          · <span className="font-mono text-amber-300">{current.angle_diff_deg.toFixed(1)}°</span>
+        </span>
+        <div className="flex gap-1">
+          <button
+            onClick={accept}
+            className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold"
+          >
+            Merge
+          </button>
+          <button
+            onClick={skip}
+            className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-200 text-[11px]"
+          >
+            Skip
+          </button>
+          <button
+            onClick={clearAll}
+            className="px-3 py-1 rounded text-purple-300 hover:text-purple-100 text-[11px] underline"
+          >
+            Dismiss all
+          </button>
+        </div>
       </div>
     </div>
   );
+}
+
+/** Colour of a ghost candidate based on why the pipeline dropped it. */
+function ghostStroke(droppedBy: string): string {
+  switch (droppedBy) {
+    case 'short':     return '#facc15';   // amber — under min-length cutoff
+    case 'manhattan': return '#a78bfa';   // violet — off-axis
+    case 'merged':    return '#6ee7b7';   // mint — already represented by a kept segment
+    default:          return '#94a3b8';
+  }
 }
 
 function Endpoint({ cx, cy, scale, active }: { cx: number; cy: number; scale: number; active: boolean }) {
@@ -419,13 +752,15 @@ function Endpoint({ cx, cy, scale, active }: { cx: number; cy: number; scale: nu
 
 /**
  * Snap target: nearest endpoint of any *other* active segment to (col, row).
- * Returns its pixel position or null if nothing is within radius.
+ * Returns its pixel position or null if nothing is within radius.  Pass
+ * ``excludeId === null`` to consider all active segments (used by draw-mode
+ * where the new segment doesn't exist yet).
  */
 function nearestEndpoint(
   col: number,
   row: number,
   segments: EditorSegment[],
-  excludeId: string,
+  excludeId: string | null,
   worldToPx: (x: number, y: number) => [number, number],
   radius: number,
 ): [number, number] | null {
@@ -440,4 +775,96 @@ function nearestEndpoint(
     if (d2 < radius && (!best || d2 < best.d)) best = { d: d2, pt: [x2, y2] };
   }
   return best ? best.pt : null;
+}
+
+/**
+ * Project (col, row) onto the body (not endpoints) of every active segment
+ * except ``excludeId``.  Returns the closest projected point on any wall
+ * within ``radius``.  Used when the operator drags an endpoint near a wall
+ * — pulls onto the wall body so corners click together cleanly.
+ */
+function nearestSegmentBody(
+  col: number,
+  row: number,
+  segments: EditorSegment[],
+  excludeId: string | null,
+  worldToPx: (x: number, y: number) => [number, number],
+  radius: number,
+): [number, number] | null {
+  let best: { d: number; pt: [number, number] } | null = null;
+  for (const seg of segments) {
+    if (seg.id === excludeId || seg.status !== 'active') continue;
+    const [x1, y1] = worldToPx(seg.x1, seg.y1);
+    const [x2, y2] = worldToPx(seg.x2, seg.y2);
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq < 1e-9) continue;
+    let t = ((col - x1) * dx + (row - y1) * dy) / lenSq;
+    // Restrict to the interior of the segment — endpoints are handled by
+    // nearestEndpoint to keep them visually first-class.
+    if (t <= 0 || t >= 1) continue;
+    const px = x1 + t * dx;
+    const py = y1 + t * dy;
+    const d = Math.hypot(col - px, row - py);
+    if (d < radius && (!best || d < best.d)) best = { d, pt: [px, py] };
+  }
+  return best?.pt ?? null;
+}
+
+/**
+ * Compute the snapped position of the draw cursor.
+ *
+ * Snap priority (first match wins):
+ *   1. Existing segment endpoint within SNAP_RADIUS_PX
+ *   2. Existing segment body within BODY_SNAP_RADIUS_PX
+ *   3. Manhattan axis relative to the draw anchor (within AXIS_SNAP_TOLERANCE_DEG)
+ *
+ * The first call (when ``anchor`` is null) only does endpoint+body — there's
+ * no axis to snap to yet.  Subsequent calls always re-evaluate against the
+ * fresh cursor position so the snap target updates as the user drags.
+ */
+function snapDrawPoint(
+  col: number,
+  row: number,
+  segments: EditorSegment[],
+  anchor: [number, number] | null,
+  worldToPx: (x: number, y: number) => [number, number],
+  scale: number,
+): [number, number] {
+  // 1. Endpoint snap.
+  const ep = nearestEndpoint(col, row, segments, null, worldToPx, SNAP_RADIUS_PX / scale);
+  if (ep) return ep;
+
+  // 2. Body snap.
+  const body = nearestSegmentBody(col, row, segments, null, worldToPx, BODY_SNAP_RADIUS_PX / scale);
+  if (body) return body;
+
+  // 3. Axis snap from the anchor (horizontal / vertical only).  In SVG-pixel
+  //    space rows grow downward, but a "horizontal" line is still equal-row;
+  //    treat the snap as zeroing whichever axis delta is small.
+  if (anchor) {
+    const dx = col - anchor[0];
+    const dy = row - anchor[1];
+    if (dx === 0 && dy === 0) return [col, row];
+    const angle = (Math.atan2(dy, dx) * 180) / Math.PI;
+    // Distance to nearest cardinal: 0, 90, 180, -90.
+    const cardinals = [0, 90, 180, -180, -90];
+    let bestDelta = Infinity;
+    let bestCard = 0;
+    for (const c of cardinals) {
+      const d = Math.abs(angle - c);
+      if (d < bestDelta) {
+        bestDelta = d;
+        bestCard = c;
+      }
+    }
+    if (bestDelta <= AXIS_SNAP_TOLERANCE_DEG) {
+      const len = Math.hypot(dx, dy);
+      const rad = (bestCard * Math.PI) / 180;
+      return [anchor[0] + Math.cos(rad) * len, anchor[1] + Math.sin(rad) * len];
+    }
+  }
+
+  return [col, row];
 }

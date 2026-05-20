@@ -19,3 +19,14 @@ html, body, #root {
 }
 .side-panel-scroll::-webkit-scrollbar { width: 6px; }
 .side-panel-scroll::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+
+/* Indeterminate shimmer for the progress bar while we wait for the first
+   backend SSE emit. A 1.6s sweep is fast enough to read as "live" without
+   being distracting. */
+@keyframes progress-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.animate-progress-shimmer {
+  animation: progress-shimmer 1.6s linear infinite;
+}
