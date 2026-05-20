@@ -43,6 +43,16 @@ export function EditorSurface({ jobId }: Props) {
   const toggleGhosts = useEditorStore((s) => s.toggleGhosts);
   const setMergeSuggestions = useEditorStore((s) => s.setMergeSuggestions);
 
+  // Phase D
+  const autoSaveEnabled = useEditorStore((s) => s.autoSaveEnabled);
+  const autoSaveError = useEditorStore((s) => s.autoSaveError);
+  const setAutoSaveError = useEditorStore((s) => s.setAutoSaveError);
+  const toggleShowOriginal = useEditorStore((s) => s.toggleShowOriginal);
+  const setMeasurement = useEditorStore((s) => s.setMeasurement);
+  const setMeasureAnchor = useEditorStore((s) => s.setMeasureAnchor);
+  const measurement = useEditorStore((s) => s.measurement);
+  const measureAnchor = useEditorStore((s) => s.measureAnchor);
+
   const [affine, setAffine] = useState<RasterAffine | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -101,11 +111,11 @@ export function EditorSurface({ jobId }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, hasRejected]);
 
-  // ── Save handler ───────────────────────────────────────────────────────
-  const handleSave = useCallback(async () => {
+  // ── Save handler (shared by manual save + auto-save) ──────────────────
+  const handleSave = useCallback(async (opts?: { silent?: boolean }) => {
     if (saving || !dirty) return;
     setSaving(true);
-    setSaveError(null);
+    if (!opts?.silent) setSaveError(null);
     try {
       const active = segments.filter((s) => s.status === 'active').map((s) => ({
         id: s.id,
@@ -117,12 +127,34 @@ export function EditorSurface({ jobId }: Props) {
       }));
       const response = await vectorizeApi.saveEdits(jobId, active, editLog);
       markSaved(response.edit_version);
+      // Clear any prior auto-save error toast on success.
+      if (autoSaveError) setAutoSaveError(null);
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Save failed');
+      const msg = err instanceof Error ? err.message : 'Save failed';
+      if (opts?.silent) {
+        setAutoSaveError(msg);
+      } else {
+        setSaveError(msg);
+      }
     } finally {
       setSaving(false);
     }
-  }, [saving, dirty, segments, editLog, jobId, markSaved]);
+  }, [saving, dirty, segments, editLog, jobId, markSaved, autoSaveError, setAutoSaveError]);
+
+  // ── Auto-save loop ─────────────────────────────────────────────────────
+  // Every 30 s, if (a) auto-save is enabled, (b) we have unsaved changes, and
+  // (c) no save is currently in flight, fire a silent save.  We avoid auto-
+  // saving the first 5 s after a manual edit to give operators a chance to
+  // undo without us racing them.
+  useEffect(() => {
+    if (!autoSaveEnabled) return;
+    const interval = window.setInterval(() => {
+      if (dirty && !saving) {
+        void handleSave({ silent: true });
+      }
+    }, 30_000);
+    return () => window.clearInterval(interval);
+  }, [autoSaveEnabled, dirty, saving, handleSave]);
 
   // ── Find-duplicates handler ────────────────────────────────────────────
   const handleFindDuplicates = useCallback(async () => {
@@ -177,11 +209,12 @@ export function EditorSurface({ jobId }: Props) {
         e.preventDefault(); void handleSave(); return;
       }
       if (e.key === 'Escape') {
-        // If currently drawing, EditorCanvas's local listener will cancel the
-        // in-progress draw.  Here we additionally pop out of draw mode if no
-        // drag is in flight, and otherwise clear selection.
+        // Esc precedence: clear measurement-in-progress → clear locked
+        // measurement → exit draw/measure mode → clear selection.
         e.preventDefault();
-        if (mode === 'draw') setMode('select');
+        if (measureAnchor) { setMeasureAnchor(null); return; }
+        if (measurement) { setMeasurement(null); return; }
+        if (mode === 'draw' || mode === 'measure') setMode('select');
         else clearSelection();
         return;
       }
@@ -191,17 +224,26 @@ export function EditorSurface({ jobId }: Props) {
       // ── Mode toggles (no modifier) — only when not typing ────────────
       if (!meta && !e.shiftKey && !e.altKey) {
         const k = e.key.toLowerCase();
-        // D / O = enter draw-mode on the named layer.  Pressing the same key
-        // again exits draw mode (so D-D toggles, D-O switches layers).
-        if (k === 'd' || k === 'o') {
+        // D / O / W / C = enter draw-mode on the named layer.  Pressing the
+        // same key again exits draw mode.  Switching keys swaps the layer.
+        const layerByKey: Record<string, SegmentLayer> = {
+          d: 'walls', o: 'openings', w: 'windows', c: 'columns',
+        };
+        if (k in layerByKey) {
           e.preventDefault();
-          const layer: SegmentLayer = k === 'o' ? 'openings' : 'walls';
+          const layer = layerByKey[k];
           if (mode === 'draw' && useEditorStore.getState().drawLayer === layer) {
             setMode('select');
           } else {
             setDrawLayer(layer);
             setMode('draw');
           }
+          return;
+        }
+        if (k === 'r') {
+          // R = ruler / measure mode toggle.
+          e.preventDefault();
+          setMode(mode === 'measure' ? 'select' : 'measure');
           return;
         }
         if (k === 'g') {
@@ -215,6 +257,11 @@ export function EditorSurface({ jobId }: Props) {
         if (k === 'f') {
           e.preventDefault(); void handleFindDuplicates(); return;
         }
+        if (e.key === ' ') {
+          // Space = toggle "show original" overlay.  Cheap diff against the
+          // pre-edit baseline without leaving keyboard.
+          e.preventDefault(); toggleShowOriginal(); return;
+        }
       }
     };
     window.addEventListener('keydown', handler);
@@ -223,6 +270,8 @@ export function EditorSurface({ jobId }: Props) {
     undo, redo, selectAll, clearSelection, rejectSelected, handleSave,
     handleFindDuplicates, mergeSelected, mode, setMode, setDrawLayer,
     ghosts.length, toggleGhosts, selectedIds.size,
+    measureAnchor, measurement, setMeasureAnchor, setMeasurement,
+    toggleShowOriginal,
   ]);
 
   // ── Derived state for the toolbar ──────────────────────────────────────
@@ -286,6 +335,17 @@ export function EditorSurface({ jobId }: Props) {
       {saveError && (
         <div className="absolute bottom-12 left-3 rounded-lg bg-rose-950/80 border border-rose-700 px-3 py-2 text-xs text-rose-200 backdrop-blur-sm">
           {saveError}
+        </div>
+      )}
+      {autoSaveError && !saveError && (
+        <div className="absolute bottom-12 left-3 rounded-lg bg-amber-950/80 border border-amber-700 px-3 py-2 text-xs text-amber-200 backdrop-blur-sm flex items-center gap-2">
+          <span>Auto-save failed: {autoSaveError}</span>
+          <button
+            onClick={() => setAutoSaveError(null)}
+            className="text-amber-300 hover:text-amber-100 text-[10px] underline"
+          >
+            dismiss
+          </button>
         </div>
       )}
       {findError && (

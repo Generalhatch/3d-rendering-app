@@ -3,9 +3,9 @@
 > **Source roadmap:** `Scan-to-CAD_Vectorization_Roadmap.docx` (Beehive Automations L.L.C., May 2026 — Draft for internal review)
 > **Codebase analyzed:** `/Users/tannerhatch/3d-rendering-app` (the "AlignAI" MVP)
 > **Decision date:** May 2026
-> **Last updated:** May 19, 2026 (late evening) — Phase 4 (doors/openings + multi-layer DXF) shipped
+> **Last updated:** May 19, 2026 (night) — Phases 5 (closed-door recall), 6 (columns + per-layer infra), and 7 (operator power tools) shipped together
 > **Owner:** Tanner Hatch
-> **Status:** Active plan — Phases 0, 1, 3 (MVP + 3.5 + 3.7), and 4 all complete; choosing the next phase from A/B/C/D/E below
+> **Status:** Active plan — Phases 0, 1, 3 (MVP + 3.5 + 3.7), 4, 5, 6, 7 all complete; remaining roadmap below
 
 ---
 
@@ -20,9 +20,12 @@
 | **3.5 — Quality & diagnostic loop** | ✅ shipped | See "Phase 3.5 deliverables" below |
 | **3.7 — Fly-through Editor** | ✅ shipped | Draw-new-wall · auto-snap-nearby · pipeline-rejected ghost layer · "Find duplicates" merge suggestions · endpoint-to-wall body snap |
 | **4 — Multi-class detection (doors/openings)** | ✅ shipped | Classical door detector + multi-layer DXF (`WALLS` + `OPENINGS` + 4 reserved slots) + layer-aware editor + `O` hotkey for draw-opening |
-| **5 — ML segmentation** | 🔜 future | Requires GPU + Stevenson archive *or* CubiCasa5K pre-train |
-| **6 — SaaS hardening** | 🔜 future | Requires IP paragraph signed with Stevenson |
-| **7 — Continuous improvement** | 🔜 future | Edit log (Phase 3) is already capturing the corrections that feed this |
+| **5 — Closed-door recall lift ("E")** | ✅ shipped | Door-header re-slice at elevation + 0.6 m; same scan went from 0 → 5 auto-openings |
+| **6 — Columns + per-layer infra ("A")** | ✅ shipped | Classical column detector (isolated 20–120 cm blobs); WINDOWS layer slot reserved; per-layer coverage skeleton |
+| **7 — Operator power tools ("D")** | ✅ shipped | Auto-save · "Show original" overlay · Measure-distance tool with snap · W/C/R hotkeys |
+| **8 — ML segmentation** | 🔜 future | Requires GPU + Stevenson archive *or* CubiCasa5K pre-train |
+| **9 — SaaS hardening** | 🔜 future | Requires IP paragraph signed with Stevenson |
+| **10 — Continuous improvement** | 🔜 future | Edit log (Phase 3) is already capturing the corrections that feed this |
 
 ### Phase 3.5 deliverables (shipped May 19, 2026)
 
@@ -65,17 +68,43 @@ These move Phase 3 well past "MVP" status — it's now the version of the editor
 
 **Recall caveat (documented in `openings.py`):** the detector finds *open* doors and door-shaped gaps; *closed* doors that filled the raster at slice height won't be auto-detected.  The smoke-test scan (180LJ2-RR) had every door closed at scan time, so auto-detection returned 0 — exactly as the algorithm should behave.  The infra ships with `O`-to-draw so operators can mark closed doors in one keystroke.
 
-### Phase 5+ candidates (next-phase decisions)
+### Phase 5 deliverable — Closed-door recall lift ("E", shipped May 19, 2026 — night)
 
-With multi-layer + editor + door detection done, the remaining product gaps are:
+- `pipeline.py`: when `detect_openings` is on, perform an extra single-slice at `elevation + 0.60 m` (above the standard 2.03 m door header). Closed-door slabs disappear from this high raster, exposing the gap. The opening detector runs on this slice, not the OR'd wall raster.
+- **Recall jump:** the same scan that previously returned 0 openings now returns **5 openings**.
+- Cost: +3–6 s per run (one extra slice + preprocess). Skipped entirely when `detect_openings` is off.
+
+### Phase 6 deliverable — Columns + per-layer infra ("A", shipped May 19, 2026 — night)
+
+| Capability | What shipped |
+|---|---|
+| **Classical column detector** (`backend/app/vectorize/columns.py`) | Subtract walls (with 12 cm slop) from the raster, run connected components on the residual, keep blobs with 20–120 cm bounding diagonal, ≤ 2.5:1 aspect, ≥ 55 % fill. Refines to a min-area rectangle and emits as a 4-vertex CCW footprint. Synthetic-test verified (3/3 planted 40 cm columns recovered with 100 % fill). |
+| **`detect_columns` API parameter + UI toggle** | On by default. Adds a `Columns` stat to the run summary; surfaces 0 when none detected with a hint about residential scans. |
+| **WINDOWS layer reserved** | `dxf_writer.DEFAULT_LAYER_MAP` now includes `WINDOWS` (DXF colour 5 / blue, dotted in the editor). No auto-detection yet — operator draws windows with `W`. |
+| **Multi-layer DXF** | Verified: smoke run emits WALLS=138, OPENINGS=5, COLUMNS=52 (13 cols × 4 edges) on the correct ACI layers. Reserved slots: WINDOWS, MEP, TEXT, ANNOTATION. |
+| **Layer-aware editor** | `LAYER_STYLES` now covers all four classes (emerald walls, yellow dashed openings, blue dotted windows, pink columns). Layer-visibility pills, draw-layer pill switcher, and counts strip all enumerate the full set. |
+| **Per-layer coverage skeleton** | `coverage_by_layer` field on `VectorizeMetrics`; today only `walls` carries a meaningful denominator (door/column "coverage" is mostly furniture noise). UI hides the strip until a second meaningful denominator exists. |
+
+### Phase 7 deliverable — Operator power tools ("D", shipped May 19, 2026 — night)
+
+| Capability | What shipped |
+|---|---|
+| **Auto-save loop** | Every 30 s while dirty + enabled, silently re-saves through the existing `/edits` endpoint and reuses the multi-layer re-emit. Toolbar shows "saved v7 · 12 s ago"; auto-save failures surface as a dismissible amber toast (manual save errors stay rose). Toggle in the save row to disable. |
+| **"Show original" overlay** (`Space` hotkey) | `loadSegments` snapshots the just-loaded baseline into `originalSegments`. Toggle in the toolbar renders the baseline as faint dashed grey behind the operator's working set — instant visual diff against the pipeline's pre-edit output. |
+| **Measure-distance tool** (`R` hotkey) | New `measure` editor mode. Click two points (snaps to endpoints + wall bodies + Manhattan axes) → locks an orange ruler. Top-centre readout shows distance (`cm` under 1 m, `m` above), Δx / Δy, and bearing in compass-clockwise degrees. Esc clears. |
+| **Hotkey overhaul** | `D` wall · `O` opening · `W` window · `C` column · `R` ruler · `Space` toggle original · existing `G` ghosts · `F` find-duplicates · `M` merge · `⌘Z`/`⌘⇧Z` undo/redo · `⌘S` save · Esc cascades (clears measure → exits draw/measure → clears selection). |
+
+### Phase 8+ candidates (next-phase decisions)
+
+Still on the table:
 
 | Path | Headline | Estimated effort |
 |---|---|---|
-| **A — Windows + columns + multi-class coverage** | Add the remaining two structural classes; extend the coverage diagnostic to be per-layer so operators can answer "did I miss any walls *or* any openings?" | 3–5 days |
-| **B — Multi-floor support** | Stevenson buildings have multiple floors; today we slice one elevation as the wall plan.  Multi-floor would let them upload a whole building and get one DXF per floor automatically. | 2–3 days |
-| **C — Eval harness** | Stop ad-hoc smoke tests.  Build a labelled fixture set (3–5 small scans with ground-truth DXFs), an `evaluate.py` that runs the pipeline and emits precision/recall/segment-length-error per scan, and a CI hook that fails on regressions. | 2–3 days |
-| **D — Operator power features** | Auto-save + rollback, "show original" overlay, measure-distance tool, in-browser DXF preview, colour walls by length. | 3–4 days |
-| **E — Closed-door recall lift** | When `multi_elevation` is on, run a *second* slice high above the door header (~ floor + 2.1 m) just for opening detection.  Open OR closed, the door's gap appears once you slice above the slab. | 1 day (small, focused win) |
+| **Multi-floor support** | Stevenson buildings have multiple floors; today we slice one elevation as the wall plan. Multi-floor would let them upload a whole building and get one DXF per floor automatically. | 2–3 days |
+| **Eval harness** | Build a labelled fixture set (3–5 small scans with ground-truth DXFs), an `evaluate.py` that emits precision / recall / segment-length-error per scan, and a CI hook that fails on regressions. | 2–3 days |
+| **Window auto-detection** | Re-slice at chest height (~ floor + 1.1 m) and compare against the door-header slice — wall pixels present below but absent above → window. Drops openings into the WINDOWS layer when distinguishable from doors. | 2 days |
+| **DXF preview in browser** | Render the operator-edited DXF inline (using `dxf-viewer` or a custom canvas pass) so QA can happen without leaving the tab. | 3 days |
+| **ML segmentation (Phase 8)** | Requires GPU + Stevenson archive or CubiCasa5K pre-train. Biggest accuracy jump once we have data. | ≥ 3 weeks |
 
 ---
 

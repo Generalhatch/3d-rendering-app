@@ -25,10 +25,18 @@ export interface VectorizeParams {
   multi_elevation: boolean;
   /** Detect door-shaped gaps in each wall and emit them on an OPENINGS layer. */
   detect_openings: boolean;
+  /** Detect column-shaped blobs in the raster and emit them on a COLUMNS layer. */
+  detect_columns: boolean;
 }
 
 /** Layer ID — drives DXF layer name + on-canvas colour. */
-export type SegmentLayer = 'walls' | 'openings' | 'columns' | 'mep' | string;
+export type SegmentLayer =
+  | 'walls'
+  | 'openings'
+  | 'windows'
+  | 'columns'
+  | 'mep'
+  | string;
 
 export interface VectorizeMetrics {
   elapsed_s: number;
@@ -52,6 +60,13 @@ export interface VectorizeMetrics {
   elevations_used_m: number[] | null;
   /** Doors / wall-gaps detected by Phase 4 opening detector.  Null on legacy jobs. */
   openings_detected: number | null;
+  /** Structural columns detected by Phase 6 column detector.  Null on legacy jobs. */
+  columns_detected: number | null;
+  /**
+   * Per-layer foreground-coverage percentage (0..1).  ``walls`` always present;
+   * ``openings`` / ``columns`` present when their respective detectors ran.
+   */
+  coverage_by_layer: Record<string, number> | null;
 }
 
 export interface VectorizeJobDetail {
@@ -202,6 +217,7 @@ export const DEFAULT_VECTORIZE_PARAMS: VectorizeParams = {
   remove_speckle: true,
   multi_elevation: true,
   detect_openings: true,
+  detect_columns: true,
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -242,6 +258,7 @@ export const vectorizeApi = {
     fd.append('remove_speckle', String(params.remove_speckle));
     fd.append('multi_elevation', String(params.multi_elevation));
     fd.append('detect_openings', String(params.detect_openings));
+    fd.append('detect_columns', String(params.detect_columns));
 
     return new Promise<VectorizeJobCreate>((resolve, reject) => {
       const xhr = new XMLHttpRequest();

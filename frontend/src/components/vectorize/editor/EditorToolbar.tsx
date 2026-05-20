@@ -52,16 +52,28 @@ export function EditorToolbar({
   const layerVisibility = useEditorStore((s) => s.layerVisibility);
   const toggleLayerVisible = useEditorStore((s) => s.toggleLayerVisible);
 
+  // Phase D wiring
+  const showOriginal = useEditorStore((s) => s.showOriginal);
+  const toggleShowOriginal = useEditorStore((s) => s.toggleShowOriginal);
+  const autoSaveEnabled = useEditorStore((s) => s.autoSaveEnabled);
+  const setAutoSaveEnabled = useEditorStore((s) => s.setAutoSaveEnabled);
+  const lastSavedAt = useEditorStore((s) => s.lastSavedAt);
+  const originalSegments = useEditorStore((s) => s.originalSegments);
+
   const anySelected = segmentCounts.selected > 0;
   const canMerge = segmentCounts.selected >= 2;
   const drawing = mode === 'draw';
 
-  // Layer pills: walls + openings first (always shown), then any other class
-  // the operator's segment list contains (future-proofs for columns / MEP).
-  const layerOrder: SegmentLayer[] = ['walls', 'openings'];
+  // Layer pills: walls + openings + windows + columns first (always shown),
+  // then any other class the operator's segment list contains.
+  const layerOrder: SegmentLayer[] = ['walls', 'openings', 'windows', 'columns'];
   for (const key of Object.keys(segmentCounts.byLayer ?? {})) {
     if (!layerOrder.includes(key)) layerOrder.push(key);
   }
+
+  // "Show original" — only meaningful if the operator has actually edited
+  // away from the baseline.  Disable when ``originalSegments`` is empty.
+  const canShowOriginal = originalSegments.length > 0;
 
   return (
     <div className="absolute top-3 left-3 flex flex-col gap-2 pointer-events-auto">
@@ -128,18 +140,18 @@ export function EditorToolbar({
         })}
       </div>
 
-      {/* Tool selector + draw-layer selector + ghosts + duplicates — the "fly-through" row */}
+      {/* Tool selector + draw-layer selector + ghosts + duplicates + measure — the "fly-through" row */}
       <div className="rounded-lg bg-gray-900/85 backdrop-blur-sm border border-gray-700 p-1 flex items-center gap-1">
         <ToolBtn
           onClick={() => setMode(drawing ? 'select' : 'draw')}
-          label={drawing ? `✎ Drawing ${styleForLayer(drawLayer).label.toLowerCase().replace(/s$/, '')}` : '✎ Draw'}
-          hint={`Draw a new ${styleForLayer(drawLayer).label.toLowerCase().replace(/s$/, '')} (D=wall, O=opening).  Click-drag in the canvas to sketch.`}
+          label={drawing ? `✎ ${styleForLayer(drawLayer).label.toLowerCase().replace(/s$/, '')}` : '✎ Draw'}
+          hint={`Draw a new ${styleForLayer(drawLayer).label.toLowerCase().replace(/s$/, '')} (D=wall, O=opening, W=window, C=column).  Click-drag in the canvas to sketch.`}
           variant={drawing ? 'primary' : 'default'}
         />
         {drawing && (
           <div className="flex items-center gap-1 pl-1 pr-2 border-l border-gray-700 ml-1">
             <span className="text-[10px] uppercase tracking-wide text-gray-500">on</span>
-            {(['walls', 'openings'] as SegmentLayer[]).map((layer) => {
+            {(['walls', 'openings', 'windows', 'columns'] as SegmentLayer[]).map((layer) => {
               const style = LAYER_STYLES[layer];
               const active = drawLayer === layer;
               return (
@@ -162,6 +174,12 @@ export function EditorToolbar({
           </div>
         )}
         <ToolBtn
+          onClick={() => setMode(mode === 'measure' ? 'select' : 'measure')}
+          label={mode === 'measure' ? '📏 Measuring' : '📏 Ruler'}
+          hint="Measure distance between two points.  Click 2 points; snaps to endpoints/walls. (R)"
+          variant={mode === 'measure' ? 'primary' : 'default'}
+        />
+        <ToolBtn
           onClick={toggleGhosts}
           disabled={segmentCounts.ghosts === 0}
           label={ghostsVisible ? '◉ Ghosts' : '○ Ghosts'}
@@ -169,6 +187,15 @@ export function EditorToolbar({
             ? 'No pipeline-rejected candidates for this job'
             : `Show ${segmentCounts.ghosts} pipeline-rejected ghost candidates.  Click a ghost to promote it. (G)`}
           variant={ghostsVisible ? 'primary' : 'default'}
+        />
+        <ToolBtn
+          onClick={toggleShowOriginal}
+          disabled={!canShowOriginal}
+          label={showOriginal ? '◉ Original' : '○ Original'}
+          hint={canShowOriginal
+            ? 'Overlay the pipeline\'s pre-edit output in faint grey so you can see what you changed. (\u00A0)'
+            : 'Nothing loaded yet'}
+          variant={showOriginal ? 'primary' : 'default'}
         />
         <Divider />
         <ToolBtn
@@ -216,7 +243,7 @@ export function EditorToolbar({
         />
       </div>
 
-      {/* Save */}
+      {/* Save + auto-save indicator */}
       <div className="rounded-lg bg-gray-900/85 backdrop-blur-sm border border-gray-700 p-1 flex items-center gap-2">
         <button
           onClick={onSave}
@@ -234,9 +261,19 @@ export function EditorToolbar({
           {dirty
             ? 'unsaved changes'
             : lastSavedVersion !== null
-              ? `saved v${lastSavedVersion}`
+              ? `saved v${lastSavedVersion}${lastSavedAt ? ` · ${relativeTime(lastSavedAt)}` : ''}`
               : 'pristine'}
         </span>
+        <Divider />
+        <button
+          onClick={() => setAutoSaveEnabled(!autoSaveEnabled)}
+          className={`px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+            autoSaveEnabled ? 'bg-emerald-950 text-emerald-300 hover:bg-emerald-900' : 'bg-gray-800 text-gray-500 hover:bg-gray-700'
+          }`}
+          title="Toggle auto-save (every 30 s while editing). Always-on by default."
+        >
+          {autoSaveEnabled ? '⟳ Auto-save: on' : '⊘ Auto-save: off'}
+        </button>
       </div>
     </div>
   );
@@ -272,4 +309,14 @@ function ToolBtn({
 
 function Divider() {
   return <span className="w-px bg-gray-700 my-1" />;
+}
+
+/** Human-friendly "12 s ago" / "3 m ago" suffix for the saved indicator. */
+function relativeTime(ts: number): string {
+  const delta_s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (delta_s < 60) return `${delta_s}s ago`;
+  const delta_m = Math.floor(delta_s / 60);
+  if (delta_m < 60) return `${delta_m}m ago`;
+  const delta_h = Math.floor(delta_m / 60);
+  return `${delta_h}h ago`;
 }

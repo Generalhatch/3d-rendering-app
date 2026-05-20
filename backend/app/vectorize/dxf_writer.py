@@ -40,14 +40,17 @@ class LayerSpec:
     description: str = ""
 
 
-# Default layer map.  Phase 1 ships only WALLS; later phases add the rest.
+# Default layer map.  Phase 1 shipped WALLS; Phase 4 added OPENINGS; Phase 6
+# adds COLUMNS + WINDOWS.  MEP/TEXT remain reserved for future classes.
 DEFAULT_LAYER_MAP: dict[str, LayerSpec] = {
     "walls":      LayerSpec("WALLS",      color_aci=3, lineweight=35,
                             description="Detected wall centrelines"),
     "openings":   LayerSpec("OPENINGS",   color_aci=2, lineweight=18,
-                            description="Detected door / window openings"),
+                            description="Detected door openings"),
+    "windows":    LayerSpec("WINDOWS",    color_aci=5, lineweight=18,
+                            description="Operator-marked windows"),
     "columns":    LayerSpec("COLUMNS",    color_aci=1, lineweight=35,
-                            description="Detected columns"),
+                            description="Detected structural columns"),
     "mep":        LayerSpec("MEP",        color_aci=6, lineweight=18,
                             description="Detected mechanical / electrical / plumbing"),
     "text":       LayerSpec("TEXT",       color_aci=7, lineweight=18,

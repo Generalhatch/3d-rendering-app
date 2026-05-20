@@ -114,11 +114,17 @@ class VectorizeParams(BaseModel):
     detect_openings: bool = Field(
         default=True,
         description="After wall detection, scan every kept wall for door-shaped "
-                    "gaps in the raster (0.7–1.2 m wide, away from wall corners). "
-                    "Emits them as an OPENINGS layer in the DXF and as separate "
-                    "segments in the editor.  Conservative — won't false-fire on "
-                    "wall terminations, but may miss closed-door scans where the "
-                    "door slab fills the raster at slice height.",
+                    "gaps (0.7–1.2 m wide, away from wall corners) at a high "
+                    "slice (elevation + 0.6 m) so closed door slabs disappear "
+                    "and only the gap remains.  Emits them on the OPENINGS layer.",
+    )
+    detect_columns: bool = Field(
+        default=True,
+        description="After wall detection, find isolated square-ish blobs in the "
+                    "raster (20–120 cm bounding diagonal, ≤ 2.5:1 aspect, ≥ 55% "
+                    "fill) that aren't explained by any wall — these are usually "
+                    "structural columns.  Emits them as 4-vertex rectangle "
+                    "footprints on the COLUMNS layer.",
     )
 
 
@@ -153,6 +159,9 @@ class VectorizeMetrics(BaseModel):
     elevations_used_m: Optional[list[float]] = None
     # Phase 4: detected openings (doors / wall-gaps).  Null on legacy jobs.
     openings_detected: Optional[int] = None
+    # Phase 6 ("A"): detected columns + per-layer coverage diagnostic.
+    columns_detected: Optional[int] = None
+    coverage_by_layer: Optional[dict[str, float]] = None
 
 
 class VectorizeJobDetail(BaseModel):

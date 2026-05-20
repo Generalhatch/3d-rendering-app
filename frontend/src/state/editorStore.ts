@@ -55,11 +55,18 @@ export const LAYER_STYLES: Record<SegmentLayer, LayerStyle> = {
     hoverColor: '#fef08a',
     dashArray: '6 3',          // dashed so closed/open doors read at a glance
   },
+  windows: {
+    label: 'Windows',
+    color: '#60a5fa',          // blue-400 — matches DXF ACI=5 (blue)
+    selectedColor: '#fb923c',
+    hoverColor: '#93c5fd',
+    dashArray: '2 4',          // dotted so windows visually differ from doors
+  },
   columns: {
     label: 'Columns',
-    color: '#f87171',
-    selectedColor: '#fb7185',
-    hoverColor: '#fda4af',
+    color: '#f472b6',          // pink-400 — matches DXF ACI=1 (red) family
+    selectedColor: '#f43f5e',
+    hoverColor: '#fbcfe8',
   },
   mep: {
     label: 'MEP',
@@ -80,8 +87,19 @@ export interface EditorSegment extends EditableSegment {
   status: SegmentStatus;
 }
 
-/** Editor interaction mode.  Drives cursor + pointer event semantics. */
-export type EditorMode = 'select' | 'draw';
+/**
+ * Editor interaction mode.  Drives cursor + pointer event semantics.
+ * Phase 6/D: ``measure`` is the click-to-click ruler.
+ */
+export type EditorMode = 'select' | 'draw' | 'measure';
+
+/** A locked or in-progress measurement (world coords). */
+export interface Measurement {
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+}
 
 const MAX_HISTORY = 100;
 
@@ -142,6 +160,27 @@ interface EditorState {
   layerVisibility: Record<SegmentLayer, boolean>;
   toggleLayerVisible: (layer: SegmentLayer) => void;
   setLayerVisible: (layer: SegmentLayer, visible: boolean) => void;
+
+  // ── Phase D: "show original" overlay ──────────────────────────────────────
+  /** Snapshot of what was loaded — for diffing operator edits against pipeline. */
+  originalSegments: EditorSegment[];
+  showOriginal: boolean;
+  toggleShowOriginal: () => void;
+
+  // ── Phase D: measurement tool ─────────────────────────────────────────────
+  /** Latest locked measurement (one only, replaces the previous). */
+  measurement: Measurement | null;
+  /** First click while in measure mode; cleared on second click or Esc. */
+  measureAnchor: [number, number] | null;
+  setMeasurement: (m: Measurement | null) => void;
+  setMeasureAnchor: (p: [number, number] | null) => void;
+
+  // ── Phase D: auto-save bookkeeping ────────────────────────────────────────
+  autoSaveEnabled: boolean;
+  setAutoSaveEnabled: (on: boolean) => void;
+  /** Last auto-save error message (sticky toast in surface).  Null = OK. */
+  autoSaveError: string | null;
+  setAutoSaveError: (msg: string | null) => void;
 
   // ── Ghost layer (pipeline-rejected segments the operator can rescue) ───────
   ghosts: RejectedSegmentPayload[];
@@ -214,7 +253,15 @@ const initialState = {
   future: [] as HistorySnapshot[],
   mode: 'select' as EditorMode,
   drawLayer: 'walls' as SegmentLayer,
-  layerVisibility: { walls: true, openings: true } as Record<SegmentLayer, boolean>,
+  layerVisibility: {
+    walls: true, openings: true, windows: true, columns: true,
+  } as Record<SegmentLayer, boolean>,
+  originalSegments: [] as EditorSegment[],
+  showOriginal: false,
+  measurement: null as Measurement | null,
+  measureAnchor: null as [number, number] | null,
+  autoSaveEnabled: true,
+  autoSaveError: null as string | null,
   ghosts: [] as RejectedSegmentPayload[],
   ghostsVisible: false,
   mergeSuggestions: [] as DuplicatePair[],
@@ -250,8 +297,13 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   loadSegments: (segments) => {
+    const fresh = segments.map((s) => ({ ...s, status: 'active' as const }));
     set({
-      segments: segments.map((s) => ({ ...s, status: 'active' as const })),
+      segments: fresh,
+      // Snapshot the just-loaded segments so "Show original" can render the
+      // pre-edit pipeline output behind the operator's working set.  We deep-
+      // copy because the active list will mutate in place over time.
+      originalSegments: fresh.map((s) => ({ ...s })),
       selectedIds: new Set<string>(),
       hoverId: null,
       editLog: [],
@@ -259,6 +311,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       future: [],
       dirty: false,
       loaded: true,
+      measurement: null,
+      measureAnchor: null,
+      autoSaveError: null,
     });
   },
 
@@ -278,6 +333,17 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
   setLayerVisible: (layer, visible) =>
     set((s) => ({ layerVisibility: { ...s.layerVisibility, [layer]: visible } })),
+
+  // ── Phase D: show-original overlay ───────────────────────────────────────
+  toggleShowOriginal: () => set((s) => ({ showOriginal: !s.showOriginal })),
+
+  // ── Phase D: measurement tool ────────────────────────────────────────────
+  setMeasurement: (measurement) => set({ measurement }),
+  setMeasureAnchor: (measureAnchor) => set({ measureAnchor }),
+
+  // ── Phase D: auto-save bookkeeping ───────────────────────────────────────
+  setAutoSaveEnabled: (autoSaveEnabled) => set({ autoSaveEnabled }),
+  setAutoSaveError: (autoSaveError) => set({ autoSaveError }),
 
   // ── Ghost layer ──────────────────────────────────────────────────────────
   setGhosts: (ghosts) => set({ ghosts }),

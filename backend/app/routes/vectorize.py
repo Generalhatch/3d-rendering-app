@@ -89,6 +89,7 @@ async def create_vectorize(
     remove_speckle: bool = Form(default=True),
     multi_elevation: bool = Form(default=True),
     detect_openings: bool = Form(default=True),
+    detect_columns: bool = Form(default=True),
 ):
     """Upload a scan and start a vectorize job.
 
@@ -140,6 +141,7 @@ async def create_vectorize(
         remove_speckle=remove_speckle,
         multi_elevation=multi_elevation,
         detect_openings=detect_openings,
+        detect_columns=detect_columns,
     )
 
     create_vectorize_job(job_id, safe_name, params.model_dump(mode="json"))

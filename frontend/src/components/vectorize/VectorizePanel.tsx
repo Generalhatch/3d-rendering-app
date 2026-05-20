@@ -496,16 +496,31 @@ function ParamsPanel({
         />
         <Toggle
           label="Detect openings (doors)"
-          help="Scan each wall for door-shaped gaps; emit them on a separate DXF layer."
+          help="Re-slice above the door header and scan each wall for door-shaped gaps."
           checked={params.detect_openings}
           onChange={(v) => onPatch({ detect_openings: v })}
           tip={
             <>
               <p className="font-semibold text-gray-100 mb-1">Promote the deliverable past walls-only</p>
-              <p>After regularization, we sample the raster along every kept wall in 2&nbsp;cm steps. Runs of pixels with no wall support that are <b>0.7–1.2&nbsp;m</b> wide and sit at least 30&nbsp;cm away from a wall endpoint become openings — they land on the <span className="font-mono text-amber-300">OPENINGS</span> layer in the DXF (yellow) and as dashed yellow segments in the editor.</p>
-              <p className="mt-2"><span className="text-emerald-300">On (default):</span> conservative — won't false-fire on wall terminations / corners.</p>
+              <p>After regularization, we slice the cloud once more at <b>elevation&nbsp;+&nbsp;0.6&nbsp;m</b> (above the standard 2.03&nbsp;m door header) so closed-door slabs disappear from the raster, then sample every kept wall in 2&nbsp;cm steps. Runs of pixels with no wall support that are <b>0.7–1.2&nbsp;m</b> wide and sit at least 30&nbsp;cm away from a wall endpoint become openings — they land on the <span className="font-mono text-amber-300">OPENINGS</span> layer in the DXF (yellow) and as dashed yellow segments in the editor.</p>
+              <p className="mt-2"><span className="text-emerald-300">On (default):</span> recovers both open and closed doors.  Adds ~3–6&nbsp;s to the run.</p>
               <p className="mt-1"><span className="text-emerald-300">Off:</span> wall-only output, identical to pre-Phase-4 behaviour.</p>
               <p className="mt-1 text-gray-500">Operators can still add or edit openings manually in the editor — press <span className="font-mono text-gray-300">O</span> to draw a new opening.</p>
+            </>
+          }
+        />
+        <Toggle
+          label="Detect columns"
+          help="Find isolated square-ish blobs that aren't walls — usually structural columns."
+          checked={params.detect_columns}
+          onChange={(v) => onPatch({ detect_columns: v })}
+          tip={
+            <>
+              <p className="font-semibold text-gray-100 mb-1">Pick up the posts between the walls</p>
+              <p>After subtracting any pixel within ~12&nbsp;cm of a kept wall from the raster, we run connected-components on what's left. Blobs that are <b>20–120&nbsp;cm</b> across, ≤&nbsp;2.5:1 aspect, and at least 55% filled within their bounding box land on the <span className="font-mono text-pink-300">COLUMNS</span> layer as a 4-vertex rectangle footprint.</p>
+              <p className="mt-2"><span className="text-emerald-300">On (default):</span> commercial/industrial spaces get their structural posts auto-detected.</p>
+              <p className="mt-1"><span className="text-emerald-300">Off:</span> skip the post-pass.  Operator can still draw columns manually with <span className="font-mono text-gray-300">C</span>.</p>
+              <p className="mt-1 text-gray-500">Residential scans usually find 0 columns — that's expected and correct.</p>
             </>
           }
         />
@@ -831,9 +846,25 @@ function ResultPanel({ jobId, job }: { jobId: string; job: NonNullable<ReturnTyp
             label="Openings"
             value={m.openings_detected}
             hint={m.openings_detected === 0
-              ? '(none detected — try the editor to draw any the scan missed)'
+              ? '(none detected — closed doors at scan time, or none in this area)'
               : '(doors / door-shaped wall gaps)'}
           />
+        )}
+        {typeof m.columns_detected === 'number' && (
+          <Stat
+            label="Columns"
+            value={m.columns_detected}
+            hint={m.columns_detected === 0
+              ? '(none detected — typical for residential / un-columned spaces)'
+              : '(structural posts, isolated from walls)'}
+          />
+        )}
+        {/* Per-layer coverage strip: only show when the pipeline emits
+            coverage for more than one class.  Today only `walls` carries a
+            meaningful denominator, so this stays hidden by default but the
+            strip is ready as soon as windows/columns get a real metric. */}
+        {m.coverage_by_layer && Object.keys(m.coverage_by_layer).length > 1 && (
+          <PerLayerCoverageStat coverage={m.coverage_by_layer} />
         )}
         {m.coverage_pct !== null && m.coverage_pct !== undefined && (
           <CoverageStat
@@ -891,6 +922,48 @@ function ResultPanel({ jobId, job }: { jobId: string; job: NonNullable<ReturnTyp
  * toggle "Show coverage gaps" to see whether the uncovered pixels are
  * furniture (ignore) or actually-missed walls (manually add).
  */
+/**
+ * Per-layer coverage strip — one chip per detected class.  Surfaces the
+ * answer to "did the pipeline miss anything on each layer?" at a glance.
+ *
+ * Note: the per-layer percentage compares each layer's segments to *its own*
+ * foreground (walls → wall raster, openings → door-header raster, columns →
+ * wall-subtracted residual).  Don't compare across layers — they're measured
+ * against different denominators.
+ */
+function PerLayerCoverageStat({ coverage }: { coverage: Record<string, number> }) {
+  const layerLabels: Record<string, string> = {
+    walls: 'Walls',
+    openings: 'Openings',
+    columns: 'Columns',
+    windows: 'Windows',
+  };
+  return (
+    <div>
+      <div className="text-gray-400 mb-1">Per-layer coverage</div>
+      <div className="flex flex-wrap gap-1.5">
+        {Object.entries(coverage).map(([layer, pct]) => {
+          const pctInt = Math.round(pct * 1000) / 10;
+          const tone =
+            pct >= 0.70 ? 'text-emerald-200 bg-emerald-900/40 border-emerald-700/60'
+            : pct >= 0.50 ? 'text-amber-200 bg-amber-900/40 border-amber-700/60'
+            : 'text-rose-200 bg-rose-950/60 border-rose-800/70';
+          return (
+            <span
+              key={layer}
+              className={`px-1.5 py-0.5 rounded border text-[10px] font-mono flex items-baseline gap-1 ${tone}`}
+              title={`${layerLabels[layer] ?? layer}: ${pctInt.toFixed(1)} % of the layer's foreground pixels are within 8 cm of an emitted segment.`}
+            >
+              <span className="text-gray-300 normal-case">{layerLabels[layer] ?? layer}</span>
+              <span>{pctInt.toFixed(1)}%</span>
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function CoverageStat({
   pct, radius_m, foreground, uncovered, multi,
 }: { pct: number; radius_m: number | null; foreground: number | null; uncovered: number | null; multi: boolean }) {

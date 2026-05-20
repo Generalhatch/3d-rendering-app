@@ -169,9 +169,11 @@ def save_edits(
     segments_by_class: dict[str, np.ndarray] = {}
     for layer, segs in by_layer.items():
         segments_by_class[layer] = np.array(segs, dtype=np.float64)
-    # Ensure walls + openings always appear in the DXF (with their layer
-    # slots) even when the operator deleted everything on one of them.
-    for required in ("walls", "openings"):
+    # Ensure walls + openings + windows + columns always appear in the DXF
+    # (with their layer slots) even when the operator deleted everything on
+    # one of them — keeps downstream CAD operators' layer state stable across
+    # versions.
+    for required in ("walls", "openings", "windows", "columns"):
         segments_by_class.setdefault(required, np.zeros((0, 2, 2), dtype=np.float64))
 
     counts = " ".join(

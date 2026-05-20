@@ -72,6 +72,14 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
   const mergeSuggestions = useEditorStore((s) => s.mergeSuggestions);
   const mergeCursor = useEditorStore((s) => s.mergeCursor);
 
+  // Phase D state
+  const originalSegments = useEditorStore((s) => s.originalSegments);
+  const showOriginal = useEditorStore((s) => s.showOriginal);
+  const measurement = useEditorStore((s) => s.measurement);
+  const measureAnchor = useEditorStore((s) => s.measureAnchor);
+  const setMeasurement = useEditorStore((s) => s.setMeasurement);
+  const setMeasureAnchor = useEditorStore((s) => s.setMeasureAnchor);
+
   /** Helper: is this layer currently visible?  Defaults to true. */
   const isLayerVisible = useCallback(
     (layer: string) => layerVisibility[layer] !== false,
@@ -246,6 +254,11 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
   const [drawAnchor, setDrawAnchor] = useState<[number, number] | null>(null);
   const [drawCursor, setDrawCursor] = useState<[number, number] | null>(null);
 
+  // ── Measure-mode live cursor (svg pixels) ──────────────────────────────
+  // After click 1 in measure mode, mouse move updates this so the operator
+  // sees the candidate ruler before committing click 2.
+  const [measureLive, setMeasureLive] = useState<[number, number] | null>(null);
+
   // ── Coverage overlay toggle (the "did we miss anything?" diagnostic) ────
   const [showCoverage, setShowCoverage] = useState(false);
 
@@ -261,6 +274,21 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
     if (e.button !== 0) return;
 
     const [col, row] = screenToSvg(e.clientX, e.clientY);
+
+    // ── Measure mode: click 1 = anchor, click 2 = lock + report ─────────
+    if (mode === 'measure') {
+      const snapped = snapDrawPoint(col, row, segments, null, worldToPx, view.scale);
+      if (!measureAnchor) {
+        setMeasureAnchor(snapped);
+        setMeasurement(null);
+      } else {
+        const [ax, ay] = pxToWorld(measureAnchor[0], measureAnchor[1]);
+        const [bx, by] = pxToWorld(snapped[0], snapped[1]);
+        setMeasurement({ ax, ay, bx, by });
+        setMeasureAnchor(null);
+      }
+      return;
+    }
 
     // ── Draw mode: anchor + start sketching a new wall ───────────────────
     if (mode === 'draw') {
@@ -314,6 +342,13 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
       const [col, row] = screenToSvg(e.clientX, e.clientY);
       const snapped = snapDrawPoint(col, row, segments, drawAnchor, worldToPx, view.scale);
       setDrawCursor(snapped);
+      return;
+    }
+
+    if (mode === 'measure' && measureAnchor) {
+      const [col, row] = screenToSvg(e.clientX, e.clientY);
+      const snapped = snapDrawPoint(col, row, segments, measureAnchor, worldToPx, view.scale);
+      setMeasureLive(snapped);
       return;
     }
 
@@ -424,10 +459,16 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
     return () => window.removeEventListener('keydown', onKey);
   }, [drawAnchor]);
 
+  // Clear the measure live-cursor whenever the anchor goes away (after lock
+  // or Esc) so the dashed ruler doesn't ghost on screen.
+  useEffect(() => {
+    if (!measureAnchor) setMeasureLive(null);
+  }, [measureAnchor]);
+
   // ── Cursor logic ────────────────────────────────────────────────────────
   const cursor = panning
     ? 'grabbing'
-    : drawAnchor || mode === 'draw'
+    : drawAnchor || mode === 'draw' || mode === 'measure'
       ? 'crosshair'
       : dragging
         ? 'crosshair'
@@ -478,6 +519,23 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
 
         {/* Faint border so the raster bounds are visible even when zoomed in. */}
         <rect x={0} y={0} width={W} height={H} fill="none" stroke="#1f2937" strokeWidth={1 / view.scale} />
+
+        {/* "Show original" — faint grey ghost of the pipeline's just-loaded
+            output, so the operator can see at a glance how their edits diverge. */}
+        {showOriginal && originalSegments.map((o) => {
+          const [x1, y1] = worldToPx(o.x1, o.y1);
+          const [x2, y2] = worldToPx(o.x2, o.y2);
+          return (
+            <line
+              key={`orig-${o.id}`}
+              x1={x1} y1={y1} x2={x2} y2={y2}
+              stroke="#94a3b8"
+              strokeOpacity={0.4}
+              strokeWidth={1.5 / view.scale}
+              strokeDasharray={`${2 / view.scale} ${3 / view.scale}`}
+            />
+          );
+        })}
 
         {/* Pipeline-rejected ghost candidates — render faintly, clickable to promote. */}
         {projectedGhosts.map(({ ghost, x1, y1, x2, y2 }) => (
@@ -586,6 +644,38 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
           );
         })()}
 
+        {/* Measure-mode preview line (anchor → live cursor) */}
+        {mode === 'measure' && measureAnchor && measureLive && (
+          <g pointerEvents="none">
+            <line
+              x1={measureAnchor[0]} y1={measureAnchor[1]}
+              x2={measureLive[0]} y2={measureLive[1]}
+              stroke="#fb923c"
+              strokeWidth={2 / view.scale}
+              strokeDasharray={`${4 / view.scale} ${3 / view.scale}`}
+            />
+            <circle cx={measureAnchor[0]} cy={measureAnchor[1]} r={4 / view.scale} fill="#fb923c" />
+            <circle cx={measureLive[0]} cy={measureLive[1]} r={4 / view.scale} fill="#fb923c" stroke="#0f172a" strokeWidth={1 / view.scale} />
+          </g>
+        )}
+
+        {/* Locked measurement (solid ruler with endpoint pips) */}
+        {measurement && (() => {
+          const [ax, ay] = worldToPx(measurement.ax, measurement.ay);
+          const [bx, by] = worldToPx(measurement.bx, measurement.by);
+          return (
+            <g pointerEvents="none">
+              <line
+                x1={ax} y1={ay} x2={bx} y2={by}
+                stroke="#fb923c"
+                strokeWidth={2 / view.scale}
+              />
+              <circle cx={ax} cy={ay} r={4 / view.scale} fill="#fb923c" stroke="#0f172a" strokeWidth={1 / view.scale} />
+              <circle cx={bx} cy={by} r={4 / view.scale} fill="#fb923c" stroke="#0f172a" strokeWidth={1 / view.scale} />
+            </g>
+          );
+        })()}
+
         {/* Merge-suggestion highlight: the two source segments + the proposed centreline. */}
         {currentSuggestion && (
           <g pointerEvents="none">
@@ -640,14 +730,18 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
 
       {/* Bottom-left help — mode-aware. */}
       <div className="absolute bottom-3 left-3 rounded-lg bg-gray-900/80 backdrop-blur-sm border border-gray-700 px-3 py-1.5 text-[11px] text-gray-400 pointer-events-none">
-        {mode === 'draw'
-          ? (
-              <span>
-                <span className="text-sky-300">draw mode</span> · click-drag = new {styleForLayer(drawLayer).label.toLowerCase()} ·
-                {' '}snaps to endpoints/walls/axes · D=wall · O=opening · esc cancel
-              </span>
-            )
-          : <span>click select · shift+click multi · delete = reject · drag endpoints · scroll = zoom · right-drag = pan · D draw wall · O draw opening · M merge · G ghosts · F duplicates</span>}
+        {mode === 'draw' ? (
+          <span>
+            <span className="text-sky-300">draw mode</span> · click-drag = new {styleForLayer(drawLayer).label.toLowerCase()} ·
+            {' '}snaps to endpoints/walls/axes · D=wall · O=opening · W=window · C=column · esc cancel
+          </span>
+        ) : mode === 'measure' ? (
+          <span>
+            <span className="text-orange-300">measure mode</span> · click 2 points · snaps to endpoints/walls · R exits · esc clears
+          </span>
+        ) : (
+          <span>click select · shift+click multi · delete = reject · drag endpoints · scroll = zoom · right-drag = pan · D wall · O opening · W window · C column · R ruler · M merge · G ghosts · F duplicates</span>
+        )}
       </div>
 
       {/* Draw-mode banner at top centre — colour matches the active draw layer. */}
@@ -678,6 +772,70 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
       {mergeSuggestions.length > 0 && mergeCursor < mergeSuggestions.length && (
         <MergeSuggestionStrip />
       )}
+
+      {/* Measurement readout — distance + bearing.  Lives top-centre so it
+          doesn't fight the merge-suggestion footer or the draw banner. */}
+      {(measurement || (mode === 'measure' && measureAnchor && measureLive)) && (
+        <MeasurementReadout
+          live={
+            measurement
+              ? null
+              : (() => {
+                  const a = measureAnchor!;
+                  const b = measureLive!;
+                  const [ax, ay] = pxToWorld(a[0], a[1]);
+                  const [bx, by] = pxToWorld(b[0], b[1]);
+                  return { ax, ay, bx, by };
+                })()
+          }
+          locked={measurement}
+          onClear={() => { setMeasurement(null); setMeasureAnchor(null); }}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Top-centre toast showing distance + bearing for the active measurement. */
+function MeasurementReadout({
+  live, locked, onClear,
+}: {
+  live: { ax: number; ay: number; bx: number; by: number } | null;
+  locked: { ax: number; ay: number; bx: number; by: number } | null;
+  onClear: () => void;
+}) {
+  const m = locked ?? live!;
+  const dx = m.bx - m.ax;
+  const dy = m.by - m.ay;
+  const dist_m = Math.hypot(dx, dy);
+  // World Y grows north (per RasterAffine); bearing = compass-clockwise from +Y.
+  const bearing_deg = ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360;
+  return (
+    <div className="absolute top-14 left-1/2 -translate-x-1/2 pointer-events-auto">
+      <div
+        className={`rounded-lg backdrop-blur-sm border px-4 py-2 text-xs shadow-lg flex items-center gap-3 ${
+          locked
+            ? 'bg-orange-950/90 border-orange-500 text-orange-100'
+            : 'bg-orange-900/80 border-orange-700 text-orange-200'
+        }`}
+      >
+        <span className="font-mono text-base font-semibold text-amber-200">
+          {dist_m < 1
+            ? `${(dist_m * 100).toFixed(1)} cm`
+            : `${dist_m.toFixed(3)} m`}
+        </span>
+        <span className="text-[11px] text-orange-300">
+          Δx={dx.toFixed(2)} Δy={dy.toFixed(2)} · bearing {bearing_deg.toFixed(1)}°
+        </span>
+        {locked && (
+          <button
+            onClick={onClear}
+            className="text-orange-200 hover:text-white text-[10px] underline"
+          >
+            clear (Esc)
+          </button>
+        )}
+      </div>
     </div>
   );
 }

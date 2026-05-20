@@ -30,7 +30,15 @@ import numpy as np
 from ..limits import JOB_SEMAPHORE
 from ..models.vectorize_job import VectorizeMetrics, VectorizeParams, VectorizeStatus
 from ..sse import publish
-from . import classical, dxf_writer, openings as openings_mod, preprocess, regularize, slicer
+from . import (
+    classical,
+    columns as columns_mod,
+    dxf_writer,
+    openings as openings_mod,
+    preprocess,
+    regularize,
+    slicer,
+)
 
 
 # Coverage tolerance: a foreground (wall) pixel counts as "covered" if any
@@ -279,27 +287,71 @@ def run_vectorize(
         )
 
         # ── 7c. Opening (door / wall-gap) detection ──────────────────────
+        # Why we re-slice above the door header (Phase 5 "E" recall-lift):
+        # The wall raster (single- or multi-elevation) sees *closed* door slabs
+        # as walls — they fill the raster at shoulder height.  Opening detection
+        # needs a slice ABOVE the door so the slab is gone and only the gap
+        # remains.  Standard interior doors top out at 2.03 m, so we slice at
+        # ``floor + 2.20 m`` (== elevation + 0.60 m for the shoulder default).
+        # We re-use the same slab thickness + axis as the main slice.  Cost:
+        # ~3–6 s on a typical scan; only paid when ``detect_openings`` is on.
         opening_segs: list[np.ndarray] = []
+        opening_raster_label = "shoulder (closed doors fill the gap)"
         if params.detect_openings and len(clean_segments) > 0:
+            _emit(job_id, "openings", "Slicing above door header for opening detection…", 0.905)
+            door_elevation = elevation + 0.60
+            from ..pipeline.ingest import load_point_cloud  # heavy, local import
+            # We already freed ``pcd`` after the main slice — reload it.  Only
+            # this branch pays the I/O cost, and only when detect_openings is on.
+            pcd_for_doors = load_point_cloud(scan_path)
+            try:
+                door_slice = slicer.slice_to_raster(
+                    pcd_for_doors,
+                    elevation_m=door_elevation,
+                    slab_thickness_m=params.slab_thickness_m,
+                    resolution_m_per_px=params.resolution_m_per_px,
+                    axis_idx=axis_idx,
+                )
+            finally:
+                del pcd_for_doors
+
+            # Same preprocessing as the wall raster so the perpendicular-band
+            # support test sees a comparable signal (closed CLOSE + optional OPEN).
+            door_cleaned = preprocess.preprocess(door_slice.image, preprocess_params)
+
+            # The door slice is sliced fresh, so its affine is *almost* identical
+            # to the main affine but may differ slightly in canvas extent (the
+            # high slice has different point coverage).  We need an affine that
+            # the openings sampler can use to index ``door_cleaned`` correctly —
+            # use ``door_slice.affine``, which matches its own raster.
+            opening_raster_label = (
+                f"high slice @ {door_elevation:.2f} m "
+                f"({door_slice.affine.width_px}×{door_slice.affine.height_px} px)"
+            )
+
             _emit(job_id, "openings", "Scanning walls for door-shaped gaps…", 0.91)
             detected = openings_mod.detect_openings(
-                cleaned, clean_segments, slice_result.affine,
+                door_cleaned, clean_segments, door_slice.affine,
             )
             opening_segs = [d.seg for d in detected]
             _emit(
                 job_id, "openings",
                 f"Detected {len(opening_segs)} opening{'s' if len(opening_segs) != 1 else ''} "
-                f"(doors / wall-gaps)",
+                f"from {opening_raster_label}",
                 0.92,
             )
             if opening_segs:
-                # Visual sanity-check overlay — walls red, openings yellow.
-                walls_px = _segments_world_to_pixels(clean_segments, slice_result.affine)
+                # Visual sanity-check overlay — walls red, openings yellow,
+                # over the door-header slice the detector actually used.
+                walls_px = _segments_world_to_pixels(clean_segments, door_slice.affine)
                 opens_px = _segments_world_to_pixels(
-                    np.array(opening_segs), slice_result.affine,
+                    np.array(opening_segs), door_slice.affine,
                 )
-                ovl = openings_mod.render_openings_overlay(cleaned, walls_px, opens_px)
+                ovl = openings_mod.render_openings_overlay(door_cleaned, walls_px, opens_px)
                 cv2.imwrite(str(artifact_dir / "overlay_openings.png"), cv2.flip(ovl, 0))
+                # Also persist the door slice raster itself so the editor can
+                # show it as an alternate backdrop (operator can verify the gaps).
+                cv2.imwrite(str(artifact_dir / "slice_doors.png"), cv2.flip(door_cleaned, 0))
 
         openings_array = (
             np.array(opening_segs, dtype=np.float64)
@@ -307,21 +359,64 @@ def run_vectorize(
             else np.zeros((0, 2, 2), dtype=np.float64)
         )
 
+        # ── 7d. Column detection ────────────────────────────────────────
+        # Columns: isolated, square-ish blobs that survived the morphology
+        # pass.  Detection runs on the *wall* raster (not the door slice) —
+        # structural columns sit between walls in plan view, so the shoulder-
+        # height slice that captures walls also captures columns.
+        column_objs: list[columns_mod.DetectedColumn] = []
+        if params.detect_columns and len(clean_segments) > 0:
+            _emit(job_id, "columns", "Scanning for column-shaped blobs…", 0.925)
+            column_objs = columns_mod.detect_columns(
+                cleaned, clean_segments, slice_result.affine,
+            )
+            _emit(
+                job_id, "columns",
+                f"Detected {len(column_objs)} column{'s' if len(column_objs) != 1 else ''}",
+                0.93,
+            )
+            if column_objs:
+                walls_px = _segments_world_to_pixels(clean_segments, slice_result.affine)
+                ovl = columns_mod.render_columns_overlay(
+                    cleaned, walls_px, column_objs, slice_result.affine,
+                )
+                cv2.imwrite(str(artifact_dir / "overlay_columns.png"), cv2.flip(ovl, 0))
+
+        columns_array = columns_mod.columns_to_segments(column_objs)
+
+        # ── 7e. Per-layer coverage diagnostic ────────────────────────────
+        # ``coverage_by_layer`` is the operator's "did we miss anything?"
+        # answer per class.  Today only walls have a meaningful denominator
+        # (their raster foreground IS what wall lines explain).  Openings
+        # and columns are about *instance count* (how many doors/columns)
+        # rather than *pixel coverage*; their numbers in this metric end
+        # up dominated by furniture noise and aren't useful to the
+        # operator, so we omit them.  The data shape is kept open so
+        # future classes (e.g. windows from a second high slice) can plug
+        # in when they have a meaningful denominator.
+        coverage_by_layer: dict[str, float] = {"walls": float(cov_pct)}
+
         # ── 8. DXF + segments.json ───────────────────────────────────────
-        _emit(job_id, "dxf", "Writing DXF…", 0.93)
+        _emit(job_id, "dxf", "Writing DXF…", 0.94)
         annotation = (
             f"Beehive Automations L.L.C. Vectorize | job={job_id} | "
             f"elev={elevation:.2f}m | slab={params.slab_thickness_m:.2f}m | "
             f"res={params.resolution_m_per_px:.3f}m/px | "
             f"detector={params.detector.value} | "
-            f"walls={segments_after} openings={len(opening_segs)}"
+            f"walls={segments_after} openings={len(opening_segs)} "
+            f"columns={len(column_objs)}"
         )
         dxf_path = result_dir / "vectorized.dxf"
-        # Multi-layer DXF: WALLS + OPENINGS.  Other classes (columns, MEP)
-        # remain unwritten this phase; layer slots are still created in the
-        # DXF so a downstream CAD operator can drop content onto them.
+        # Multi-layer DXF: WALLS + OPENINGS + COLUMNS (windows always reserved
+        # but operator-only).  Other classes (MEP, TEXT) remain unwritten this
+        # phase; their layer slots are still created so a CAD operator can
+        # drop content onto them.
         dxf_writer.write_dxf(
-            {"walls": clean_segments, "openings": openings_array},
+            {
+                "walls": clean_segments,
+                "openings": openings_array,
+                "columns": columns_array,
+            },
             dxf_path,
             annotation_text=annotation,
         )
@@ -360,6 +455,16 @@ def run_vectorize(
                     "y2": float(seg[1, 1]),
                 }
                 for seg in opening_segs
+            ] + [
+                {
+                    "id": uuid.uuid4().hex[:12],
+                    "layer": "columns",
+                    "x1": float(seg[0, 0]),
+                    "y1": float(seg[0, 1]),
+                    "x2": float(seg[1, 0]),
+                    "y2": float(seg[1, 1]),
+                }
+                for seg in columns_array
             ],
         }
         (result_dir / "segments.json").write_text(json.dumps(segments_payload, indent=2))
@@ -411,6 +516,8 @@ def run_vectorize(
             uncovered_px=int(uncov_px),
             elevations_used_m=list(slice_result.elevations_used or [elevation]),
             openings_detected=len(opening_segs),
+            columns_detected=len(column_objs),
+            coverage_by_layer=coverage_by_layer,
         )
 
         artifacts = {
@@ -424,6 +531,8 @@ def run_vectorize(
         }
         if opening_segs:
             artifacts["overlay_openings_png"] = str(artifact_dir / "overlay_openings.png")
+        if column_objs:
+            artifacts["overlay_columns_png"] = str(artifact_dir / "overlay_columns.png")
 
         result_payload = {
             "metrics": metrics.model_dump(),
@@ -441,6 +550,7 @@ def run_vectorize(
         completion_summary = (
             f"Done in {elapsed:.1f}s · {segments_after} walls"
             + (f" · {len(opening_segs)} openings" if opening_segs else "")
+            + (f" · {len(column_objs)} columns" if column_objs else "")
             + " · DXF ready"
         )
         _emit(job_id, "complete", completion_summary, 1.0)
