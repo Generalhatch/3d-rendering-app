@@ -5,7 +5,8 @@
  * The companion ``VectorizeViewer`` renders the raster / overlay in the main
  * area; this file owns everything else.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { useVectorizeStore } from '../../state/vectorizeStore';
 import { vectorizeApi, type DetectorName, type VectorizeParams } from '../../api/vectorize';
 
@@ -22,6 +23,51 @@ export function VectorizePanel() {
 
   // Tear down SSE when component unmounts or job changes
   useEffect(() => () => sseHandle.current?.close(), []);
+
+  // ── Rehydrate on mount ───────────────────────────────────────────────────
+  // If a jobId is persisted (from a previous session or page refresh) but the
+  // in-memory phase is still 'idle', fetch the job and resume the right state:
+  //   - complete  → flip phase to 'complete' so the editor surface mounts
+  //   - failed    → flip phase to 'failed' with the error message
+  //   - other     → flip to 'processing' and re-subscribe to SSE
+  // Done exactly once per mount; the empty deps array is intentional.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!jobId || phase !== 'idle') return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const detail = await vectorizeApi.get(jobId);
+        if (cancelled) return;
+        setJob(detail);
+        if (detail.status === 'complete') {
+          setPhase('complete');
+        } else if (detail.status === 'failed') {
+          setPhase('failed');
+        } else {
+          setPhase('processing');
+          // Re-attach SSE so the still-running job streams progress here too.
+          sseHandle.current?.close();
+          sseHandle.current = vectorizeApi.subscribeProgress(jobId, (event) => {
+            appendLog(event);
+            if (event.stage === 'complete') {
+              sseHandle.current?.close();
+              void refreshJob(jobId);
+            } else if (event.stage === 'error') {
+              sseHandle.current?.close();
+              setPhase('failed');
+              void refreshJob(jobId);
+            }
+          });
+        }
+      } catch {
+        // Persisted job no longer exists on backend (cleanup, etc.) — clear it.
+        reset();
+      }
+    })();
+    return () => { cancelled = true; };
+    // We deliberately run this once on mount.
+  }, []);
 
   const submit = useCallback(async () => {
     if (!scanFile) return;
@@ -266,7 +312,7 @@ function ParamsPanel({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   return (
-    <div className={`rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
+    <div className={`rounded-xl border border-gray-700 bg-gray-800/30 ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
       <div className="px-3 py-2 border-b border-gray-700 text-xs font-semibold text-emerald-300">
         Parameters
       </div>
@@ -275,7 +321,15 @@ function ParamsPanel({
         {/* Elevation */}
         <div className="space-y-1">
           <div className="flex items-center justify-between">
-            <label className="text-xs font-medium text-gray-300">Elevation (m)</label>
+            <label className="text-xs font-medium text-gray-300 inline-flex items-center">
+              Elevation (m)
+              <InfoTip>
+                <p className="font-semibold text-gray-100 mb-1">What it does</p>
+                <p>The height of the horizontal slice through your scan that we look for walls in.</p>
+                <p className="mt-2"><span className="text-emerald-300">Leave blank (auto):</span> we detect the floor and slice at floor + 1.4&nbsp;m (chest height) — above furniture, below ceiling fixtures.</p>
+                <p className="mt-1"><span className="text-emerald-300">Set a number:</span> slice at exactly that elevation. Use for multi-storey scans or when auto picks the wrong floor.</p>
+              </InfoTip>
+            </label>
             {params.elevation_m !== null && (
               <button
                 onClick={onReset}
@@ -298,11 +352,22 @@ function ParamsPanel({
               className="flex-1 px-2 py-1 rounded bg-gray-900 border border-gray-700 text-xs text-gray-100 placeholder-gray-600"
             />
           </div>
+          <p className="text-[11px] text-gray-500">
+            Leave blank to auto-pick chest height above the detected floor.
+          </p>
         </div>
 
         {/* Detector */}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-gray-300">Line detector</label>
+          <label className="text-xs font-medium text-gray-300 inline-flex items-center">
+            Line detector
+            <InfoTip>
+              <p className="font-semibold text-gray-100 mb-1">Which algorithm finds the walls</p>
+              <p><span className="text-emerald-300">FLD</span> — modern, clean long segments. Best for most architectural scans. <span className="text-gray-400">(default)</span></p>
+              <p className="mt-1"><span className="text-emerald-300">Hough</span> — robust classic, fragments long walls into many short pieces. Try if FLD misses obvious walls.</p>
+              <p className="mt-1"><span className="text-emerald-300">Both</span> — runs FLD + Hough and merges. Slower; mainly for comparing quality.</p>
+            </InfoTip>
+          </label>
           <div className="flex gap-1">
             {(['fld', 'hough', 'both'] as DetectorName[]).map((d) => (
               <button
@@ -330,6 +395,16 @@ function ParamsPanel({
           value={params.min_wall_length_m}
           min={0.10} max={5.0} step={0.10}
           onChange={(v) => onPatch({ min_wall_length_m: v })}
+          help="Drop any wall shorter than this. Lower = keeps short walls / clutter, higher = structural walls only."
+          tip={
+            <>
+              <p className="font-semibold text-gray-100 mb-1">Shortest wall we'll keep</p>
+              <p>Anything shorter than this — in real-world metres — is dropped from the final DXF.</p>
+              <p className="mt-2"><span className="text-emerald-300">Low (0.10–0.50&nbsp;m):</span> keeps door jambs, columns, closet returns. More noise.</p>
+              <p className="mt-1"><span className="text-emerald-300">Default (~1.4&nbsp;m):</span> balanced — real walls, most furniture-edge noise removed.</p>
+              <p className="mt-1"><span className="text-emerald-300">High (2–5&nbsp;m):</span> structural walls only. Very clean, but you'll lose short real walls.</p>
+            </>
+          }
         />
 
         {/* Toggles */}
@@ -338,12 +413,28 @@ function ParamsPanel({
           help="Filters non-orthogonal noise. Disable on rotated/curved buildings."
           checked={params.manhattan_snap}
           onChange={(v) => onPatch({ manhattan_snap: v })}
+          tip={
+            <>
+              <p className="font-semibold text-gray-100 mb-1">Force walls onto two axes</p>
+              <p>After detection, we find the two dominant wall directions and drop everything that isn't aligned with them — then snap survivors perfectly straight.</p>
+              <p className="mt-2"><span className="text-emerald-300">On:</span> output looks "drafted." Kills diagonal noise from furniture, plants, reflections. Best for normal rectangular buildings (even if rotated as a whole).</p>
+              <p className="mt-1"><span className="text-emerald-300">Off:</span> every angle is kept. Use for curved walls, organic shapes, or buildings with more than two wall orientations.</p>
+            </>
+          }
         />
         <Toggle
           label="Merge collinear segments"
           help="Fuse near-touching parallel segments into one wall."
           checked={params.merge_collinear}
           onChange={(v) => onPatch({ merge_collinear: v })}
+          tip={
+            <>
+              <p className="font-semibold text-gray-100 mb-1">Glue broken walls back together</p>
+              <p>A long wall the detector broke into 5–10 pieces (because of a doorway or scan gap) becomes a single line. Typical 2–5× drop in segment count.</p>
+              <p className="mt-2"><span className="text-emerald-300">On (default):</span> always recommended.</p>
+              <p className="mt-1"><span className="text-emerald-300">Off:</span> useful only for QA, to see exactly what the detector returned.</p>
+            </>
+          }
         />
 
         {/* Advanced */}
@@ -363,6 +454,16 @@ function ParamsPanel({
                 value={params.slab_thickness_m}
                 min={0.05} max={1.00} step={0.05}
                 onChange={(v) => onPatch({ slab_thickness_m: v })}
+                help="How thick a horizontal slice we flatten into an image. 0.20 m is the sweet spot."
+                tip={
+                  <>
+                    <p className="font-semibold text-gray-100 mb-1">Slice thickness around the elevation</p>
+                    <p>We grab a horizontal slab this tall, centred on the elevation plane, then squash it down into a 2D image for the detector to work on.</p>
+                    <p className="mt-2"><span className="text-emerald-300">Thinner (≤ 0.10&nbsp;m):</span> crisper corners, but sparse scans go dashed and walls get missed.</p>
+                    <p className="mt-1"><span className="text-emerald-300">0.20&nbsp;m (default):</span> the sweet spot.</p>
+                    <p className="mt-1"><span className="text-emerald-300">Thicker (≥ 0.30&nbsp;m):</span> dense image, reliable detection, but rounded corners and possible fake walls from beams/door tops.</p>
+                  </>
+                }
               />
               <SliderRow
                 label="Resolution (m/px)"
@@ -370,6 +471,17 @@ function ParamsPanel({
                 min={0.002} max={0.05} step={0.002}
                 onChange={(v) => onPatch({ resolution_m_per_px: v })}
                 fixed={3}
+                help="How many metres each pixel represents. 0.010 (1 cm/px) is the practical default."
+                tip={
+                  <>
+                    <p className="font-semibold text-gray-100 mb-1">Image resolution</p>
+                    <p>How much real-world space one pixel represents.</p>
+                    <p className="mt-2"><span className="text-emerald-300">0.005 (5&nbsp;mm/px):</span> high fidelity, preserves thin walls. ~4× larger image, slower, noisier.</p>
+                    <p className="mt-1"><span className="text-emerald-300">0.010 (1&nbsp;cm/px, default):</span> production default. Captures anything ≥ 2&nbsp;cm thick.</p>
+                    <p className="mt-1"><span className="text-emerald-300">0.050 (5&nbsp;cm/px):</span> very coarse — structural walls only. Good for previews of huge buildings.</p>
+                    <p className="mt-2 text-amber-300/90">Lowering this also raises the effective minimum wall length — short walls may disappear.</p>
+                  </>
+                }
               />
             </div>
           )}
@@ -380,33 +492,45 @@ function ParamsPanel({
 }
 
 function SliderRow({
-  label, value, min, max, step, onChange, fixed = 2,
+  label, value, min, max, step, onChange, fixed = 2, help, tip,
 }: {
   label: string;
   value: number;
   min: number; max: number; step: number;
   onChange: (v: number) => void;
   fixed?: number;
+  help?: string;
+  tip?: ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-2">
-      <span className="text-xs text-gray-400 w-36 flex-shrink-0">{label}</span>
-      <input
-        type="range"
-        min={min} max={max} step={step}
-        value={value}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
-        className="flex-1 accent-emerald-500"
-      />
-      <span className="text-xs text-gray-300 w-12 text-right font-mono">{value.toFixed(fixed)}</span>
+    <div className="space-y-1">
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-gray-400 w-36 flex-shrink-0 inline-flex items-center">
+          {label}
+          {tip && <InfoTip>{tip}</InfoTip>}
+        </span>
+        <input
+          type="range"
+          min={min} max={max} step={step}
+          value={value}
+          onChange={(e) => onChange(parseFloat(e.target.value))}
+          className="flex-1 accent-emerald-500"
+        />
+        <span className="text-xs text-gray-300 w-12 text-right font-mono">{value.toFixed(fixed)}</span>
+      </div>
+      {help && <p className="text-[11px] text-gray-500 pl-0">{help}</p>}
     </div>
   );
 }
 
 function Toggle({
-  label, help, checked, onChange,
+  label, help, checked, onChange, tip,
 }: {
-  label: string; help?: string; checked: boolean; onChange: (v: boolean) => void;
+  label: string;
+  help?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  tip?: ReactNode;
 }) {
   return (
     <label className="flex items-start gap-2 cursor-pointer">
@@ -417,10 +541,138 @@ function Toggle({
         className="mt-0.5 accent-emerald-500"
       />
       <div className="flex-1">
-        <div className="text-xs text-gray-200">{label}</div>
+        <div className="text-xs text-gray-200 inline-flex items-center">
+          {label}
+          {tip && <InfoTip>{tip}</InfoTip>}
+        </div>
         {help && <div className="text-[11px] text-gray-500">{help}</div>}
       </div>
     </label>
+  );
+}
+
+/**
+ * Small `?` icon that reveals a tooltip on hover or keyboard focus.
+ *
+ * The tooltip is rendered via a React portal to ``document.body`` and
+ * positioned with ``fixed`` coordinates derived from the trigger's bounding
+ * rect. This is necessary because the side panel that hosts these controls
+ * uses ``overflow-y-auto`` — which per CSS spec forces ``overflow-x: hidden``
+ * — so any in-DOM tooltip extending past the panel edge would get clipped.
+ *
+ * Behaviour:
+ *  - Opens on mouse hover OR keyboard focus.
+ *  - Prefers to sit ABOVE the icon (so it doesn't get hidden behind a finger
+ *    on touch devices, and so it doesn't push the rest of the panel).
+ *  - Horizontally clamped to the viewport with an 8 px margin.
+ *  - Width clamps to 16 rem or the viewport, whichever is smaller.
+ */
+const TOOLTIP_WIDTH_PX = 256;
+const TOOLTIP_MARGIN_PX = 8;
+const TOOLTIP_GAP_PX = 8;
+
+function InfoTip({ children }: { children: ReactNode }) {
+  const triggerRef = useRef<HTMLSpanElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number; placement: 'top' | 'bottom' }>({
+    top: 0, left: 0, placement: 'top',
+  });
+
+  // Recompute position whenever the tooltip opens (or the viewport scrolls /
+  // resizes while it's open). useLayoutEffect avoids a one-frame flash at
+  // (0,0) before the position is applied.
+  useLayoutEffect(() => {
+    if (!open || !triggerRef.current) return;
+
+    const compute = () => {
+      const trigger = triggerRef.current;
+      const tooltip = tooltipRef.current;
+      if (!trigger) return;
+      const rect = trigger.getBoundingClientRect();
+      const tooltipHeight = tooltip?.offsetHeight ?? 100;
+      const viewportW = window.innerWidth;
+      const viewportH = window.innerHeight;
+
+      // Horizontal: anchor the tooltip's right edge to the icon's right edge,
+      // then clamp inside the viewport with an 8 px margin on each side.
+      let left = rect.right - TOOLTIP_WIDTH_PX;
+      const minLeft = TOOLTIP_MARGIN_PX;
+      const maxLeft = viewportW - TOOLTIP_WIDTH_PX - TOOLTIP_MARGIN_PX;
+      if (left < minLeft) left = minLeft;
+      if (left > maxLeft) left = Math.max(minLeft, maxLeft);
+
+      // Vertical: prefer above the icon. If there isn't room above, flip
+      // below.
+      let placement: 'top' | 'bottom' = 'top';
+      let top = rect.top - tooltipHeight - TOOLTIP_GAP_PX;
+      if (top < TOOLTIP_MARGIN_PX) {
+        placement = 'bottom';
+        top = rect.bottom + TOOLTIP_GAP_PX;
+        // If even below would overflow, clamp.
+        if (top + tooltipHeight > viewportH - TOOLTIP_MARGIN_PX) {
+          top = Math.max(TOOLTIP_MARGIN_PX, viewportH - tooltipHeight - TOOLTIP_MARGIN_PX);
+        }
+      }
+
+      setPos({ top, left, placement });
+    };
+
+    compute();
+    // Run a second time after a tick so we measure the tooltip's actual
+    // height (the first pass might use the fallback 100 px).
+    const id = requestAnimationFrame(compute);
+
+    window.addEventListener('scroll', compute, true);
+    window.addEventListener('resize', compute);
+    return () => {
+      cancelAnimationFrame(id);
+      window.removeEventListener('scroll', compute, true);
+      window.removeEventListener('resize', compute);
+    };
+  }, [open]);
+
+  // Close on Escape for keyboard users.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open]);
+
+  return (
+    <>
+      <span
+        ref={triggerRef}
+        tabIndex={0}
+        role="button"
+        aria-label="More info"
+        onMouseEnter={() => setOpen(true)}
+        onMouseLeave={() => setOpen(false)}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        className="ml-1 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full bg-gray-700 text-[9px] font-bold text-gray-300 cursor-help select-none align-middle hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
+      >
+        ?
+      </span>
+      {open && createPortal(
+        <div
+          ref={tooltipRef}
+          role="tooltip"
+          style={{
+            position: 'fixed',
+            top: pos.top,
+            left: pos.left,
+            width: `min(${TOOLTIP_WIDTH_PX}px, calc(100vw - ${TOOLTIP_MARGIN_PX * 2}px))`,
+            zIndex: 9999,
+          }}
+          className="pointer-events-none rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-[11px] leading-snug text-gray-300 shadow-xl"
+        >
+          {children}
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
 

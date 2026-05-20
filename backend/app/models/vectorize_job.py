@@ -125,3 +125,60 @@ class VectorizeReprocessRequest(BaseModel):
     scan with a new set of parameters.  Skips re-uploading.
     """
     params: VectorizeParams
+
+
+# ── Edit-mode (Phase 3) schemas ──────────────────────────────────────────────
+
+class EditableSegment(BaseModel):
+    """One wall segment that the operator can review / edit in the browser.
+
+    World coordinates in metres; ``id`` is stable for the lifetime of one
+    pipeline run (re-runs invalidate IDs).  ``layer`` lets us extend to
+    openings/columns later without changing the wire format.
+    """
+    id: str
+    layer: str = "walls"
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+    @property
+    def length_m(self) -> float:
+        dx = self.x2 - self.x1
+        dy = self.y2 - self.y1
+        return (dx * dx + dy * dy) ** 0.5
+
+
+class EditEvent(BaseModel):
+    """A single operator action.
+
+    Stored as an append-only log alongside the final segment state — the log
+    is what feeds Phase 4 training data ("here's what the model produced,
+    here's what the operator changed it to").
+    """
+    op: str                # "reject" | "restore" | "move_endpoint" | "snap_manhattan" | "delete"
+    segment_id: Optional[str] = None
+    segment_ids: Optional[list[str]] = None
+    which_endpoint: Optional[int] = None       # 0 or 1 for move_endpoint
+    from_xy: Optional[list[float]] = None
+    to_xy: Optional[list[float]] = None
+    ts_ms: Optional[int] = None                # client-side timestamp
+
+
+class SaveEditsRequest(BaseModel):
+    """Body for POST /api/vectorize/{id}/edits.
+
+    The operator's final cleaned segment list plus the full edit log.  Backend
+    persists both, re-emits the DXF from the final segments, and returns the
+    versioned DXF URL.
+    """
+    segments: list[EditableSegment]
+    log: list[EditEvent] = []
+
+
+class SaveEditsResponse(BaseModel):
+    job_id: str
+    edit_version: int                  # monotonic — increments on every save
+    dxf_url: str
+    segments_saved: int

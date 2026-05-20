@@ -81,12 +81,14 @@ export function VectorizeViewer() {
           dragStart.current = { x: e.clientX, y: e.clientY, tx: transform.x, ty: transform.y };
         }}
         onMouseMove={(e) => {
-          if (!dragging || !dragStart.current) return;
-          setTransform((t) => ({
-            ...t,
-            x: dragStart.current!.tx + (e.clientX - dragStart.current!.x),
-            y: dragStart.current!.ty + (e.clientY - dragStart.current!.y),
-          }));
+          // Snapshot the drag origin into locals BEFORE invoking setState — React
+          // can defer the updater, by which time onMouseUp may have nulled
+          // dragStart.current (the non-null assertion would then explode).
+          const start = dragStart.current;
+          if (!dragging || !start) return;
+          const dx = e.clientX - start.x;
+          const dy = e.clientY - start.y;
+          setTransform((t) => ({ ...t, x: start.tx + dx, y: start.ty + dy }));
         }}
         onMouseUp={() => { setDragging(false); dragStart.current = null; }}
         onMouseLeave={() => { setDragging(false); dragStart.current = null; }}

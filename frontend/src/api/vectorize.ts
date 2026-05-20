@@ -61,6 +61,51 @@ export interface VectorizeProgressEvent {
   job_id: string;
 }
 
+// ── Editor (Phase 3) ────────────────────────────────────────────────────────
+
+export interface EditableSegment {
+  id: string;
+  layer: string;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+export interface RasterAffine {
+  origin_x: number;
+  origin_y: number;
+  resolution_m_per_px: number;
+  width_px: number;
+  height_px: number;
+}
+
+export interface SegmentsPayload {
+  version: number;
+  units: string;
+  edit_version?: number;
+  affine?: RasterAffine;
+  raster?: { width_px: number; height_px: number; y_flipped_for_display: boolean };
+  segments: EditableSegment[];
+}
+
+export interface EditEvent {
+  op: 'reject' | 'restore' | 'move_endpoint' | 'snap_manhattan' | 'delete';
+  segment_id?: string;
+  segment_ids?: string[];
+  which_endpoint?: 0 | 1;
+  from_xy?: [number, number];
+  to_xy?: [number, number];
+  ts_ms?: number;
+}
+
+export interface SaveEditsResponse {
+  job_id: string;
+  edit_version: number;
+  dxf_url: string;
+  segments_saved: number;
+}
+
 export const DEFAULT_VECTORIZE_PARAMS: VectorizeParams = {
   elevation_m: null,
   slab_thickness_m: 0.20,
@@ -112,6 +157,15 @@ export const vectorizeApi = {
   overlayUrl: (jobId: string) => `${BASE}/${jobId}/overlay`,
   overlayRawUrl: (jobId: string) => `${BASE}/${jobId}/overlay/raw`,
   dxfUrl: (jobId: string) => `${BASE}/${jobId}/dxf`,
+
+  getSegments: (jobId: string) => request<SegmentsPayload>(`/${jobId}/segments`),
+
+  saveEdits: (jobId: string, segments: EditableSegment[], log: EditEvent[]) =>
+    request<SaveEditsResponse>(`/${jobId}/edits`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segments, log }),
+    }),
 
   subscribeProgress: (
     jobId: string,

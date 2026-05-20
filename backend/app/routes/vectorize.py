@@ -27,6 +27,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from ..models.vectorize_job import (
     DetectorName,
+    SaveEditsRequest,
+    SaveEditsResponse,
     VectorizeJobCreate,
     VectorizeJobDetail,
     VectorizeMetrics,
@@ -47,6 +49,7 @@ from ..storage import (
     update_vectorize_status,
     uploads_dir,
 )
+from ..vectorize import edits as edits_mod
 from ..vectorize.pipeline import run_vectorize_guarded
 
 MAX_SCAN_MB = 2048
@@ -251,6 +254,66 @@ async def reprocess_vectorize(
     _enqueue_run(bg, job_id, scan_path, body.params)
 
     return VectorizeJobCreate(job_id=job_id, status=VectorizeStatus.queued)
+
+
+# ── Editor endpoints (Phase 3) ───────────────────────────────────────────────
+
+@router.get("/{job_id}/segments")
+async def get_segments(job_id: str):
+    """Return the current editable segment list for this job.
+
+    Reflects the latest save — if the operator has saved edits, those are
+    returned; otherwise the original pipeline output.
+    """
+    r_dir = results_dir(job_id)
+    try:
+        return edits_mod.load_segments(r_dir)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/{job_id}/edits/log")
+async def get_edit_log(job_id: str):
+    """Return all save events for this job, oldest first.
+
+    Useful for debugging and (later) for training-data export.
+    """
+    r_dir = results_dir(job_id)
+    return {"saves": edits_mod.load_edit_history(r_dir)}
+
+
+@router.post("/{job_id}/edits", response_model=SaveEditsResponse)
+async def save_edits(job_id: str, body: SaveEditsRequest):
+    """Persist operator edits + re-emit the DXF.
+
+    The frontend sends the *complete* current segment list (not a diff) plus
+    the full event log from this editor session.  Backend snapshots the
+    previous state, writes the new one, and returns a versioned DXF URL.
+    """
+    # Confirm the job exists and completed at least once.
+    try:
+        record = load_vectorize_job(job_id)
+    except KeyError:
+        raise HTTPException(404, f"Vectorize job {job_id} not found")
+    if record["status"] != "complete":
+        raise HTTPException(
+            409,
+            f"Cannot save edits on a job in status {record['status']!r}; "
+            f"wait for the pipeline to finish.",
+        )
+
+    r_dir = results_dir(job_id)
+    try:
+        result = edits_mod.save_edits(r_dir, job_id, body.segments, body.log)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    return SaveEditsResponse(
+        job_id=job_id,
+        edit_version=result.edit_version,
+        dxf_url=f"/api/vectorize/{job_id}/dxf",
+        segments_saved=result.segments_saved,
+    )
 
 
 # ── GET /api/vectorize  (list) ───────────────────────────────────────────────

@@ -20,6 +20,7 @@ import asyncio
 import json
 import time
 import traceback
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -169,7 +170,7 @@ def run_vectorize(
         raw_overlay = classical.render_overlay(cleaned, seg_px, color_bgr=(0, 165, 255), thickness=1)
         cv2.imwrite(str(artifact_dir / "overlay_raw.png"), cv2.flip(raw_overlay, 0))
 
-        # ── 8. DXF ───────────────────────────────────────────────────────
+        # ── 8. DXF + segments.json ───────────────────────────────────────
         _emit(job_id, "dxf", "Writing DXF…", 0.92)
         annotation = (
             f"Stevenson Vectorize | job={job_id} | "
@@ -180,6 +181,34 @@ def run_vectorize(
         )
         dxf_path = result_dir / "vectorized.dxf"
         dxf_writer.write_walls_dxf(clean_segments, dxf_path, annotation_text=annotation)
+
+        # Persist segments as JSON with stable IDs so the editor (Phase 3) has
+        # an addressable source-of-truth.  The DXF is the *deliverable*; this
+        # JSON is the *editable record*.  The affine + raster URL are bundled
+        # so the editor can render the slice as a backdrop without a second
+        # round-trip.
+        segments_payload = {
+            "version": 1,
+            "units": "metres",
+            "affine": slice_result.affine.to_json(),
+            "raster": {
+                "width_px": int(slice_result.affine.width_px),
+                "height_px": int(slice_result.affine.height_px),
+                "y_flipped_for_display": True,
+            },
+            "segments": [
+                {
+                    "id": uuid.uuid4().hex[:12],
+                    "layer": "walls",
+                    "x1": float(seg[0, 0]),
+                    "y1": float(seg[0, 1]),
+                    "x2": float(seg[1, 0]),
+                    "y2": float(seg[1, 1]),
+                }
+                for seg in clean_segments
+            ],
+        }
+        (result_dir / "segments.json").write_text(json.dumps(segments_payload, indent=2))
 
         # ── 9. Persist metrics ──────────────────────────────────────────
         elapsed = time.time() - t0
@@ -212,6 +241,7 @@ def run_vectorize(
                 "overlay_png": str(artifact_dir / "overlay.png"),
                 "overlay_raw_png": str(artifact_dir / "overlay_raw.png"),
                 "dxf": str(dxf_path),
+                "segments_json": str(result_dir / "segments.json"),
             },
         }
         (result_dir / "result.json").write_text(json.dumps(result_payload, indent=2))

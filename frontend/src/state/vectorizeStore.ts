@@ -4,6 +4,11 @@
  * Kept separate from ``jobStore`` so the two surfaces never accidentally
  * share state.  The alignment store has 50+ fields specific to its 3D
  * workflow; mixing them would hurt both.
+ *
+ * The active ``jobId`` is mirrored to ``localStorage`` so a refresh
+ * resurrects the current job (the editor can rehydrate from the backend).
+ * Heavy state — progress logs, the in-memory segment list — is intentionally
+ * NOT persisted; that comes from the backend on rehydrate.
  */
 import { create } from 'zustand';
 import {
@@ -12,6 +17,25 @@ import {
   type VectorizeProgressEvent,
   DEFAULT_VECTORIZE_PARAMS,
 } from '../api/vectorize';
+
+const ACTIVE_JOB_KEY = 'alignai_vectorize_active_job';
+
+function loadActiveJob(): string | null {
+  try {
+    return localStorage.getItem(ACTIVE_JOB_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistActiveJob(jobId: string | null): void {
+  try {
+    if (jobId === null) localStorage.removeItem(ACTIVE_JOB_KEY);
+    else localStorage.setItem(ACTIVE_JOB_KEY, jobId);
+  } catch {
+    // localStorage unavailable
+  }
+}
 
 export type VectorizePhase = 'idle' | 'uploading' | 'processing' | 'complete' | 'failed';
 
@@ -46,8 +70,11 @@ interface VectorizeState {
 }
 
 const initialState = {
+  // ``phase`` starts as 'idle' on a fresh page but flips to 'processing' or
+  // 'complete' once we rehydrate the persisted jobId (handled by
+  // ``VectorizePanel`` on mount).
   phase: 'idle' as VectorizePhase,
-  jobId: null,
+  jobId: loadActiveJob(),
   scanFile: null,
   params: DEFAULT_VECTORIZE_PARAMS,
   job: null,
@@ -60,7 +87,10 @@ export const useVectorizeStore = create<VectorizeState>((set) => ({
   ...initialState,
 
   setPhase: (phase) => set({ phase }),
-  setJobId: (jobId) => set({ jobId }),
+  setJobId: (jobId) => {
+    persistActiveJob(jobId);
+    set({ jobId });
+  },
   setScanFile: (scanFile) => set({ scanFile }),
   setParams: (params) => set({ params }),
   patchParams: (patch) => set((s) => ({ params: { ...s.params, ...patch } })),
@@ -80,5 +110,8 @@ export const useVectorizeStore = create<VectorizeState>((set) => ({
     })),
   clearLogs: () => set({ logs: [], overallProgress: 0 }),
   setOverlayMode: (overlayMode) => set({ overlayMode }),
-  reset: () => set({ ...initialState }),
+  reset: () => {
+    persistActiveJob(null);
+    set({ ...initialState, jobId: null });
+  },
 }));
