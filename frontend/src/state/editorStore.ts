@@ -43,10 +43,29 @@ export interface LayerStyle {
  */
 export const LAYER_STYLES: Record<SegmentLayer, LayerStyle> = {
   walls: {
-    label: 'Walls',
+    label: 'Walls (centerlines)',
     color: '#34d399',          // emerald-400 — matches DXF ACI=3 (green)
     selectedColor: '#fde047',  // yellow-300 — high-contrast selection
     hoverColor: '#67e8f9',     // cyan-300 — subtle pre-click affordance
+  },
+  walls_exterior: {
+    label: 'Exterior shell',
+    color: '#3b82f6',          // blue-500 — heavier than interior walls, matches DXF ACI=5
+    selectedColor: '#fde047',
+    hoverColor: '#93c5fd',
+  },
+  walls_faces: {
+    label: 'Wall faces (double-line)',
+    color: '#94a3b8',          // slate-400 — quieter than centerlines so the eye reads structure first
+    selectedColor: '#fde047',
+    hoverColor: '#cbd5e1',
+  },
+  rooms: {
+    label: 'Rooms',
+    color: '#f97316',          // orange-500 — matches DXF ACI=4 (cyan family, varies by viewer)
+    selectedColor: '#fde047',
+    hoverColor: '#fdba74',
+    dashArray: '8 4',          // dashed so rooms read as enclosure, not lines
   },
   openings: {
     label: 'Openings',

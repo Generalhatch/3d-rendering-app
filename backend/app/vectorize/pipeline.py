@@ -33,11 +33,15 @@ from ..sse import publish
 from . import (
     classical,
     columns as columns_mod,
+    density_slicer as density_slicer_mod,
     dxf_writer,
+    envelope as envelope_mod,
+    normals as normals_mod,
     openings as openings_mod,
     preprocess,
     regularize,
     slicer,
+    walls as walls_mod,
 )
 
 
@@ -131,11 +135,12 @@ def run_vectorize(
             # cubicle dividers (~1.3–1.5 m) while staying below typical ceiling
             # fixtures, beams, and HVAC (≥ 2.1 m).  See VECTORIZE_SETTINGS.md.
             shoulder_offset = 1.60
-            elevation = float(floor.floor_z_estimate + shoulder_offset)
+            floor_z = float(floor.floor_z_estimate)
+            elevation = floor_z + shoulder_offset
             axis_idx = int(floor.axis_idx)
             _emit(
                 job_id, "floor",
-                f"Floor at {floor.floor_z_estimate:.2f} m (axis="
+                f"Floor at {floor_z:.2f} m (axis="
                 f"{'Z' if axis_idx == 2 else 'Y'}-up) — slicing at "
                 f"{elevation:.2f} m (floor + {shoulder_offset:.2f} m)",
                 0.25,
@@ -143,14 +148,125 @@ def run_vectorize(
         else:
             elevation = float(params.elevation_m)
             axis_idx = 2  # Default to Z-up when explicit elevation supplied.
+            # No floor detection ran; assume floor is ~1.6 m below the
+            # explicit slice plane (typical shoulder-height default).  Used
+            # only by the envelope extractor — slight error here is fine
+            # because the envelope band is a 45 cm range, not a sharp plane.
+            floor_z = elevation - 1.60
             _emit(
                 job_id, "floor",
-                f"Slicing at user-supplied elevation {elevation:.2f} m",
+                f"Slicing at user-supplied elevation {elevation:.2f} m "
+                f"(assuming floor at {floor_z:.2f} m for envelope)",
                 0.25,
             )
 
-        # ── 3. Slice (single or multi-elevation OR-fused) ───────────────
-        if params.multi_elevation:
+        # ── 2a. Building envelope (priority #1 — external walls) ─────────
+        # Extracts the building shell as a single closed polygon via a
+        # concave-hull on a floor-level point projection.  Independent of
+        # the line detector — locks the exterior wall even if the rest of
+        # the pipeline stumbles.  Run BEFORE the vertical-surface filter
+        # so the floor-level band still contains floor points (which is
+        # what gives the hull its lateral extent).
+        envelope_segments_world: np.ndarray = np.zeros((0, 2, 2), dtype=np.float64)
+        envelope_result = None
+        if params.extract_envelope:
+            try:
+                _emit(job_id, "envelope", "Extracting building envelope…", 0.255)
+                envelope_result = envelope_mod.extract_envelope(
+                    pcd, floor_z=floor_z, axis_idx=axis_idx,
+                )
+                envelope_segments_world = envelope_result.segments
+                envelope_mod.save_envelope(
+                    envelope_result, result_dir / "envelope.json",
+                )
+                _emit(
+                    job_id, "envelope",
+                    f"Envelope: {envelope_result.area_m2:.0f} m² floorplate, "
+                    f"{envelope_result.perimeter_m:.1f} m perimeter, "
+                    f"{len(envelope_result.segments)} edges "
+                    f"(alpha={envelope_result.alpha_used:.2f})",
+                    0.265,
+                )
+            except Exception as env_err:
+                _emit(
+                    job_id, "envelope",
+                    f"Envelope extraction skipped: {env_err}",
+                    0.265,
+                )
+
+        # ── 2b. Filter to vertical surfaces (point-normal gate) ──────────
+        # Estimate per-point normals, keep only points on vertical surfaces.
+        # This removes floor returns, ceiling returns, desk tops, cabinet
+        # tops, monitor screens, picture frames, and similar horizontal
+        # contaminants BEFORE any 2D projection.  Single biggest noise-floor
+        # reduction available in the classical-CV pipeline.  See
+        # backend/app/vectorize/normals.py for details.
+        if params.vertical_surfaces_only:
+            _emit(job_id, "normals", "Estimating point normals…", 0.27)
+            n_before = int(len(pcd.points))
+            try:
+                pcd = normals_mod.filter_to_vertical_surfaces(
+                    pcd, axis_idx=axis_idx,
+                )
+                n_after = int(len(pcd.points))
+                _emit(
+                    job_id, "normals",
+                    normals_mod.filter_summary(n_before, n_after),
+                    0.29,
+                )
+                if n_after < 1000:
+                    # Filter wiped almost everything — likely an axis mis-detection
+                    # or an unusual scan format.  Bail out of the filter rather
+                    # than starve the slicer; downstream stages still work on
+                    # unfiltered points.
+                    raise ValueError(
+                        f"only {n_after} points survived vertical-surface filter "
+                        f"(input had {n_before:,}) — falling back to unfiltered"
+                    )
+            except Exception as filt_err:
+                # Reload the cloud to recover from any in-place filter damage.
+                _emit(
+                    job_id, "normals",
+                    f"Vertical-surface filter skipped: {filt_err}",
+                    0.29,
+                )
+                pcd = load_point_cloud(scan_path)
+
+        # ── 3. Slice (density-column / single / multi-elevation OR-fused) ─
+        if params.use_density_slicer:
+            # Vertical-column density score: every XY cell gets the fraction
+            # of its vertical wall-band heights that have any point in them.
+            # Walls light up (continuous floor-to-ceiling); furniture stays
+            # dim.  See backend/app/vectorize/density_slicer.py.
+            _emit(
+                job_id, "slice",
+                f"Building density raster (band {floor_z + 0.30:.2f}–"
+                f"{floor_z + 2.20:.2f} m)…",
+                0.30,
+            )
+            density_params = density_slicer_mod.DensitySliceParams(
+                resolution_m_per_px=params.resolution_m_per_px,
+            )
+            slice_result = density_slicer_mod.slice_to_raster_density(
+                pcd,
+                floor_z=floor_z,
+                axis_idx=axis_idx,
+                params=density_params,
+            )
+            # Also persist the raw density image (pre-threshold) for the
+            # editor — useful diagnostic of what the model "saw".
+            try:
+                density_uint8, _ = density_slicer_mod.density_image_uint8(
+                    pcd, floor_z=floor_z, axis_idx=axis_idx,
+                    params=density_params,
+                )
+                cv2.imwrite(
+                    str(artifact_dir / "slice_density.png"),
+                    cv2.flip(density_uint8, 0),
+                )
+            except Exception:
+                pass
+        elif params.multi_elevation:
             # ±0.4 m brackets the centre slice — catches walls hidden by tall
             # furniture or doorway headers without straying into ceiling.
             elevations = [elevation - 0.40, elevation, elevation + 0.40]
@@ -253,6 +369,35 @@ def run_vectorize(
             f"{len(rejected_segments)} rescuable ghost candidates)",
             0.80,
         )
+
+        # ── 6b. Wall-thickness pairing → double-line entities ────────────
+        # Collapse parallel detected segments 7–35 cm apart (the two faces of
+        # a wall) into single thickness-aware Wall entities.  Emits both
+        # faces on the WALLS_FACES DXF layer plus a centerline on WALLS.
+        # See backend/app/vectorize/walls.py — this is the single biggest
+        # visual lift toward Image 1 ("looks like CAD, not a sketch").
+        wall_pairing = walls_mod.WallPairingResult(
+            walls=[],
+            face_segments=np.zeros((0, 2, 2), dtype=np.float64),
+            centerline_segments=clean_segments,
+            median_thickness_m=walls_mod.WallPairingParams().fallback_thickness_m,
+            n_paired=0,
+            n_unpaired=int(len(clean_segments)),
+        )
+        if params.pair_walls and len(clean_segments) > 1:
+            try:
+                wall_pairing = walls_mod.pair_walls(clean_segments)
+                _emit(
+                    job_id, "regularize",
+                    walls_mod.pairing_summary(wall_pairing),
+                    0.82,
+                )
+            except Exception as wp_err:
+                _emit(
+                    job_id, "regularize",
+                    f"Wall pairing skipped: {wp_err}",
+                    0.82,
+                )
 
         # ── 7. Overlay PNG ───────────────────────────────────────────────
         _emit(job_id, "overlay", "Rendering review overlay…", 0.85)
@@ -398,24 +543,31 @@ def run_vectorize(
 
         # ── 8. DXF + segments.json ───────────────────────────────────────
         _emit(job_id, "dxf", "Writing DXF…", 0.94)
+        envelope_summary = (
+            f" envelope=yes({envelope_result.area_m2:.0f}m²)"
+            if envelope_result is not None
+            else ""
+        )
         annotation = (
             f"Beehive Automations L.L.C. Vectorize | job={job_id} | "
             f"elev={elevation:.2f}m | slab={params.slab_thickness_m:.2f}m | "
             f"res={params.resolution_m_per_px:.3f}m/px | "
             f"detector={params.detector.value} | "
             f"walls={segments_after} openings={len(opening_segs)} "
-            f"columns={len(column_objs)}"
+            f"columns={len(column_objs)}{envelope_summary}"
         )
         dxf_path = result_dir / "vectorized.dxf"
-        # Multi-layer DXF: WALLS + OPENINGS + COLUMNS (windows always reserved
-        # but operator-only).  Other classes (MEP, TEXT) remain unwritten this
-        # phase; their layer slots are still created so a CAD operator can
-        # drop content onto them.
+        # Multi-layer DXF: WALLS_EXTERIOR (envelope) + WALLS (centerlines) +
+        # WALLS_FACES (paired double-line walls) + OPENINGS + COLUMNS.
+        # Reserved-but-unwritten slots (ROOMS, WINDOWS, MEP, TEXT) are still
+        # created so CAD operators can drop content onto them.
         dxf_writer.write_dxf(
             {
-                "walls": clean_segments,
-                "openings": openings_array,
-                "columns": columns_array,
+                "walls_exterior": envelope_segments_world,
+                "walls":          wall_pairing.centerline_segments,
+                "walls_faces":    wall_pairing.face_segments,
+                "openings":       openings_array,
+                "columns":        columns_array,
             },
             dxf_path,
             annotation_text=annotation,
@@ -438,13 +590,33 @@ def run_vectorize(
             "segments": [
                 {
                     "id": uuid.uuid4().hex[:12],
+                    "layer": "walls_exterior",
+                    "x1": float(seg[0, 0]),
+                    "y1": float(seg[0, 1]),
+                    "x2": float(seg[1, 0]),
+                    "y2": float(seg[1, 1]),
+                }
+                for seg in envelope_segments_world
+            ] + [
+                {
+                    "id": uuid.uuid4().hex[:12],
                     "layer": "walls",
                     "x1": float(seg[0, 0]),
                     "y1": float(seg[0, 1]),
                     "x2": float(seg[1, 0]),
                     "y2": float(seg[1, 1]),
                 }
-                for seg in clean_segments
+                for seg in wall_pairing.centerline_segments
+            ] + [
+                {
+                    "id": uuid.uuid4().hex[:12],
+                    "layer": "walls_faces",
+                    "x1": float(seg[0, 0]),
+                    "y1": float(seg[0, 1]),
+                    "x2": float(seg[1, 0]),
+                    "y2": float(seg[1, 1]),
+                }
+                for seg in wall_pairing.face_segments
             ] + [
                 {
                     "id": uuid.uuid4().hex[:12],
@@ -518,6 +690,9 @@ def run_vectorize(
             openings_detected=len(opening_segs),
             columns_detected=len(column_objs),
             coverage_by_layer=coverage_by_layer,
+            walls_paired=int(wall_pairing.n_paired),
+            walls_unpaired=int(wall_pairing.n_unpaired),
+            walls_median_thickness_m=float(wall_pairing.median_thickness_m),
         )
 
         artifacts = {

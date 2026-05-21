@@ -127,6 +127,48 @@ class VectorizeParams(BaseModel):
                     "footprints on the COLUMNS layer.",
     )
 
+    # ── Accuracy-track parameters (MacBook MVP — see ACCURACY_TO_CAD_QUALITY_PLAN.md § 0.5) ──
+
+    vertical_surfaces_only: bool = Field(
+        default=True,
+        description="Before slicing, estimate per-point normals and keep only "
+                    "points whose normal is nearly horizontal (|n_z| ≤ 0.30) — "
+                    "i.e. points on vertical surfaces.  Removes floor + ceiling "
+                    "returns, desk tops, monitor screens (mostly), bookshelf "
+                    "tops, and any other roughly horizontal surface from the "
+                    "input before the raster is built.  Dramatic noise drop on "
+                    "office and lab scans.  Disable for scans where many real "
+                    "walls are slanted (industrial / agricultural). Adds ~5–15 s "
+                    "to the ingest stage.",
+    )
+    extract_envelope: bool = Field(
+        default=True,
+        description="In addition to the main detector pass, extract the building "
+                    "shell as a single closed polygon via concave-hull / alpha-"
+                    "shape on a floor-level point projection.  Emitted on its "
+                    "own layer (WALLS_EXTERIOR) so the deliverable can highlight "
+                    "the exterior independently.  Locks priority #1 (external "
+                    "walls) even if the rest of the detector path stumbles.",
+    )
+    use_density_slicer: bool = Field(
+        default=True,
+        description="Use the vertical-column density slicer (every XY cell gets "
+                    "a score = fraction of vertical wall-band heights that have "
+                    "any point in them) instead of the legacy binary-occupancy "
+                    "slicer.  Walls become bright; furniture stays dim.  Strong "
+                    "noise reduction for downstream detection.",
+    )
+    pair_walls: bool = Field(
+        default=True,
+        description="After regularization, find pairs of parallel detected "
+                    "segments 7–35 cm apart (the two faces of a wall) and "
+                    "collapse each pair into a single thickness-aware wall.  "
+                    "Emits both faces on the WALLS_FACES DXF layer plus a "
+                    "centerline on WALLS.  Single-faced walls keep the median "
+                    "thickness from the paired set.  This is the visual lift "
+                    "that turns the deliverable from a sketch into CAD.",
+    )
+
 
 class VectorizeJobCreate(BaseModel):
     """Response after POSTing a new vectorize job."""
@@ -162,6 +204,10 @@ class VectorizeMetrics(BaseModel):
     # Phase 6 ("A"): detected columns + per-layer coverage diagnostic.
     columns_detected: Optional[int] = None
     coverage_by_layer: Optional[dict[str, float]] = None
+    # MacBook MVP (A4): wall-thickness pairing summary.
+    walls_paired: Optional[int] = None              # # of double-line walls
+    walls_unpaired: Optional[int] = None            # # of single-face walls
+    walls_median_thickness_m: Optional[float] = None
 
 
 class VectorizeJobDetail(BaseModel):

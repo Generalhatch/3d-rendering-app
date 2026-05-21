@@ -32,6 +32,9 @@ export interface VectorizeParams {
 /** Layer ID — drives DXF layer name + on-canvas colour. */
 export type SegmentLayer =
   | 'walls'
+  | 'walls_exterior'
+  | 'walls_faces'
+  | 'rooms'
   | 'openings'
   | 'windows'
   | 'columns'
