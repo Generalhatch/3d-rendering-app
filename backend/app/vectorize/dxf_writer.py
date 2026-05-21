@@ -72,6 +72,7 @@ def write_dxf(
     layer_map: dict[str, LayerSpec] | None = None,
     insunits: int = INSUNITS_METRES,
     annotation_text: Optional[str] = None,
+    circles_by_class: Optional[dict[str, list[tuple[tuple[float, float], float]]]] = None,
 ) -> Path:
     """Write a DXF containing per-class line geometry.
 
@@ -143,6 +144,26 @@ def write_dxf(
                 dxfattribs={"layer": layer_name},
             )
             total_entities += 1
+
+    # v4: optional circles_by_class (round columns).  Emitted as native DXF
+    # CIRCLE entities instead of polyline rectangles — this is what the
+    # commercial CAD drawings in the user's reference image use for round
+    # columns.  Drafters can hatch round columns with one click in AutoCAD.
+    if circles_by_class:
+        for class_key, circles in circles_by_class.items():
+            if class_key not in layer_map:
+                unknown_classes.append(class_key)
+                continue
+            if not circles:
+                continue
+            layer_name = layer_map[class_key].name
+            for (cx, cy), radius in circles:
+                msp.add_circle(
+                    center=(float(cx), float(cy)),
+                    radius=float(radius),
+                    dxfattribs={"layer": layer_name},
+                )
+                total_entities += 1
 
     # Annotation: small text at world origin describing the run.
     if annotation_text or unknown_classes:

@@ -83,14 +83,40 @@ class ColumnParams:
     """Outward pad on the emitted bounding rectangle so the footprint reads
     cleanly in CAD (no zero-thickness intersections with adjacent walls)."""
 
+    # v4 shape classifier (Cloud2BIM-inspired).
+    # A circle inscribed in a square has fill_ratio = π/4 ≈ 0.785; a true
+    # square has fill_ratio ≈ 1.0.  We classify a column as ROUND if its
+    # min-area-rect aspect is near 1 (≤ ``round_max_aspect``) AND its fill
+    # ratio is in the circle window (``round_fill_lo`` to ``round_fill_hi``).
+    # The DXF writer then emits a CIRCLE entity instead of an LWPOLYLINE,
+    # producing the cleaner symbol used in commercial CAD drawings.
+    round_classifier_enable: bool = True
+    round_max_aspect: float = 1.20
+    round_fill_lo: float = 0.65
+    round_fill_hi: float = 0.92
+
+    # Stricter base criteria (v4): the v3 defaults let counters /
+    # workbenches through as "columns" because their fill_ratio came in
+    # just above 0.55 and their aspect just under 2.5.  Real columns
+    # rarely exceed 80 cm on a side; raise the bar.
+    # (Override via the public API for industrial scans.)
+
 
 @dataclass
 class DetectedColumn:
-    """One detected column footprint as a 4-vertex rectangle."""
+    """One detected column footprint.
+
+    ``corners`` is the bounding rectangle (always 4 vertices) so the DXF
+    writer can fall back to a polyline regardless of shape.  When
+    ``is_round`` is True, the DXF writer additionally emits a CIRCLE
+    entity centred on ``centre_m`` with radius = mean(size_m) / 2.
+    """
     corners: np.ndarray   # (4, 2) world coords, CCW
     centre_m: tuple[float, float]
     size_m: tuple[float, float]   # (long_side, short_side)
     fill_ratio: float
+    is_round: bool = False
+    eccentricity: float = 0.0     # 0 = circle / square, → 1 = elongated
 
 
 def detect_columns(
@@ -193,6 +219,26 @@ def detect_columns(
         if diag_min < min_diag_px or diag_min > max_diag_px:
             continue
 
+        # 4b. Shape classifier — round vs rectangular.
+        # Method: aspect of min-area rect tells us whether we even *could*
+        # be round; fill ratio inside the same rect tells us how much of
+        # the rect is filled.  A circle inscribed in a 1:1 rect fills
+        # exactly π/4 ≈ 0.785; a true square fills ~1.0; a noisy column
+        # blob is somewhere in between.
+        rect_fill = float(area_px) / max(1.0, rw_px * rh_px)
+        rect_aspect = float(long_px) / float(short_px)
+        is_round = False
+        if params.round_classifier_enable:
+            if (rect_aspect <= params.round_max_aspect and
+                    params.round_fill_lo <= rect_fill <= params.round_fill_hi):
+                is_round = True
+
+        # Eccentricity from second-moment covariance — diagnostic info,
+        # not used for filtering (the rect-fill check above is the
+        # primary signal).  0 = perfectly circular / square; → 1 as the
+        # shape elongates.
+        eccentricity = _component_eccentricity(mask)
+
         # 5. Pad and convert to world coords.
         pad_px = max(1, int(round(params.rectangle_buffer_m / res)))
         padded_rect = (
@@ -212,9 +258,38 @@ def detect_columns(
             centre_m=(float(cx_world), float(cy_world)),
             size_m=(float(long_px * res), float(short_px * res)),
             fill_ratio=float(fill),
+            is_round=bool(is_round),
+            eccentricity=float(eccentricity),
         ))
 
     return out
+
+
+def _component_eccentricity(mask: np.ndarray) -> float:
+    """Compute the eccentricity of a binary blob via second moments.
+
+    Returns sqrt(1 - λ2/λ1) where λ1 ≥ λ2 are eigenvalues of the central
+    covariance matrix.  0.0 → perfectly isotropic (circle / square);
+    values closer to 1.0 → elongated shapes.
+
+    Used as a diagnostic (logged in DetectedColumn) rather than a hard
+    filter — the rect_fill + rect_aspect tests in detect_columns are
+    typically sufficient, but eccentricity helps explain edge cases.
+    """
+    pts = np.column_stack(np.where(mask > 0))  # (N, 2): rows, cols
+    if len(pts) < 4:
+        return 0.0
+    pts = pts.astype(np.float64) - pts.mean(axis=0)
+    cov = (pts.T @ pts) / len(pts)
+    try:
+        evals = np.linalg.eigvalsh(cov)
+    except np.linalg.LinAlgError:
+        return 0.0
+    evals = np.sort(evals)[::-1]
+    if evals[0] <= 0:
+        return 0.0
+    ratio = max(0.0, evals[1] / evals[0])
+    return float(np.sqrt(1.0 - ratio))
 
 
 def columns_to_segments(columns: list[DetectedColumn]) -> np.ndarray:

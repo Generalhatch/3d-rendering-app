@@ -72,6 +72,12 @@ class WallPairingParams:
     # paired thicknesses on the same scan.
     fallback_thickness_m: float = 0.10
 
+    # After pairing, drop UNPAIRED walls shorter than this.  These are almost
+    # always furniture edges or scanner artefacts that survived regularize but
+    # don't pair with anything.  Paired walls are kept regardless of length —
+    # if two parallel detections agreed on a wall existing, we trust it.
+    drop_unpaired_below_m: float = 0.50
+
 
 @dataclass
 class Wall:
@@ -102,6 +108,7 @@ class WallPairingResult:
     median_thickness_m: float
     n_paired: int
     n_unpaired: int
+    n_orphans_dropped: int = 0        # short unpaired fragments dropped
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -213,9 +220,16 @@ def pair_walls(
         wall.source_indices = (i, j)
         walls.append(wall)
 
-    # Then unpaired ones, using median thickness from the paired set.
+    # Then unpaired ones, using median thickness from the paired set —
+    # but drop fragments shorter than the orphan-drop threshold.  These
+    # are almost always furniture edges or scanner artefacts that survived
+    # regularize without finding a pair.
+    n_orphans_dropped = 0
     for idx in range(n):
         if paired_of[idx] is not None:
+            continue
+        if float(lengths[idx]) < params.drop_unpaired_below_m:
+            n_orphans_dropped += 1
             continue
         wall = _build_unpaired_wall(
             segs[idx], dirs[idx], thickness=median_thickness,
@@ -234,13 +248,18 @@ def pair_walls(
         if walls else np.zeros((0, 2, 2), dtype=np.float64)
     )
 
+    n_unpaired_kept = sum(
+        1 for idx, p in enumerate(paired_of)
+        if p is None and float(lengths[idx]) >= params.drop_unpaired_below_m
+    )
     return WallPairingResult(
         walls=walls,
         face_segments=face_segments,
         centerline_segments=centerline_segments,
         median_thickness_m=median_thickness,
         n_paired=len(pair_records),
-        n_unpaired=sum(1 for x in paired_of if x is None),
+        n_unpaired=n_unpaired_kept,
+        n_orphans_dropped=n_orphans_dropped,
     )
 
 
@@ -350,8 +369,12 @@ def _build_unpaired_wall(
 
 def pairing_summary(result: WallPairingResult) -> str:
     """One-line human-readable summary for SSE progress."""
+    extra = (
+        f" · dropped {result.n_orphans_dropped} short orphans"
+        if result.n_orphans_dropped else ""
+    )
     return (
         f"walls: {result.n_paired} paired + {result.n_unpaired} single-face = "
         f"{len(result.walls)} total · "
-        f"median thickness {result.median_thickness_m * 100:.1f} cm"
+        f"median thickness {result.median_thickness_m * 100:.1f} cm{extra}"
     )

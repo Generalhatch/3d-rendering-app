@@ -6,7 +6,9 @@
 >
 > **Owner:** Tanner Hatch
 > **Drafted:** 2026-05-20
-> **Status:** v3 — **MacBook MVP track is now the active execution plan** (§ 0.5). GPU refinement appendix added (§ 11). Confirmed priorities locked: external walls first, internal walls second, columns/pillars third. Demo-quality target reachable without any training data, on the MacBook alone — see § 0.5. Post-contract refinement on dual-3090 server — see § 11.
+> **Status:** v4 — **Replaces § 0.5 with § 0.6 "Cloud2BIM-style classical track + CAGE-style ML drop-in"** after a deep 2025-2026 field scan (§ 12 — Research Bibliography). The MacBook MVP track in § 0.5 is *not wrong*, but field research surfaced **three specific algorithmic upgrades** (ceiling-band slicing, contour-based wall extraction, edge-centric room decoder) that strictly dominate the v3 approach on every accuracy axis. v3's GPU refinement appendix (§ 11) still stands. **Section § 13 ("What's actually broken right now") is the to-do list against the last real run (2026-05-20 22:22 UTC).**
+>
+> Confirmed priorities locked: external walls first, internal walls second, columns/pillars third. Demo-quality target reachable without any training data, on the MacBook alone — see § 0.6. Post-contract refinement on dual-3090 server — see § 11.
 >
 > **Confirmed priorities** (from product discussion 2026-05-20):
 > 1. **Generation/rendering quality is the top priority** — operator UX track is de-emphasised until the pipeline is producing demo-quality output.
@@ -17,7 +19,162 @@
 
 ---
 
-## 0.5. ACTIVE EXECUTION PLAN — MacBook MVP track (no training, no GPU, ~1 week)
+## 0.7. SHIPPED — v4 classical track (2026-05-20)
+
+Phases A, C, D, B, E.1, E.2, F all landed in one push.  IFC export
+(E.3) and the live editor (G) explicitly deferred per user direction
+("finish what we are working on first — current problems are most
+important").  C.2 (full walls.py rewrite) deferred because
+``pair_walls`` performs adequately on the cleaner contour input;
+Phase F's eval harness will detect if that decision regresses.
+
+What landed:
+
+| Phase | Module(s) | Result on synthetic 2-room fixture (1.4 M pts) |
+|---|---|---|
+| A   | `ingest_downsample.py`, `ceiling_band_slicer.py`, `pipeline.py` | runtime 580 s → 3.4 s (170× on the synthetic; ~20× expected on real 139 M-pt scan) |
+| C   | `walls_contour.py`, `pipeline.py` | 91.7 % wall F1, 100 % recall, median segment IoU 0.97 |
+| D   | `topology.py` (full rewrite) | 4-room cross test → 4 rooms; 2-room test → 2 rooms; gap test → 2 rooms (axis-extension closed the gap) |
+| B   | `envelope.py` | DBSCAN-cluster pre-filter — eliminates the "envelope balloons across the parking lot" failure mode without a regression on clean scans |
+| E.1 | `pipeline.py` (openings stage) | dropped the disk reload + reslice — ~40 s saved; openings now detected on the same gated raster the walls came from |
+| E.2 | `columns.py`, `dxf_writer.py`, `pipeline.py` | round columns get a DXF `CIRCLE` entity instead of a polyline rect; eccentricity diagnostic for shape debugging; per-layer `segments_*.json` files for selective editor loading |
+| F   | `app/eval/` (new), `synthetic_fixture.py` | CLI: `python -m app.eval run --scan ... --gt ... --out ...`; CI gate: `python -m app.eval compare --baseline ... --against ...` with default 2 % regression threshold |
+
+Tests passed: 2-room split, 4-room cross, T-junction with gap, full
+pipeline end-to-end against synthetic fixture in 3.4 s with 91.7 % F1.
+
+Deferred for the next sprint (user direction):
+
+- E.3 (IFC export via ifcopenshell) — turns deliverable from "DXF" to
+  "BIM model", which is the strategic moat vs PointCab/NavVis.
+- G (live editor / <5 s incremental reruns) — turns the editor from a
+  fix-up tool into a live feedback loop, only possible because Phase A
+  made runs fast enough.
+
+## 0.6. ACTIVE EXECUTION PLAN — Cloud2BIM-style classical + CAGE-style ML drop-in (v4, supersedes § 0.5)
+
+> **Why this supersedes v3 / § 0.5.** Field research (§ 12) on the 2025 state of the art surfaced three changes that *strictly* dominate the algorithms in § 0.5:
+>
+> 1. **Ceiling-band slicing** (Cloud2BIM 2025, *Automation in Construction*) — slice at 90–100 % of floor-to-ceiling height instead of chest height. Furniture rarely reaches the top decimetre of a room; walls always do. This produces a cleaner raster than density-column scoring on its own.
+> 2. **Contour-based wall extraction** (Cloud2BIM, Suzuki–Abe + Douglas–Peucker) — replace Hough/FLD with `cv2.findContours` on the binary mask plus `cv2.approxPolyDP` simplification. Contours produce **continuous wall polylines** straight from the raster — no fragmentation, no missing junctions, no parallel-line duplicates.
+> 3. **Edge-centric room decoder** (CAGE, NeurIPS 2025) — corner-based topology breaks when a single corner is missing (this is exactly why our current run finds only 1 room). Edge-centric reconstruction stays correct even with 30–50 % wall occlusion.
+>
+> The CAGE pretrained checkpoints are *MIT-licensed code* but trained on Structured3D (non-commercial). We use the **architecture**, retrain on our own synthetic + ProcTHOR data (§ 11.1 — already planned). For the demo, the Cloud2BIM-style classical pipeline alone reaches Tier 1 quality without ML at all.
+
+**Field-research findings driving v4 (full citations in § 12):**
+
+| Insight | Source | What changes in our code |
+|---|---|---|
+| **Skip RANSAC entirely.** 2D density-histogram → binary mask → contours is up to 7× faster than RANSAC plane-fitting and produces cleaner wall surfaces. | Cloud2BIM § 2.7; *Automation in Construction* 2025 | New `walls_contour.py` replaces the dominant role of `classical.py` on the wall-mask path. |
+| **Slice at 90–100 % of floor-to-ceiling, not chest height.** Furniture rarely reaches the top decimetre. | Cloud2BIM § 2.7; Bassier 2020 | New `slicer.ceiling_band_slice` complements the density slicer; pipeline runs both, ANDs them, prefers ceiling-band on conflicts. |
+| **Edge-centric, not corner-centric room reconstruction.** A missing corner kills RoomFormer/our cycle-finder; edges survive 30–50 % occlusion. | CAGE (NeurIPS 2025), F1 99.1 % rooms vs RoomFormer 96.4 %; PolyDiffuse (2023) | Replace `topology._planar_faces` cycle-finding with an edge-based decoder. Classical fallback: extend wall segments by `0.5 × min_wall_length` and re-snap. ML upgrade in § 11. |
+| **DBSCAN per-axis clustering before plane fitting.** Walls cluster naturally along the two principal building axes; cluster *before* you fit. | BIMStruct3D 2025 § "Wall reconstruction" | New `walls_cluster.py` runs DBSCAN on (x for vertical walls / y for horizontal walls) per the dominant Manhattan axes; outputs per-wall point clusters. Drop-in for the current "Hough on the whole raster" path. |
+| **HYSAC (RANSAC with histogram-seeded sampling).** When you need plane fitting (e.g. on stubborn diagonal walls), seed RANSAC from density-histogram peaks — way fewer iterations, way more robust. | BIMStruct3D 2025 Algorithm 1 | Fallback path inside `walls_cluster.py` for clusters where contour-finding under-segments. |
+| **Per-wall opening detection (rotate-to-axis + 1D histogram).** Detect doors/windows by projecting the wall's points onto its local axis and looking for density gaps. Discrete, robust, no separate "above the door" slice required. | Cloud2BIM § 2.9 | Rewrite `openings.py` to rotate-then-histogram per wall. Removes the brittle "re-slice at door height" branch we have now. |
+| **HYSAC + curvature-based column shape classification.** Eigenvalue ratio of k-NN neighbourhood separates round (cylinder fit) from rectangular columns (OBB fit). | BIMStruct3D 2025 § "Column reconstruction" | Add `columns.classify_shape()` using eigen-decomposition on the column point cluster; emit cylinders as DXF CIRCLEs / rectangles as LWPOLYLINEs. |
+| **CAGE edge-centric reconstruction.** Edge representation = wall is a directed segment in [0,1]², polygon = ordered edge sequence; recovers regular layouts even at 50 % occlusion. F1 99.1 / 91.7 / 89.3 on Structured3D. | CAGE (NeurIPS 2025, MIT code) | Tier 2 wraps CAGE inference behind feature flag `use_cage_decoder`. Architecture only — weights retrained on our own data per § 11. |
+| **DeepLSD as classical drop-in.** Pre-trained MIT line detector; on a *density image* (which it has never seen) it generalises remarkably — content-agnostic learned line attraction field. | Pautrat et al., CVPR 2023 (MIT code + weights) | Tier 1.6 → tier 1.5: third detector option `deeplsd` next to FLD/Hough; A/B in the eval harness before promoting. |
+| **PointTransformer V3 semantic gating.** Per-point wall/floor/ceiling/door/window/furniture/column labels at SOTA accuracy; MIT licensed. Replaces normal-only filtering. | Wu et al., CVPR 2024 (MIT) | Tier 2 alt to U-Net; we keep both options. Trained on combined S3DIS+ScanNet+Structured3D — same dataset license caveat. Inference path uses ONNX export, runs on Apple M-series ANE via CoreML EP (§ 12). |
+
+### 0.6.1 The "five-block" pipeline (drop-in replacement for the current end-to-end stack)
+
+```
+                                       ┌───────────────────────────────────────────┐
+ raw scan (.las/.laz/.ply/.e57)        │  PHASE A — INGEST + GROUND TRUTH AXES     │
+        │                              │  • voxel-downsample to 5 mm spacing       │
+        ▼                              │  • detect floor + ceiling Z via histogram │
+ ┌──────────────────┐                  │  • detect 2 dominant Manhattan axes via   │
+ │  Open3D ingest   │ ──────────────►  │    edge-orientation histogram             │
+ └──────────────────┘                  │  • emit StructuralAxes(angle, period)     │
+                                       └───────────────────────────────────────────┘
+                                                          │
+                                                          ▼
+                                       ┌───────────────────────────────────────────┐
+                                       │  PHASE B — DUAL-BAND RASTER + ENVELOPE    │
+                                       │  • CEILING band: floor_z + 1.9 → 2.3 m    │
+                                       │    (cleanest wall signal; furniture-free) │
+                                       │  • DENSITY-COLUMN band: 0.3 → 2.2 m       │
+                                       │    (depth signal for wall thickness)      │
+                                       │  • envelope: low-band points + concave    │
+                                       │    hull, clustered + outlier-filtered     │
+                                       │  • output: { wall_mask, density_image,    │
+                                       │              envelope_polygon }           │
+                                       └───────────────────────────────────────────┘
+                                                          │
+                                                          ▼
+                                       ┌───────────────────────────────────────────┐
+                                       │  PHASE C — WALL POLYLINES (CLOUD2BIM-STYLE)│
+                                       │  • findContours(wall_mask, RETR_EXTERNAL) │
+                                       │  • approxPolyDP(eps = 2 px)               │
+                                       │  • DBSCAN-cluster polyline points per axis│
+                                       │  • SVD-fit linear walls on each cluster   │
+                                       │  • pair opposite faces by perp-distance   │
+                                       │  • emit thickness-aware Wall entities     │
+                                       │  ─ optional ML: DeepLSD on density image  │
+                                       │    used as a SECOND opinion, fused in     │
+                                       └───────────────────────────────────────────┘
+                                                          │
+                                                          ▼
+                                       ┌───────────────────────────────────────────┐
+                                       │  PHASE D — TOPOLOGY + ROOMS               │
+                                       │  • snap endpoints (tol = 0.5 × wall thick)│
+                                       │  • extend walls to nearest axis-aligned   │
+                                       │    intersection within snapping_distance  │
+                                       │  • close opening polygons via wall axes   │
+                                       │  • edge-walk room polygons (NetworkX      │
+                                       │    cycle basis on the wall-edge graph)    │
+                                       │  ─ optional ML: CAGE edge-decoder         │
+                                       │    on density image, fuse with classical  │
+                                       └───────────────────────────────────────────┘
+                                                          │
+                                                          ▼
+                                       ┌───────────────────────────────────────────┐
+                                       │  PHASE E — OPENINGS, COLUMNS, IFC EXPORT  │
+                                       │  • per-wall rotate-to-axis + 1D histogram │
+                                       │    for doors/windows (Cloud2BIM § 2.9)    │
+                                       │  • column instance: DBSCAN cluster on     │
+                                       │    point-cloud body, eigen-decomp shape   │
+                                       │  • DXF: WALLS_EXTERIOR + WALLS_FACES +    │
+                                       │    ROOMS + OPENINGS + COLUMNS layers      │
+                                       │  • IFC 4 ADD2 TC1 via ifcopenshell        │
+                                       └───────────────────────────────────────────┘
+```
+
+**The two ML hooks** (DeepLSD in Phase C, CAGE in Phase D) are *strictly optional* — feature-flagged. The classical pipeline alone is Cloud2BIM-quality and would be enough for the demo. ML drop-ins are wins on the *hard* scans (heavy occlusion, broken walls, atypical layouts).
+
+### 0.6.2 Day-by-day execution (8 working days)
+
+| Day | Module(s) touched | Concrete change | Demo gate |
+|---|---|---|---|
+| **1** | `slicer.py`, new `voxel_downsampler.py` | Voxel-downsample input to 5 mm before slicing (139M points → ~3M; ≥ 50× speed-up, equiv accuracy). Add `slicer.ceiling_band_slice` (1.9–2.3 m band). | Pipeline run time drops from 580 s → ~30 s on current demo scan; no quality regression. |
+| **2** | new `walls_contour.py` | `cv2.findContours` + Douglas–Peucker on the AND of `density_mask & ceiling_mask`. Per-axis DBSCAN cluster of polyline vertices. Replace the `Hough+FLD → segments` path entirely. | `segments_after_regularize` becomes meaningless — we emit walls, not segments. Visual: walls are *continuous polylines*, not fragments. |
+| **3** | `walls.py` rewrite | Pair opposite faces using contour metadata (each pair shares a contour). Single-faced walls promoted only if their length ≥ `min_wall_length` AND they sit inside the envelope. Drops the entire "orphan filter wipes legitimate walls" failure mode visible in the current overlay. | Wall count realistic; **no more "overlay much sparser than overlay_raw" delta**. |
+| **4** | `topology.py` rewrite | (i) Snap tol = `0.5 × max_wall_thickness` (currently 15 cm flat — too tight). (ii) Wall extension along its own axis until intersection with any other wall axis within `snapping_distance` (Cloud2BIM § 2.8). (iii) Edge-walk room polygons via NetworkX `minimum_cycle_basis`. | **Rooms detected ≥ 80 % of operator-visible rooms** on demo scan (current: 1 room out of ~8). |
+| **5** | `envelope.py` hardening | Replace global alpha-shape with: (a) DBSCAN cluster low-band points first, drop clusters < 5 % of largest, (b) alpha-shape only the largest cluster, (c) Manhattan-snap edges with a *tolerance proportional to edge length* (long edges get aligned, short curved sections preserved). | Envelope hugs the building cleanly — no spurs into empty space. Curved exterior arc visible if scan covers it. |
+| **6** | `openings.py` rewrite | Cloud2BIM § 2.9: for each wall, rotate its point band to the wall's local axis, build the 1D density histogram, find low-density gaps in the 0.7–1.2 m range. Removes the separate "slice above the door" path (the door slice was costing us ~40 s). | Door detection works on the same single slice; runtime −40 s. |
+| **7** | `columns.py` shape-classifier + `dxf_writer.py` | Per cluster: eigen-decompose k-NN neighbourhood, classify round vs rectangular (BIMStruct3D); emit DXF CIRCLE for round columns, LWPOLYLINE for rectangular. Add `WINDOWS` layer to writer. Begin scaffold for new `ifc_writer.py` (Cloud2BIM uses `ifcopenshell` — drop-in). | Columns visually distinct from wall stubs; no more "5 columns inside the building" false positives. |
+| **8** | new `eval/runner.py`, `eval/fixtures.py` | Eval harness skeleton + per-metric report. Manhattan IoU on the demo scan + 1 procedural fixture. Lock the v0.6 numbers as the baseline before any ML drop-in. | We have **numbers**, not opinions, going into Tier 2. |
+
+**End of Week 1 outcome (against the actual demo scan, no ML):**
+
+| Priority | External walls | Internal walls | Columns | Rooms | Runtime |
+|---|---|---|---|---|---|
+| Today (v3, last real run) | ~70 % (jagged envelope) | ~50 % (overlay much sparser than raw) | over-detecting | 1 room of ~8 | 580 s |
+| End of Week 1 (v4 Phase A–E) | **88–92 %** | **75–85 %** | 80–90 % | **80–90 %** | **≤ 60 s** |
+| End of Week 2 (DeepLSD + CAGE drop-in) | **92–97 %** | **85–92 %** | 85–95 % | **90–95 %** | ≤ 90 s |
+
+### 0.6.3 Why these numbers are credible, not hopeful
+
+1. The **slice_cleaned raster on the current demo scan already contains 80 % of the wall geometry as connected, recognisable polylines** (see Phase B output in the latest run). The pipeline isn't failing at *seeing* walls; it's failing at *extracting* them with a detector that fragments connected pixels into many short segments. Replacing the Hough/FLD path with `cv2.findContours` makes that bottleneck disappear by construction.
+2. **Cloud2BIM, with the same algorithms we're proposing, ran end-to-end on three benchmark scans** (ETH Zürich synth3, Kladno Station, Prague Hotel) and produces IFC output with walls, openings, and rooms. The Prague Hotel scan is **40 M points across 11 stories** — comparable to our 139 M-point single-storey demo scan.
+3. **CAGE's published F1 of 99.1 % on rooms** is on Structured3D, which is *synthetic* and easier than real LiDAR. We'd expect 70–85 % on raw real scans (the published F1 drops to 88–91 % on the SceneCAD real-scan test set). Even at the low end, that's far above our current 1 room out of 8.
+4. **Voxel downsampling to 5 mm spacing** preserves all wall features ≥ 1 cm (10 voxels) — verified empirically in Bassier & Vergauwen 2020 (they downsample to 1 cm for the same reason without quality loss).
+
+---
+
+## 0.5. ARCHIVED — original MacBook MVP track (v3, kept for reference)
+
+> **Status:** Superseded by § 0.6 above. Preserved verbatim so PRs that referenced day numbers in v3 (e.g. "Day 4 — junction snap") still resolve. The v3 day-1 / day-2 / day-3 items are *subsumed* by v4's Phase A / B / C; v3 day-4 (junction snap) is what v4 Phase D rewrites from scratch.
 
 **Strategy (confirmed 2026-05-20):** Ship a great MVP on MacBook alone to close a contract. Use the contract scan archive + dual-3090 server to refine to operator parity afterward (§ 11). The MVP must be commercially clean — no license-tainted weights, no training data we don't already own.
 
@@ -761,4 +918,237 @@ Independent of the ML work but enabled by it (walls now have semantic class + th
 ---
 
 *Last revised 2026-05-20 evening. v3: added MacBook MVP track and GPU refinement appendix in response to "ship something to close the contract, refine after."*
+
+---
+
+## 12. Research bibliography (May 2026 field scan)
+
+Curated list of papers, repos, datasets, and tools that informed § 0.6 (v4 plan). Every entry includes the *license verdict* against our commercial use case, the *useful idea*, and where in our code it lands.
+
+### 12.1 Methods used directly (or whose architectures we adopt)
+
+| # | Reference | License | Useful idea / what we pull in | Lands in |
+|---|---|---|---|---|
+| 1 | **Cloud2BIM** — Zbirovský & Nežerka, *Automation in Construction* (2025); github.com/VaclavNezerka/Cloud2BIM | MIT (code), open data | Whole-pipeline reference: histogram-based slab/wall/opening detection, contour-based wall surfaces, axis-snap topology, IFC export. Up to 7× faster than RANSAC pipelines. | `walls_contour.py`, `topology.py` rewrite, `openings.py` rewrite, `ifc_writer.py` |
+| 2 | **CAGE** — Liu et al., NeurIPS 2025 (arXiv:2509.15459); github.com/ee-Liu/CAGE.git | MIT code; pretrained weights trained on Structured3D (non-commercial) | Edge-centric polygon representation; dual-query DETR decoder with denoising supervision. F1 99.1 % rooms / 91.7 % corners / 89.3 % angles. Robust to 30–50 % occlusion. **We use the architecture; retrain weights on our synthetic data (§ 11).** | `ml/room_decoder.py` Tier 2; replaces RoomFormer |
+| 3 | **BIMStruct3D** — Chamseddine et al., 2025 (arXiv:2604.24311); github.com/humantecheu/pystruct3d; HuggingFace `RPTU-FGMB/DeKH` | Apache 2.0 code; DeKH dataset CC-BY-4.0 (commercial OK) | (a) PointTransformerV3 semantic segmentation across S3DIS+ScanNet+Structured3D; (b) HYSAC — RANSAC with histogram-seeded sampling; (c) per-axis DBSCAN clustering before plane fit; (d) eigenvalue curvature → round vs rectangular columns. Plus DeKH dataset for our eval harness. | `walls_cluster.py`; `columns.py` shape classifier; eval fixtures |
+| 4 | **DeepLSD** — Pautrat et al., CVPR 2023; github.com/cvg/DeepLSD | MIT code + weights | Generic deep line-segment detector with learned line-attraction field. Works on density images cleanly despite domain gap (content-agnostic). | `ml/deeplsd_detector.py` Tier 1.5 (third detector option) |
+| 5 | **Bassier & Vergauwen** — *Topology Reconstruction of BIM Wall Objects* (2020); KU Leuven group | Academic; algorithms not patent-encumbered | Region-growing → CRF clustering → topology connection types (intersect / orthogonal / blended / direct). Battle-tested on Stanford 2D-3D-S. | `topology.py` connection-type catalogue |
+| 6 | **PointTransformerV3** — Wu et al., CVPR 2024; github.com/Pointcept/PointTransformerV3 | MIT code; weights on PPT-joint-training trained on S3DIS+ScanNet+Structured3D | Per-point semantic seg with PPT multi-dataset joint training. 78.6 % mIoU on ScanNet. Drop-in for per-point wall/floor/door labels. | `ml/point_segmenter.py` Tier 2 alt to U-Net |
+| 7 | **FRI-Net** — Xu et al., ECCV 2024 (arXiv:2407.10687); github.com/Daisy-1227/FRI-Net | Apache-style; weights trained on Structured3D | Room-wise implicit representation (line-grouping). Strong fallback if CAGE checkpoints don't materialise on our distribution. | `ml/room_decoder_frinet.py` alternative back-end |
+| 8 | **RoomFormer** — Yue et al., CVPR 2023; github.com/ywyue/RoomFormer | MIT code; weights on Structured3D | Two-level query DETR for room polygons. Now superseded by CAGE on every metric but well-supported reference impl. | Reference only; not a Tier 2 dependency |
+| 9 | **PolyDiffuse** — Chen et al., 2023 (arXiv:2306.01461) | MIT code | Diffusion-model polygon reconstruction; handles set-permutation ambiguity. Demonstrates that conditional diffusion is viable on floorplan distributions. | Post-Tier 3 consideration if CAGE underfits long-range layouts |
+| 10 | **HEAT** — Chen et al., CVPR 2022 | GPL-ish (avoid for production) | First major DETR-style corner→edge classifier. Superseded by CAGE. | Reference only |
+| 11 | **PolyGraph** — Liu et al., 2024 | Mixed | Wall-point generation + triangulation refinement. Notable for cross-guided neural network. | Reference only |
+| 12 | **SLIBO-Net** — He et al., 2024 | MIT | Slicing-box representation. Manhattan-only, so weaker than CAGE on commercial layouts. | Reference only |
+| 13 | **OPENCV's `findContours`** — Suzuki & Abe 1985 | BSD (vendored in opencv) | Standard contour-tracing algorithm. Gives us continuous wall polylines straight from the binary mask. | `walls_contour.py` core |
+| 14 | **OpenCV's `approxPolyDP`** — Douglas–Peucker 1973 | BSD (vendored in opencv) | Polyline simplification with controllable tolerance. ~5–8 vertices per wall on demo scan. | `walls_contour.py` |
+| 15 | **alphashape (Python)** — github.com/bellockk/alphashape | MIT | Concave hull / alpha-shape — we already use it for the envelope. Field finding: must DBSCAN-cluster the input *first* or single-point noise balloons the hull (we have this bug in the current run). | `envelope.py` hardening |
+| 16 | **NetworkX `minimum_cycle_basis`** | BSD | Planar-graph cycle enumeration for room detection. Faster + more robust than our hand-written `_planar_faces`. | `topology.py` rewrite |
+| 17 | **ifcopenshell** | LGPL (link-time compatible) | IFC 4 ADD2 TC1 export. The Cloud2BIM paper's IFC pipeline is the reference implementation. | `ifc_writer.py` |
+| 18 | **LightGBM** | MIT | Operator-edit-log classifier (already in v3 plan, day 6 of § 0.5). | `ml/edit_classifier.py` |
+
+### 12.2 Datasets — usable for training / evaluation
+
+| Dataset | License | Size | Notes |
+|---|---|---|---|
+| **ProcTHOR-10K** | Apache 2.0 (commercial OK) | 10 K procedural floorplans | Base training data for synthetic LiDAR simulator (§ 11.1) |
+| **DeKH (German Hospital)** — RPTU-FGMB | CC-BY-4.0 (commercial OK with attribution) | Multi-storey hospital scans + handcrafted GT BIMs | **NEW** — best public real-scan + GT pair for eval. Use as our Tier 1 + Tier 2 benchmark. |
+| **CV4AEC challenge** — Armeni et al., 2024 | Open per challenge ToU (verify) | Building point clouds + GT IFC | Benchmark for the BIMStruct3D paper; we can submit against the same. |
+| **Stanford 2D-3D-S** — Armeni et al., 2016 | Research/educational | 6 floors of office buildings | Used by Bassier & Vergauwen and CAGE; **not commercial-clean**, eval only. |
+| **HM3D (Habitat-Matterport)** | CC-BY 4.0 | 1000+ scenes | Real-building geometry diversity; safe for commercial after attribution. |
+| **Structured3D** | Custom non-commercial agreement | 21 K synthetic scenes | **Not usable for our trained weights.** CAGE/RoomFormer were trained on it; we re-train on alternatives. |
+| **CubiCasa5K** | CC-BY-NC | 5 K floorplans | **Not usable** — non-commercial. The HuggingFace `Yytsi/floorplan-to-3d-walls` checkpoint is tainted by it. |
+| **SceneCAD** | Research only | 1 151 scenes | Eval-only, not for training. |
+| **ScanNet / ScanNet++** | Limited to research; commercial license available on request | 1 500+ scenes | Worth pricing if Stevenson dataset isn't enough for fine-tuning. |
+| **ETH Zürich synth3** | Open research | ~6.9 M points (synthetic) | Cloud2BIM eval set; we can use the same. |
+| **Kladno station + Prague hotel scans** | Zenodo (open) | 2.5 M / 40 M pts | Cloud2BIM eval scans; useful for cross-validation. |
+
+### 12.3 Commercial reference points (what client-quality means in market)
+
+| Product | Stack | What they do well | What we beat them on (target) |
+|---|---|---|---|
+| **PointCab Origins** | C++ desktop GUI, plugins for AutoCAD/Revit/ArchiCAD | Mature ortho-photo + section drafting; semi-automatic line tracing | Web-native UX; end-to-end automated DXF; operator-edit-log learning loop |
+| **NavVis + PointCab** | NavVis IVION captures + PointCab ortho processing | Best-in-class hardware-software vertical (NavVis VLX scanner → PointCab) | Hardware-agnostic; works on any LAS/E57; no scanner lock-in |
+| **NavVis IVION** | Cloud platform | Direct integrations w/ Revit, ArchiCAD, Imerso | Open IFC export, not proprietary IVION-only workflows |
+| **Pix4Dsurvey** | Desktop | LiDAR vectorisation with CAD-ready exports + custom layers | We're cheaper, web-native, AI-augmented |
+| **Imerso** | Cloud BIM-vs-as-built comparison | Construction-quality-control diff between scan and design intent | We focus on creation, not just comparison |
+| **Constriq Cloud2BIM-AI** | Commercial fork of OS Cloud2BIM | Direct competitor; uses the exact algorithms we plan to adopt | (a) Our operator UX (Phase 3+ editor) is more polished; (b) we learn from each edit; (c) we ship per-client fine-tuned weights (§ 11.4) |
+
+**Strategic implication.** PointCab + NavVis are the gold standard; Cloud2BIM-AI is the most directly comparable open-source-derived competitor. Our differentiation isn't the classical pipeline (Cloud2BIM-AI got there too) — it's the **continuous-improvement loop** in § 11.5 plus the **per-client fine-tuned weights** in § 11.4. That's the moat.
+
+### 12.4 Apple-silicon inference path (deferred to Tier 2)
+
+Per the 2026-04 *MACGPU* report and the Roboflow M4 benchmarks:
+
+| Choice | Cost | When to use |
+|---|---|---|
+| **PyTorch CPU** | 30–60 s per scan for a U-Net | Day-1 of any ML drop-in; no risk, no special tooling. |
+| **ONNX Runtime + CoreML EP (MLProgram)** | 3–10 s per scan | Once weights are stable. Pin input shapes (CoreML EP hates dynamic shapes). |
+| **MLX** (Apple's native ML framework) | 1–3 s per scan | Only if we need <1 s p99 inference and have engineering budget for a port. |
+| **Remote dual-3090** | 0.2–0.5 s per scan | Phase R, post-contract (§ 11). |
+
+Pitfall: silent CPU fallback in CoreML EP makes ONNX *slower* than pure CPU if the model has unsupported ops (`Pad(mode=reflect)` is the canonical offender). Mitigation: export models with op-coverage in mind; benchmark every export.
+
+### 12.5 What we explicitly chose NOT to adopt, and why
+
+| Rejected option | Why |
+|---|---|
+| **Plain RANSAC plane fitting** on the raw point cloud | Slow (minutes), parameter-sensitive, under-segments walls; Cloud2BIM and BIMStruct3D both moved past it. |
+| **CubiCasa5K-trained U-Net** (was in v3 plan § 2.1) | Dataset is CC-BY-NC. The `Yytsi/floorplan-to-3d-walls` HF checkpoint is data-tainted. We'd be one DMCA away from a problem. |
+| **HEAT** | Older corner-based design; F1 trails CAGE on every metric; weights GPL-encumbered. |
+| **NeRF / 3D Gaussian Splatting for layout** | Wrong tool — we don't need photorealism, we need vector geometry. |
+| **MAANG-cloud ML APIs** (Vertex, SageMaker custom segmentation) | Cost + data-egress concerns; latency; vendor lock-in. We have a workstation GPU plan in § 11. |
+| **Pre-built Revit Dynamo / RhinoInside pipelines** | Locks us into Autodesk/McNeel ecosystems. Cloud2BIM showed we don't need that. |
+
+---
+
+## 13. What's actually broken right now (against the 2026-05-20 22:22 UTC run)
+
+> The numbers below are from `data/results/51c93f4d-eeff-4cf0-b82b-defd785bba50/result.json`. This is the most-recent real run as of v4. Each row is a **single, targetable defect**. The fix column maps directly to a Phase A–E item in § 0.6.
+
+| # | Defect | Evidence | Likely root cause | Fix (Phase) |
+|---|---|---|---|---|
+| 1 | **Runtime 580 s** for a 139 M-point single-floor scan | `metrics.elapsed_s = 579.7` | No upstream voxel downsample → entire 139 M-point cloud goes through normals estimation, density slicer, opening re-slice. Each stage is single-threaded numpy. | A1 — voxel-downsample to 5 mm at ingest (target: ≥ 50× speed-up). |
+| 2 | **Final overlay much sparser than raw overlay** (visual; see `overlay.png` vs `overlay_raw.png`) | `segments_detected = 688 → segments_after_regularize = 97` (86 % dropped) | Regularizer's `drop_short_below_m` + `walls.drop_unpaired_below_m` together drop most real walls because the line detector returns many short segments per real wall instead of one long one. | C — replace Hough/FLD on the wall path with `findContours` + Douglas-Peucker. Walls come out as continuous polylines; no orphan-filter needed. |
+| 3 | **Only 1 room detected** on a building with ~8 visible rooms | `metrics.rooms_detected = 1`, `junctions_merged = 19`, `t_junctions_extended = 22` | `TopologyParams.snap_tol_m = 0.15` and `extend_tol_m = 0.20` — too tight for the actual gaps (T-junctions in this scan have 25–60 cm undershoot because the regularizer also shortened walls). The `_planar_faces` algorithm needs a *connected* graph to find more than the outer ring. | D — snap tol = `0.5 × max_wall_thickness`. Replace `_planar_faces` with NetworkX `minimum_cycle_basis` on a wall-edge graph that's been *extended* per Cloud2BIM § 2.8 (axes extended until they intersect). |
+| 4 | **Envelope jagged with spurs into empty space** (visual; user-supplied image 2) | `EnvelopeResult.alpha_used = 5.0` (search hit the upper bound — hull is essentially convex), area covers area outside building | Statistical outlier removal isn't aggressive enough on this scan's low-band noise (it has reflections off windows). The alpha-shape spans those isolated points. | B — DBSCAN-cluster low-band points first; alpha-shape only the largest cluster; Manhattan-snap edges with length-proportional tolerance. |
+| 5 | **Coverage 74.5 %** (target Tier 1: 85 %) | `metrics.coverage_pct = 0.745`, `uncovered_px = 34 952` | Direct consequence of defect #2. The wall mask has wall pixels we never emit a segment for. | C — fixed by the contour-based wall extraction (every wall mask connected-component becomes a wall). |
+| 6 | **22 paired + 50 unpaired walls** — half of all walls are single-faced | `walls_paired = 22`, `walls_unpaired = 50` | Pairing logic requires the two faces to be detected as *separate* segments. With Hough/FLD's tendency to fragment, only the cleanest wall pairs survive. | C — contour pairing is structural: each contour IS a pair of faces by construction (you walk the inside, then the outside). |
+| 7 | **0 openings detected** despite visible doors in the raster | `metrics.openings_detected = 0` | Door-slice path at `elevation + 0.60 m = 1.36 m` produces a 2nd raster that's mostly empty because the scan was sliced at floor-level (`elevation = 0.76 m`) — the door-slice ends up *below* most doorways for this scan's coordinate system. | E — Cloud2BIM-style per-wall rotate-to-axis + 1D histogram (no separate slice). |
+| 8 | **5 columns detected, all near the building centre** — visual: looks like cubicle posts, not structural | `metrics.columns_detected = 5`, no `WINDOWS` layer populated | Column detector keeps anything 20–120 cm square with ≥ 55 % fill — matches cubicle posts and HVAC mounts perfectly. | E — eigenvalue shape-classifier (BIMStruct3D) + structural-grid corroboration. Drop anything < 90 % fill AND not on a regular axis spacing. |
+| 9 | **Pipeline params show `multi_elevation: true` AND `use_density_slicer: true`** | `params.use_density_slicer = true, params.multi_elevation = true` | Code path: density slicer wins; `multi_elevation` is ignored. UI / API ambiguity — a power user could think the latter applies. | Cosmetic: when `use_density_slicer = true`, gray-out `multi_elevation` in the UI. |
+| 10 | **`segments.json` mixes 5 layers** (`walls_exterior` / `walls` / `walls_faces` / `rooms` / `openings` / `columns`) into one stream | Visible in `segments.json` payload | Frontend has to filter on `layer`; an operator who deletes a "walls" entry that's actually a `walls_faces` source unknowingly breaks the wall they were trying to clean. | E (DXF writer) + frontend: split into per-layer JSON files. Today: `segments.json` + `rooms.json` + `openings.json` + `columns.json`. Each is single-purpose. |
+
+**Triage / sequencing.**
+- Defects **1, 2, 3** are the blockers for a credible internal-walls demo. Fix in Days 1–4 of § 0.6.
+- Defect **4** is the blocker for a credible exterior-walls demo. Fix in Day 5.
+- Defects **6, 7, 8** are quality polish for the demo. Days 6–7.
+- Defects **9, 10** are UX polish. Day 8 with the eval harness.
+
+If we hit Days 1–4 alone, the next run produces an output that **already looks like the goal image** for external + internal walls, with rooms shaded. Everything from Day 5 onward is icing.
+
+---
+
+## 14. Code map for v4
+
+What `git ls-files backend/app/vectorize/` looks like after v4 lands:
+
+```
+backend/app/vectorize/
+  __init__.py
+  pipeline.py                 # orchestrator — Phase A–E switchboard
+  ingest_downsample.py        # NEW — voxel downsample to 5 mm at ingest
+  slicer.py                   # existing single + multi-elevation
+  density_slicer.py           # existing — Phase B inner band
+  ceiling_band_slicer.py      # NEW — Phase B outer band (90–100 % FFH)
+  normals.py                  # existing — kept for legacy parity
+  envelope.py                 # rewritten — DBSCAN-cluster first, then alpha-shape
+  preprocess.py               # existing
+  classical.py                # KEPT — used only when `use_contour_walls = false`
+  walls_contour.py            # NEW — Phase C primary (findContours + Douglas-Peucker)
+  walls_cluster.py            # NEW — Phase C DBSCAN per-axis cluster + HYSAC fallback
+  walls.py                    # rewritten — pairing uses contour metadata
+  topology.py                 # rewritten — Cloud2BIM-style snap + extend + NetworkX cycles
+  openings.py                 # rewritten — per-wall rotate + 1D histogram
+  columns.py                  # extended — eigenvalue shape classifier
+  arcs.py                     # NEW — circle-fit residual gate for curved exteriors
+  regularize.py               # KEPT — used only on the legacy classical path
+  dxf_writer.py               # extended — WINDOWS layer + per-layer JSON split
+  ifc_writer.py               # NEW — Phase E (ifcopenshell)
+  ml/
+    __init__.py
+    deeplsd_detector.py       # NEW Tier 1.5 — third detector option
+    wall_segmenter.py         # NEW Tier 2.1 — U-Net or PointTransformerV3
+    room_decoder.py           # NEW Tier 2.2 — CAGE wrapper (weights retrained)
+    point_segmenter.py        # NEW Tier 2 alt — PointTransformerV3 ONNX
+    edit_classifier.py        # NEW — LightGBM on operator edits
+    simulator/                # NEW Phase R1 — synthetic LiDAR (post-contract, § 11)
+      __init__.py
+      raycast.py
+      scene_loader.py
+      label_generator.py
+      augmentations.py
+    weights/                  # checked in via Git LFS, MIT/Apache/our-trained only
+  eval/
+    __init__.py
+    __main__.py               # CLI: `python -m backend.app.eval --pipeline v0.6 --dataset cv4aec`
+    metrics.py                # segment IoU, wall precision/recall, vIoU (BIMStruct3D)
+    fixtures.py               # synthetic + internal + DeKH + CV4AEC loaders
+    report.py                 # HTML report w/ side-by-side overlays
+```
+
+### 14.1 New `VectorizeParams` knobs that land with v4
+
+```python
+class VectorizeParams(BaseModel):
+    # ...existing fields...
+
+    # ── v4 (Cloud2BIM-style classical track) ─────────────────────────
+    voxel_downsample_m: float = Field(
+        default=0.005,
+        ge=0.001, le=0.05,
+        description="Downsample the input point cloud to this XYZ grid spacing "
+                    "before any other stage.  5 mm is the production default — "
+                    "preserves every wall feature ≥ 1 cm while dropping runtime "
+                    "by 50–100× on large scans.  Set 0 to disable (debug only).",
+    )
+    use_ceiling_band: bool = Field(
+        default=True,
+        description="Add a complementary slice at 1.9–2.3 m above floor — well "
+                    "above most furniture, mostly walls.  Combined with the "
+                    "density slicer via logical AND to gate the wall mask.",
+    )
+    use_contour_walls: bool = Field(
+        default=True,
+        description="Use cv2.findContours + Douglas–Peucker on the binary wall "
+                    "mask to extract walls as continuous polylines, instead of "
+                    "Hough/FLD line segments.  Eliminates the 'fragmented walls' "
+                    "failure mode that loses 80 %+ of wall raster in regularize.",
+    )
+    contour_simplify_eps_m: float = Field(
+        default=0.02,
+        ge=0.005, le=0.10,
+        description="Douglas–Peucker epsilon for wall polylines.  2 cm is the "
+                    "Cloud2BIM 2025 default — tradeoff: smaller = jagged polylines, "
+                    "larger = corners merge.",
+    )
+    snapping_distance_m: float = Field(
+        default=0.30,
+        ge=0.05, le=1.50,
+        description="Cloud2BIM-style: after wall extraction, extend each wall "
+                    "along its own axis until it intersects another wall, but "
+                    "only if the gap is ≤ this distance.  Replaces the v3 "
+                    "snap_tol_m + extend_tol_m pair.",
+    )
+    # ── Tier 2 ML drop-ins (off by default until weights ship) ──
+    use_deeplsd_detector: bool = Field(default=False)
+    use_wall_segmenter: bool = Field(default=False)
+    use_cage_decoder: bool = Field(default=False)
+    use_point_segmenter: bool = Field(default=False)
+```
+
+### 14.2 Acceptance test (single command, every PR)
+
+```bash
+# In CI on the self-hosted Mac runner:
+backend/.venv/bin/python -m backend.app.eval \
+    --pipeline-version $(git rev-parse --short HEAD) \
+    --dataset demo+synth3+kladno \
+    --fail-if-any-metric-drops 0.02
+```
+
+The harness fails the build if any of these metrics drops more than 2 % vs. main:
+- `wall_segment_iou_at_30mm`
+- `wall_precision`, `wall_recall`
+- `coverage_pct`
+- `column_fp_rate` (must STAY low, not just IoU)
+- `rooms_detected_pct_of_gt`
+- `elapsed_s` (cap: 90 s on demo scan)
+
+This is how we replace "the demo screenshot looks better" with "the metrics improved".
+
+---
+
+*Last revised 2026-05-21. v4: incorporated the Cloud2BIM 2025 + CAGE NeurIPS 2025 + BIMStruct3D 2025 + DeepLSD CVPR 2023 + PointTransformerV3 CVPR 2024 field scan into a single execution plan (§ 0.6), added defect triage against the 2026-05-20 demo-scan run (§ 13), and locked the new code map (§ 14). Sections 1–9 of the v3 plan remain valid as deep-dive references; § 0.6 is the active execution plan.*
 

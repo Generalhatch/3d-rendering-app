@@ -31,17 +31,22 @@ from ..limits import JOB_SEMAPHORE
 from ..models.vectorize_job import VectorizeMetrics, VectorizeParams, VectorizeStatus
 from ..sse import publish
 from . import (
+    ceiling_band_slicer as ceiling_band_mod,
     classical,
+    clip_to_envelope as clip_mod,
     columns as columns_mod,
     density_slicer as density_slicer_mod,
     dxf_writer,
     envelope as envelope_mod,
+    ingest_downsample as downsample_mod,
     normals as normals_mod,
     openings as openings_mod,
     preprocess,
     regularize,
     slicer,
+    topology as topology_mod,
     walls as walls_mod,
+    walls_contour as walls_contour_mod,
 )
 
 
@@ -124,7 +129,46 @@ def run_vectorize(
         from ..pipeline.ingest import load_point_cloud   # local import: heavy module
         pcd = load_point_cloud(scan_path)
         raw_points = int(len(pcd.points))
-        _emit(job_id, "ingest", f"Loaded {raw_points:,} points", 0.15)
+        _emit(job_id, "ingest", f"Loaded {raw_points:,} points", 0.12)
+
+        # ── 1b. Voxel downsample (v4 Phase A — see ACCURACY_TO_CAD_QUALITY_PLAN.md § 0.6) ──
+        # Single biggest speed lever in the pipeline.  At 5 mm voxel spacing,
+        # walls are still represented by hundreds of points per metre, every
+        # door frame by dozens.  Density rasters and alpha-shapes are
+        # visually indistinguishable from native-resolution output, but every
+        # downstream stage runs 10–50× faster.
+        #
+        # Done HERE, before envelope/normals/slice, so every other stage
+        # benefits.  Envelope works correctly post-downsample because it
+        # depends on the *spatial extent* of low-band points, not their
+        # density (downsample preserves extent, only thins density).
+        downsample_result: downsample_mod.DownsampleResult | None = None
+        if params.voxel_downsample_m > 0:
+            _emit(job_id, "ingest", "Voxel-downsampling cloud…", 0.135)
+            try:
+                if getattr(params, "voxel_downsample_auto", True):
+                    downsample_result = downsample_mod.voxel_downsample_auto(
+                        pcd, initial_voxel_m=params.voxel_downsample_m,
+                    )
+                else:
+                    downsample_result = downsample_mod.voxel_downsample(
+                        pcd, voxel_m=params.voxel_downsample_m,
+                    )
+                pcd = downsample_result.pcd
+                _emit(job_id, "ingest", downsample_result.summary(), 0.15)
+            except Exception as ds_err:
+                # Downsampling should never fail on a non-empty cloud, but
+                # if Open3D throws on some pathological input we'd rather
+                # eat the runtime hit than abort the entire job.
+                _emit(
+                    job_id, "ingest",
+                    f"Voxel downsample skipped: {ds_err} — running at native resolution",
+                    0.15,
+                )
+        else:
+            _emit(job_id, "ingest", f"Loaded {raw_points:,} points (downsample disabled)", 0.15)
+
+        points_after_downsample = int(len(pcd.points))
 
         # ── 2. Decide elevation ──────────────────────────────────────────
         if params.elevation_m is None:
@@ -233,6 +277,8 @@ def run_vectorize(
                 pcd = load_point_cloud(scan_path)
 
         # ── 3. Slice (density-column / single / multi-elevation OR-fused) ─
+        ceiling_band_points = 0
+        wall_mask_pixels_after_gate = 0
         if params.use_density_slicer:
             # Vertical-column density score: every XY cell gets the fraction
             # of its vertical wall-band heights that have any point in them.
@@ -266,6 +312,86 @@ def run_vectorize(
                 )
             except Exception:
                 pass
+
+            # ── 3a. Ceiling-band gate (v4 Phase A.2) ──────────────────────
+            # Cloud2BIM 2025 strategy: a 1.9-2.3 m slab is mostly walls,
+            # almost no furniture (cubicle stops ≤ 1.5 m, file cabinets ≤
+            # 1.8 m), and above the 2.03 m standard door header so closed/
+            # open doors don't fill the gap.  ANDing it with the density
+            # mask kills tall furniture (bookcases / shelving units) that
+            # the density score alone misclassifies as walls.
+            if params.use_ceiling_band:
+                try:
+                    _emit(
+                        job_id, "slice",
+                        f"Slicing ceiling band ({params.ceiling_band_lo_m:.2f}–"
+                        f"{params.ceiling_band_hi_m:.2f} m above floor)…",
+                        0.36,
+                    )
+                    ceiling_params = ceiling_band_mod.CeilingBandParams(
+                        z_lo_m=params.ceiling_band_lo_m,
+                        z_hi_m=params.ceiling_band_hi_m,
+                        resolution_m_per_px=params.resolution_m_per_px,
+                    )
+                    ceiling_slice = ceiling_band_mod.slice_ceiling_band(
+                        pcd,
+                        floor_z=floor_z,
+                        axis_idx=axis_idx,
+                        params=ceiling_params,
+                        target_affine=slice_result.affine,
+                    )
+                    ceiling_band_points = int(ceiling_slice.n_points_in_slab)
+
+                    # AND the two masks.  If the ceiling band is too sparse
+                    # the helper returns the density mask unchanged so we
+                    # don't silently emit an empty wall raster.
+                    pre_and = int((slice_result.image > 0).sum())
+                    gated = ceiling_band_mod.gate_with_ceiling(
+                        slice_result.image, ceiling_slice.image,
+                    )
+                    post_and = int((gated > 0).sum())
+                    wall_mask_pixels_after_gate = post_and
+                    slice_result = slicer.SliceResult(
+                        image=gated,
+                        affine=slice_result.affine,
+                        elevation_m=slice_result.elevation_m,
+                        slab_thickness_m=slice_result.slab_thickness_m,
+                        axis_idx=slice_result.axis_idx,
+                        n_points_in_slab=slice_result.n_points_in_slab,
+                        elevations_used=(
+                            list(slice_result.elevations_used or [])
+                            + list(ceiling_slice.elevations_used or [])
+                        ),
+                    )
+                    # Persist the ceiling-band raster so the editor / debug
+                    # tooling can compare it side-by-side with the density.
+                    cv2.imwrite(
+                        str(artifact_dir / "slice_ceiling.png"),
+                        cv2.flip(ceiling_slice.image, 0),
+                    )
+
+                    if post_and == pre_and:
+                        # Helper fell back — surface that explicitly.
+                        _emit(
+                            job_id, "slice",
+                            f"Ceiling band sparse ({ceiling_band_points:,} pts) "
+                            f"— gating skipped, density mask kept",
+                            0.40,
+                        )
+                    else:
+                        kept_pct = 100.0 * post_and / max(1, pre_and)
+                        _emit(
+                            job_id, "slice",
+                            f"Ceiling gate: {pre_and:,} → {post_and:,} wall px "
+                            f"({kept_pct:.1f}% kept; {ceiling_band_points:,} band pts)",
+                            0.40,
+                        )
+                except Exception as cb_err:
+                    _emit(
+                        job_id, "slice",
+                        f"Ceiling-band slice skipped: {cb_err}",
+                        0.40,
+                    )
         elif params.multi_elevation:
             # ±0.4 m brackets the centre slice — catches walls hidden by tall
             # furniture or doorway headers without straying into ceiling.
@@ -292,8 +418,11 @@ def run_vectorize(
                 resolution_m_per_px=params.resolution_m_per_px,
                 axis_idx=axis_idx,
             )
-        # Free the point cloud — slicer is the last consumer.
-        del pcd
+        # v4 Phase A: post-voxel-downsample, the cloud is small enough (~3 M
+        # points) that keeping it around for openings detection is cheap
+        # (~40 MB).  Previously we freed it here and reloaded the entire
+        # raw 680 MB file from disk for the door re-slice, adding ~30 s of
+        # I/O.  We now keep `pcd` alive until after openings detection runs.
 
         slicer.save_slice(slice_result, artifact_dir, basename="slice")
         elev_summary = (
@@ -323,52 +452,138 @@ def run_vectorize(
         cleaned_display = cv2.flip(cleaned, 0)
         cv2.imwrite(str(artifact_dir / "slice_cleaned.png"), cleaned_display)
 
-        # ── 5. Detect line segments ──────────────────────────────────────
-        _emit(job_id, "detect", f"Detecting lines (detector={params.detector.value})…", 0.55)
+        # ── 5. Detect wall geometry ──────────────────────────────────────
+        # Two paths:
+        #   (a) v4 contour-based extraction (default — Cloud2BIM 2025) →
+        #       walls come out as continuous polylines.  Eliminates the
+        #       "688 raw segments → 97 final" regularizer attrition that
+        #       § 13 of ACCURACY_TO_CAD_QUALITY_PLAN.md identified as the
+        #       single biggest source of dropped walls.
+        #   (b) Legacy Hough/FLD line detector (kept behind feature flag for
+        #       A/B and as a fallback for buildings where contour topology
+        #       breaks — large open spaces with very few walls).
+        contour_walls_detected = 0
+        seg_px = np.zeros((0, 4), dtype=np.int32)
 
-        min_len_px = max(
-            3, int(round(params.min_wall_length_m / params.resolution_m_per_px))
-        )
-        hough_params = classical.HoughParams(min_line_length_px=min_len_px)
-        fld_params = classical.FldParams(length_threshold=min_len_px)
+        if params.use_contour_walls:
+            _emit(
+                job_id, "detect",
+                f"Extracting wall contours (eps={params.contour_simplify_eps_m * 100:.1f} cm)…",
+                0.55,
+            )
+            try:
+                contour_params = walls_contour_mod.WallContourParams(
+                    simplify_eps_m=params.contour_simplify_eps_m,
+                    min_perimeter_m=max(params.min_wall_length_m * 2, 0.30),
+                    min_segment_length_m=max(params.min_wall_length_m * 0.20, 0.08),
+                )
+                contour_result = walls_contour_mod.extract_wall_contours(
+                    cleaned, slice_result.affine, params=contour_params,
+                )
+                clean_segments = contour_result.flat_segments
+                segments_detected = int(contour_result.n_segments_total)
+                contour_walls_detected = int(contour_result.n_contours_kept)
+                _emit(
+                    job_id, "detect",
+                    walls_contour_mod.contour_summary(contour_result),
+                    0.65,
+                )
+                # Contour path has no "rejected" segments — every segment
+                # belongs to a kept contour by construction.  The downstream
+                # ghost-promotion code still expects a list, so we hand it
+                # an empty one rather than skipping the contract.
+                rejected_segments = []
+            except Exception as cw_err:
+                _emit(
+                    job_id, "detect",
+                    f"Contour walls failed ({cw_err}) — falling back to "
+                    f"line detector",
+                    0.58,
+                )
+                # Fall through to the legacy detector path so the run can
+                # still produce *something*.  In practice this never fires
+                # on real scans; it's a defence-in-depth path for malformed
+                # masks.
+                params_use_contour = False
+            else:
+                params_use_contour = True
+        else:
+            params_use_contour = False
 
-        if params.detector.value == "hough":
-            seg_px = classical.detect_hough(cleaned, hough_params)
-        elif params.detector.value == "fld":
-            seg_px = classical.detect_fld(cleaned, fld_params)
-            if len(seg_px) == 0:
-                # ximgproc missing or FLD found nothing — fall back to Hough.
-                _emit(job_id, "detect",
-                      "FLD returned no segments — falling back to Hough", 0.58)
+        if not params_use_contour:
+            _emit(
+                job_id, "detect",
+                f"Detecting lines (detector={params.detector.value})…",
+                0.55,
+            )
+            min_len_px = max(
+                3, int(round(params.min_wall_length_m / params.resolution_m_per_px))
+            )
+            hough_params = classical.HoughParams(min_line_length_px=min_len_px)
+            fld_params = classical.FldParams(length_threshold=min_len_px)
+
+            if params.detector.value == "hough":
                 seg_px = classical.detect_hough(cleaned, hough_params)
-        else:  # "both"
-            seg_px = classical.merge_detectors(
-                classical.detect_hough(cleaned, hough_params),
-                classical.detect_fld(cleaned, fld_params),
+            elif params.detector.value == "fld":
+                seg_px = classical.detect_fld(cleaned, fld_params)
+                if len(seg_px) == 0:
+                    _emit(job_id, "detect",
+                          "FLD returned no segments — falling back to Hough", 0.58)
+                    seg_px = classical.detect_hough(cleaned, hough_params)
+            else:  # "both"
+                seg_px = classical.merge_detectors(
+                    classical.detect_hough(cleaned, hough_params),
+                    classical.detect_fld(cleaned, fld_params),
+                )
+            segments_detected = int(len(seg_px))
+            _emit(job_id, "detect", f"Detected {segments_detected} raw segments", 0.65)
+
+            # ── 6. Pixel → world, then regularize ───────────────────────
+            _emit(job_id, "regularize", "Snapping + merging segments…", 0.72)
+            segments_world = classical.segments_pixels_to_world(seg_px, slice_result.affine)
+            reg_params = regularize.RegularizeParams(
+                drop_short_below_m=params.min_wall_length_m,
+                manhattan_snap=params.manhattan_snap,
+                merge_collinear=params.merge_collinear,
+            )
+            reg_result = regularize.regularize_with_provenance(segments_world, reg_params)
+            clean_segments = reg_result.kept
+            rejected_segments = reg_result.rejected
+            _emit(
+                job_id, "regularize",
+                f"{int(len(clean_segments))} clean segments (from {segments_detected}, "
+                f"{len(rejected_segments)} rescuable ghost candidates)",
+                0.80,
             )
 
-        segments_detected = int(len(seg_px))
-        _emit(job_id, "detect", f"Detected {segments_detected} raw segments", 0.65)
-
-        # ── 6. Pixel → world, then regularize ───────────────────────────
-        _emit(job_id, "regularize", "Snapping + merging segments…", 0.72)
-        segments_world = classical.segments_pixels_to_world(seg_px, slice_result.affine)
-
-        reg_params = regularize.RegularizeParams(
-            drop_short_below_m=params.min_wall_length_m,
-            manhattan_snap=params.manhattan_snap,
-            merge_collinear=params.merge_collinear,
-        )
-        reg_result = regularize.regularize_with_provenance(segments_world, reg_params)
-        clean_segments = reg_result.kept
-        rejected_segments = reg_result.rejected
         segments_after = int(len(clean_segments))
-        _emit(
-            job_id, "regularize",
-            f"{segments_after} clean segments (from {segments_detected}, "
-            f"{len(rejected_segments)} rescuable ghost candidates)",
-            0.80,
-        )
+
+        # ── 6a. Clip walls to envelope (OPT-IN) ──────────────────────────
+        # Some walls survive contour extraction even when they're outside
+        # the building shell (window reflections, awnings, parapet
+        # edges).  Cheap fix: drop walls whose midpoint sits outside the
+        # envelope polygon + a generous buffer.
+        #
+        # DISABLED BY DEFAULT.  When the envelope is even slightly too
+        # tight (DBSCAN dropped some legitimate exterior wall points)
+        # this clips real walls and the floor plan collapses.  Enable
+        # via params.clip_walls_to_envelope on scans where you've
+        # confirmed the envelope is good and you have a parking-lot
+        # contamination problem.  Buffer of 1 m is generous — only
+        # catches truly external clutter.
+        n_clipped_out = 0
+        if (getattr(params, "clip_walls_to_envelope", False)
+                and envelope_result is not None and len(clean_segments) > 0):
+            clip_res = clip_mod.clip_walls_to_envelope(
+                clean_segments,
+                envelope_result.polygon_xy,
+                buffer_m=1.00,
+            )
+            n_clipped_out = clip_res.n_dropped
+            if n_clipped_out > 0:
+                clean_segments = clip_res.kept
+                segments_after = int(len(clean_segments))
+                _emit(job_id, "regularize", clip_res.summary(), 0.81)
 
         # ── 6b. Wall-thickness pairing → double-line entities ────────────
         # Collapse parallel detected segments 7–35 cm apart (the two faces of
@@ -399,6 +614,43 @@ def run_vectorize(
                     0.82,
                 )
 
+        # ── 6c. Junction snap + room inference ───────────────────────────
+        # Close T-junctions / L-corners that overshoot or undershoot by a
+        # few centimetres, then enumerate the planar faces of the wall
+        # graph — each interior face is a room.  This is what visually
+        # turns a "good sketch" into a CAD-ready floor plan: walls *meet*
+        # cleanly and rooms become first-class geometry the operator can
+        # label, tag, and area-tabulate.  See backend/app/vectorize/topology.py
+        topology_result: topology_mod.TopologyResult | None = None
+        room_segments = np.zeros((0, 2, 2), dtype=np.float64)
+        if params.infer_rooms and len(wall_pairing.centerline_segments) > 1:
+            try:
+                # Auto-tune snap tolerance to wall thickness (v4): too-small
+                # tolerance leaves T-junctions open; too-large fuses the two
+                # faces of one wall into a single junction.  Median wall
+                # thickness from the pairing stage is the right scale.
+                topology_params = topology_mod.TopologyParams(
+                    snap_tol_m=0.0,  # 0 → auto-tune from wall thickness
+                    snapping_distance_m=params.snapping_distance_m,
+                    wall_thickness_median_m=float(wall_pairing.median_thickness_m),
+                )
+                topology_result = topology_mod.build_topology(
+                    wall_pairing.centerline_segments,
+                    params=topology_params,
+                )
+                _emit(
+                    job_id, "regularize",
+                    topology_mod.topology_summary(topology_result),
+                    0.84,
+                )
+                room_segments = topology_mod.rooms_to_segments(topology_result.rooms)
+            except Exception as tp_err:
+                _emit(
+                    job_id, "regularize",
+                    f"Room inference skipped: {tp_err}",
+                    0.84,
+                )
+
         # ── 7. Overlay PNG ───────────────────────────────────────────────
         _emit(job_id, "overlay", "Rendering review overlay…", 0.85)
         # Re-project clean segments back to pixel space so the overlay matches
@@ -408,7 +660,12 @@ def run_vectorize(
         cv2.imwrite(str(artifact_dir / "overlay.png"), cv2.flip(overlay, 0))
 
         # Also save the raw (pre-regularize) detection overlay for comparison.
-        raw_overlay = classical.render_overlay(cleaned, seg_px, color_bgr=(0, 165, 255), thickness=1)
+        # Contour-walls path: no separate "raw" stage exists — show the same
+        # walls in orange so the operator can still A/B against the cleaned
+        # overlay visually (the orange + red won't differ when contour mode
+        # is on, which is itself a useful signal that nothing got dropped).
+        raw_px = clean_px if params.use_contour_walls else seg_px
+        raw_overlay = classical.render_overlay(cleaned, raw_px, color_bgr=(0, 165, 255), thickness=1)
         cv2.imwrite(str(artifact_dir / "overlay_raw.png"), cv2.flip(raw_overlay, 0))
 
         # ── 7b. Coverage diagnostic ──────────────────────────────────────
@@ -432,71 +689,82 @@ def run_vectorize(
         )
 
         # ── 7c. Opening (door / wall-gap) detection ──────────────────────
-        # Why we re-slice above the door header (Phase 5 "E" recall-lift):
-        # The wall raster (single- or multi-elevation) sees *closed* door slabs
-        # as walls — they fill the raster at shoulder height.  Opening detection
-        # needs a slice ABOVE the door so the slab is gone and only the gap
-        # remains.  Standard interior doors top out at 2.03 m, so we slice at
-        # ``floor + 2.20 m`` (== elevation + 0.60 m for the shoulder default).
-        # We re-use the same slab thickness + axis as the main slice.  Cost:
-        # ~3–6 s on a typical scan; only paid when ``detect_openings`` is on.
+        # v4 (Cloud2BIM-style) simplification:
+        # The wall raster IS already the right surface for opening detection
+        # when we use the ceiling-band gate.  The ceiling-band slice sits at
+        # 1.9-2.3 m above the floor — that's ABOVE the standard 2.03 m door
+        # header, so closed-door slabs have already disappeared and only the
+        # gap remains.  The AND with the density mask doesn't re-fill the
+        # gap because the density slicer also returns "no support" where the
+        # door slab is.
+        #
+        # Therefore: detect openings on the SAME `cleaned` raster the wall
+        # extractor used.  This removes:
+        #   - The 30-second reload of the raw 680 MB scan (we no longer
+        #     `del pcd`, so this isn't needed even as a fallback).
+        #   - The duplicate slice + preprocess step (3-6 s saved).
+        #   - The elevation-misalignment failure mode (the old re-slice at
+        #     `elevation + 0.60` could land below or above doors depending
+        #     on the operator's chosen `elevation` knob).
+        # Net: openings work on more scans, AND ~40 s faster.
         opening_segs: list[np.ndarray] = []
-        opening_raster_label = "shoulder (closed doors fill the gap)"
-        if params.detect_openings and len(clean_segments) > 0:
-            _emit(job_id, "openings", "Slicing above door header for opening detection…", 0.905)
-            door_elevation = elevation + 0.60
-            from ..pipeline.ingest import load_point_cloud  # heavy, local import
-            # We already freed ``pcd`` after the main slice — reload it.  Only
-            # this branch pays the I/O cost, and only when detect_openings is on.
-            pcd_for_doors = load_point_cloud(scan_path)
+        # v4 bug fix: the opening detector samples perpendicular to each
+        # wall.  If we pass it the CONTOUR FACE segments (which sit on
+        # either face of a real wall), the perpendicular band from the
+        # outer face hits the inner face of the same wall and reports
+        # "supported" — masking every door.  Pass the CENTERLINES from
+        # the pairing stage instead; perpendicular sampling from there
+        # sees no wall at a door from either side, so the gap is
+        # detected.  Falls back to clean_segments only if pairing
+        # produced zero centerlines (rare, debug-only).
+        walls_for_openings = (
+            wall_pairing.centerline_segments
+            if (wall_pairing is not None and
+                len(wall_pairing.centerline_segments) > 0)
+            else clean_segments
+        )
+        if params.detect_openings and len(walls_for_openings) > 0:
+            _emit(
+                job_id, "openings",
+                "Scanning walls for door-shaped gaps on ceiling-gated raster…",
+                0.91,
+            )
             try:
-                door_slice = slicer.slice_to_raster(
-                    pcd_for_doors,
-                    elevation_m=door_elevation,
-                    slab_thickness_m=params.slab_thickness_m,
-                    resolution_m_per_px=params.resolution_m_per_px,
-                    axis_idx=axis_idx,
+                # Increase perpendicular band to half of typical wall
+                # thickness — this way the sampler sees both faces of
+                # the wall, but at a door it sees NEITHER and correctly
+                # registers the gap.
+                op_params = openings_mod.OpeningParams(
+                    perpendicular_band_m=max(
+                        0.08,
+                        float(wall_pairing.median_thickness_m) * 0.6,
+                    ),
                 )
-            finally:
-                del pcd_for_doors
+                detected = openings_mod.detect_openings(
+                    cleaned, walls_for_openings, slice_result.affine,
+                    params=op_params,
+                )
+            except Exception as op_err:
+                _emit(
+                    job_id, "openings",
+                    f"Opening detection failed: {op_err}", 0.92,
+                )
+                detected = []
 
-            # Same preprocessing as the wall raster so the perpendicular-band
-            # support test sees a comparable signal (closed CLOSE + optional OPEN).
-            door_cleaned = preprocess.preprocess(door_slice.image, preprocess_params)
-
-            # The door slice is sliced fresh, so its affine is *almost* identical
-            # to the main affine but may differ slightly in canvas extent (the
-            # high slice has different point coverage).  We need an affine that
-            # the openings sampler can use to index ``door_cleaned`` correctly —
-            # use ``door_slice.affine``, which matches its own raster.
-            opening_raster_label = (
-                f"high slice @ {door_elevation:.2f} m "
-                f"({door_slice.affine.width_px}×{door_slice.affine.height_px} px)"
-            )
-
-            _emit(job_id, "openings", "Scanning walls for door-shaped gaps…", 0.91)
-            detected = openings_mod.detect_openings(
-                door_cleaned, clean_segments, door_slice.affine,
-            )
             opening_segs = [d.seg for d in detected]
             _emit(
                 job_id, "openings",
-                f"Detected {len(opening_segs)} opening{'s' if len(opening_segs) != 1 else ''} "
-                f"from {opening_raster_label}",
+                f"Detected {len(opening_segs)} opening"
+                f"{'s' if len(opening_segs) != 1 else ''}",
                 0.92,
             )
             if opening_segs:
-                # Visual sanity-check overlay — walls red, openings yellow,
-                # over the door-header slice the detector actually used.
-                walls_px = _segments_world_to_pixels(clean_segments, door_slice.affine)
+                walls_px = _segments_world_to_pixels(walls_for_openings, slice_result.affine)
                 opens_px = _segments_world_to_pixels(
-                    np.array(opening_segs), door_slice.affine,
+                    np.array(opening_segs), slice_result.affine,
                 )
-                ovl = openings_mod.render_openings_overlay(door_cleaned, walls_px, opens_px)
+                ovl = openings_mod.render_openings_overlay(cleaned, walls_px, opens_px)
                 cv2.imwrite(str(artifact_dir / "overlay_openings.png"), cv2.flip(ovl, 0))
-                # Also persist the door slice raster itself so the editor can
-                # show it as an alternate backdrop (operator can verify the gaps).
-                cv2.imwrite(str(artifact_dir / "slice_doors.png"), cv2.flip(door_cleaned, 0))
 
         openings_array = (
             np.array(opening_segs, dtype=np.float64)
@@ -527,7 +795,20 @@ def run_vectorize(
                 )
                 cv2.imwrite(str(artifact_dir / "overlay_columns.png"), cv2.flip(ovl, 0))
 
-        columns_array = columns_mod.columns_to_segments(column_objs)
+        # v4: split round vs rectangular columns.  Rectangular ones still go
+        # via the segments array (4 polyline edges); round ones go as DXF
+        # CIRCLE entities via the new ``circles_by_class`` parameter to
+        # write_dxf.  This matches what commercial CAD drawings do.
+        rect_columns = [c for c in column_objs if not c.is_round]
+        round_columns = [c for c in column_objs if c.is_round]
+        columns_array = columns_mod.columns_to_segments(rect_columns)
+        column_circles: list[tuple[tuple[float, float], float]] = []
+        for c in round_columns:
+            # Diameter = mean(long, short) of the min-area rect; the round
+            # classifier already ensured aspect ≤ 1.2 so the rect is nearly
+            # square — mean is the correct radius estimate.
+            radius = float(0.5 * 0.5 * (c.size_m[0] + c.size_m[1]))
+            column_circles.append((c.centre_m, radius))
 
         # ── 7e. Per-layer coverage diagnostic ────────────────────────────
         # ``coverage_by_layer`` is the operator's "did we miss anything?"
@@ -566,11 +847,15 @@ def run_vectorize(
                 "walls_exterior": envelope_segments_world,
                 "walls":          wall_pairing.centerline_segments,
                 "walls_faces":    wall_pairing.face_segments,
+                "rooms":          room_segments,
                 "openings":       openings_array,
                 "columns":        columns_array,
             },
             dxf_path,
             annotation_text=annotation,
+            circles_by_class=(
+                {"columns": column_circles} if column_circles else None
+            ),
         )
 
         # Persist segments as JSON with stable IDs so the editor (Phase 3) has
@@ -620,6 +905,16 @@ def run_vectorize(
             ] + [
                 {
                     "id": uuid.uuid4().hex[:12],
+                    "layer": "rooms",
+                    "x1": float(seg[0, 0]),
+                    "y1": float(seg[0, 1]),
+                    "x2": float(seg[1, 0]),
+                    "y2": float(seg[1, 1]),
+                }
+                for seg in room_segments
+            ] + [
+                {
+                    "id": uuid.uuid4().hex[:12],
                     "layer": "openings",
                     "x1": float(seg[0, 0]),
                     "y1": float(seg[0, 1]),
@@ -640,6 +935,54 @@ def run_vectorize(
             ],
         }
         (result_dir / "segments.json").write_text(json.dumps(segments_payload, indent=2))
+
+        # v4: also persist per-layer JSON files alongside the combined
+        # segments.json.  The editor can keep reading segments.json (no
+        # frontend changes required), but future code can lazy-load only
+        # the layers it needs — useful for very large floor plans where
+        # rooms + walls alone are MBs of polylines.  The per-layer files
+        # use the same item shape as segments.json's `segments` list, so
+        # a JSON reader can be reused.
+        per_layer_payload = {
+            "version": 1,
+            "units": "metres",
+            "affine": slice_result.affine.to_json(),
+            "raster": {
+                "width_px": int(slice_result.affine.width_px),
+                "height_px": int(slice_result.affine.height_px),
+                "y_flipped_for_display": True,
+            },
+        }
+        layer_buckets: dict[str, list[dict]] = {}
+        for entry in segments_payload["segments"]:
+            layer_buckets.setdefault(entry["layer"], []).append(entry)
+        for layer_name, entries in layer_buckets.items():
+            payload = dict(per_layer_payload)
+            payload["layer"] = layer_name
+            payload["segments"] = entries
+            (result_dir / f"segments_{layer_name}.json").write_text(
+                json.dumps(payload, indent=2)
+            )
+        # v4 round columns — separate file because the data shape (centre +
+        # radius) doesn't fit the segments schema.
+        if column_circles:
+            circles_payload = {
+                "version": 1,
+                "units": "metres",
+                "layer": "columns_circles",
+                "circles": [
+                    {
+                        "id": uuid.uuid4().hex[:12],
+                        "cx": float(cx),
+                        "cy": float(cy),
+                        "r": float(r),
+                    }
+                    for (cx, cy), r in column_circles
+                ],
+            }
+            (result_dir / "segments_columns_circles.json").write_text(
+                json.dumps(circles_payload, indent=2)
+            )
 
         # Persist the rejected ghost candidates separately so the editor can
         # render them on demand without bloating the primary segments.json.
@@ -693,6 +1036,33 @@ def run_vectorize(
             walls_paired=int(wall_pairing.n_paired),
             walls_unpaired=int(wall_pairing.n_unpaired),
             walls_median_thickness_m=float(wall_pairing.median_thickness_m),
+            rooms_detected=(
+                len(topology_result.rooms) if topology_result is not None else 0
+            ),
+            junctions_merged=(
+                int(topology_result.n_endpoints_merged)
+                if topology_result is not None else 0
+            ),
+            t_junctions_extended=(
+                int(topology_result.n_extended)
+                if topology_result is not None else 0
+            ),
+            # v4 Phase A stats — voxel downsample + ceiling-band gate.
+            points_after_downsample=points_after_downsample,
+            downsample_voxel_m=(
+                float(downsample_result.voxel_m)
+                if downsample_result is not None else None
+            ),
+            ceiling_band_used=bool(params.use_ceiling_band and params.use_density_slicer),
+            ceiling_band_n_points=(
+                int(ceiling_band_points) if ceiling_band_points else None
+            ),
+            wall_mask_pixels=(
+                int(wall_mask_pixels_after_gate) if wall_mask_pixels_after_gate else None
+            ),
+            contour_walls_detected=(
+                int(contour_walls_detected) if contour_walls_detected else None
+            ),
         )
 
         artifacts = {
@@ -708,6 +1078,13 @@ def run_vectorize(
             artifacts["overlay_openings_png"] = str(artifact_dir / "overlay_openings.png")
         if column_objs:
             artifacts["overlay_columns_png"] = str(artifact_dir / "overlay_columns.png")
+        # v4 Phase A: ceiling-band slice (when use_ceiling_band is on).
+        ceiling_png = artifact_dir / "slice_ceiling.png"
+        if ceiling_png.exists():
+            artifacts["slice_ceiling_png"] = str(ceiling_png)
+        density_png = artifact_dir / "slice_density.png"
+        if density_png.exists():
+            artifacts["slice_density_png"] = str(density_png)
 
         result_payload = {
             "metrics": metrics.model_dump(),

@@ -66,9 +66,43 @@ class EnvelopeParams:
     simplify_tolerance_m: float = 0.10  # 10 cm — drops noise notches, keeps corners
     manhattan_snap_tolerance_deg: float = 8.0  # snap envelope edges to dominant axes
     manhattan_snap_enable: bool = True
-    # alpha parameter is auto-tuned by binary search; this is the starting value
-    # in 1/metres units.  Larger alpha → tighter hull.  We sweep from ~0.1 to ~5.
-    alpha_search_lo: float = 0.10
+    # Statistical outlier filter on the floor-slab points BEFORE the alpha-
+    # shape.  Stray scanner returns (glass reflections, multipath echoes,
+    # points on neighbouring structures) appear as isolated points far
+    # from the main cluster.  Including them in the alpha-shape forces
+    # the envelope to enclose huge empty regions to "reach" them.  We
+    # drop any point whose mean distance to its ``outlier_nb_neighbors``
+    # neighbours is more than ``outlier_std_ratio`` standard deviations
+    # above the global mean.  Classic Open3D statistical outlier removal.
+    outlier_filter_enable: bool = True
+    outlier_nb_neighbors: int = 20
+    outlier_std_ratio: float = 1.5      # tighter than default (2.0) — favours a clean hull
+    # DBSCAN pre-cluster (v4 Cloud2BIM-inspired addition).  After the
+    # statistical outlier filter, run density-based clustering and keep
+    # ONLY points in the largest connected cluster.  This is the
+    # surgical fix for "the envelope balloons across the parking lot to
+    # capture window reflections" — those reflections form their own
+    # spatial cluster that isn't a statistical outlier within itself
+    # (statistical outlier removal only catches isolated lone points).
+    # ``dbscan_eps_m`` is the cluster joining distance — 0.50 m covers
+    # any wall-to-wall gap (doorways, openings) without bridging across
+    # an entire room.  Below 0.30 m and dim corners get fragmented;
+    # above 1.5 m and adjacent buildings get merged.
+    dbscan_cluster_enable: bool = True
+    dbscan_eps_m: float = 0.50
+    dbscan_min_samples: int = 25
+    # When the largest cluster has fewer than this many points it's
+    # probably too sparse to be a building — fall back to all points.
+    dbscan_min_cluster_points: int = 2000
+    # OPT-IN despike: drop polygon vertices that stick out more than this
+    # distance from the line between their two neighbours.  Disabled by
+    # default (0) because on real scans it removes legitimate corners.
+    # Set to e.g. 0.80 m for very noisy scans where saw-tooth artefacts
+    # dominate.
+    despike_threshold_m: float = 0.0
+    # alpha parameter is auto-tuned by sweep; we pick the tightest valid hull.
+    # Larger alpha → tighter hull.  Range is in 1/metres units.
+    alpha_search_lo: float = 0.50       # was 0.10; below this the hull is essentially convex
     alpha_search_hi: float = 5.00
     alpha_search_steps: int = 12
     # When the hull is suspiciously small (< 5 m² interior) we bail — usually
@@ -163,8 +197,47 @@ def extract_envelope(
     if params.voxel_downsample_m > 0 and n_in_band > 50_000:
         band_xy = _grid_downsample_2d(band_xy, params.voxel_downsample_m)
 
-    # Alpha-shape with auto-tuning.  We sweep alpha from lo→hi and pick the
-    # largest single polygon whose interior area is above the min threshold.
+    # Drop sparse outliers BEFORE the alpha-shape.  This is the fix for the
+    # "envelope balloons out to capture stray points" pathology — a single
+    # multipath echo 20 m outside the building used to pull the envelope to
+    # it.  Statistical outlier removal flags any point whose neighbourhood
+    # density is significantly below the cluster mean.
+    n_before_outlier = len(band_xy)
+    if params.outlier_filter_enable and n_before_outlier >= params.outlier_nb_neighbors + 1:
+        band_xy = _drop_far_outliers(
+            band_xy,
+            nb_neighbors=params.outlier_nb_neighbors,
+            std_ratio=params.outlier_std_ratio,
+        )
+    n_after_outlier = len(band_xy)
+    if n_after_outlier < 500:
+        raise ValueError(
+            f"envelope: only {n_after_outlier} points remain after outlier "
+            f"filter (started with {n_before_outlier}); cloud too sparse"
+        )
+
+    # DBSCAN: keep only the largest spatial cluster.  Surgically eliminates
+    # window-reflection blobs and outdoor furniture clusters that survive
+    # the statistical outlier filter (those blobs are dense enough among
+    # themselves to evade stat-outlier, but they're a distinct cluster from
+    # the building proper, so DBSCAN separates them cleanly).
+    n_before_dbscan = len(band_xy)
+    if params.dbscan_cluster_enable and n_before_dbscan >= params.dbscan_min_cluster_points:
+        band_xy = _keep_largest_dbscan_cluster(
+            band_xy,
+            eps_m=params.dbscan_eps_m,
+            min_samples=params.dbscan_min_samples,
+            min_cluster_points=params.dbscan_min_cluster_points,
+        )
+    n_after_dbscan = len(band_xy)
+    if n_after_dbscan < 500:
+        raise ValueError(
+            f"envelope: only {n_after_dbscan} points remain after DBSCAN "
+            f"(started with {n_before_dbscan}); cloud too fragmented"
+        )
+
+    # Alpha-shape with auto-tuning.  We sweep alpha from tight → loose and
+    # accept the tightest valid hull (single Polygon, area ≥ min threshold).
     poly, alpha_used = _alpha_shape_auto(band_xy, params)
     if poly is None:
         raise ValueError(
@@ -178,6 +251,13 @@ def extract_envelope(
 
     # Manhattan-align the envelope edges if requested.
     ring_xy = _polygon_outer_ring(poly_simplified)
+
+    # v4 despike: drop polygon vertices that stick out more than
+    # ``despike_threshold_m`` from the line between their two neighbours.
+    # Iterates until no vertex qualifies (typically 2-4 passes).
+    if params.despike_threshold_m > 0:
+        ring_xy = _despike_ring(ring_xy, params.despike_threshold_m)
+
     if params.manhattan_snap_enable:
         ring_xy = _manhattan_snap_ring(
             ring_xy, tolerance_deg=params.manhattan_snap_tolerance_deg,
@@ -226,6 +306,86 @@ def save_envelope(result: EnvelopeResult, out_path: Path) -> Path:
 
 # ── Internals ────────────────────────────────────────────────────────────────
 
+def _drop_far_outliers(
+    xy: np.ndarray,
+    nb_neighbors: int = 20,
+    std_ratio: float = 1.5,
+) -> np.ndarray:
+    """Drop sparse outlier points using statistical outlier removal.
+
+    For each point we compute the mean distance to its ``nb_neighbors`` nearest
+    neighbours, then drop any point whose mean k-NN distance is more than
+    ``std_ratio`` standard deviations above the global mean.  This nukes the
+    isolated multipath echoes / glass reflections that otherwise force the
+    alpha-shape envelope to balloon out across empty space to capture them.
+
+    Implemented via Open3D's :py:meth:`PointCloud.remove_statistical_outlier`
+    (we already depend on Open3D for ingest, so no new dependency).  Operates
+    on a temporary 3-D cloud with z=0 so the 2-D KNN reduces correctly.
+    """
+    if len(xy) <= nb_neighbors:
+        return xy
+    pcd_tmp = o3d.geometry.PointCloud()
+    pcd_tmp.points = o3d.utility.Vector3dVector(
+        np.hstack([xy.astype(np.float64), np.zeros((len(xy), 1))])
+    )
+    clean, _ = pcd_tmp.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors, std_ratio=std_ratio,
+    )
+    return np.asarray(clean.points)[:, :2]
+
+
+def _keep_largest_dbscan_cluster(
+    xy: np.ndarray,
+    eps_m: float,
+    min_samples: int,
+    min_cluster_points: int,
+) -> np.ndarray:
+    """Run DBSCAN and return only the points in the largest cluster.
+
+    Uses scikit-learn's ``DBSCAN`` (already a dependency).  The largest
+    cluster is the one with the most member points; for envelope extraction
+    this is essentially always the building.  If the largest cluster has
+    fewer than ``min_cluster_points`` members we treat the whole space as
+    too fragmented and return the input unchanged — the caller will then
+    try the alpha-shape against everything, which is no worse than not
+    having clustered at all.
+
+    Why DBSCAN here and not k-means / GMM:
+      - We don't know K (the number of clusters) — there are typically
+        1 (just the building) up to ~5 (building + window blobs +
+        neighbouring structure) on a complex scan.
+      - We want noise points (sparse-but-not-quite-outlier) excluded from
+        the kept set, not absorbed into the nearest cluster.  DBSCAN's
+        explicit "noise" label does this; k-means doesn't.
+
+    Performance: sklearn's DBSCAN with the default ball-tree backend is
+    O(N log N) and runs in ~1 s on 100 k points.  We downsample to 3 cm
+    above this step, so the input is typically 20-50 k points.
+    """
+    if len(xy) == 0:
+        return xy
+    try:
+        from sklearn.cluster import DBSCAN
+    except Exception:
+        # scikit-learn missing — fall back to no clustering.
+        return xy
+    db = DBSCAN(eps=float(eps_m), min_samples=int(min_samples)).fit(xy)
+    labels = db.labels_
+    valid = labels >= 0
+    if not valid.any():
+        return xy
+    label_counts: dict[int, int] = {}
+    for lbl in labels[valid]:
+        label_counts[int(lbl)] = label_counts.get(int(lbl), 0) + 1
+    if not label_counts:
+        return xy
+    best_label = max(label_counts.items(), key=lambda kv: kv[1])
+    if best_label[1] < min_cluster_points:
+        return xy
+    return xy[labels == best_label[0]]
+
+
 def _grid_downsample_2d(pts: np.ndarray, cell: float) -> np.ndarray:
     """Voxel-grid downsample a 2-D point set.
 
@@ -241,15 +401,18 @@ def _grid_downsample_2d(pts: np.ndarray, cell: float) -> np.ndarray:
 
 
 def _alpha_shape_auto(pts: np.ndarray, params: EnvelopeParams):
-    """Try a range of alpha values, pick the best.
+    """Try a range of alpha values, pick the *tightest* valid hull.
 
-    "Best" = largest single-polygon hull whose interior area exceeds
-    ``params.min_polygon_area_m2``.  Returns ``(poly_or_None, alpha_used)``.
+    Sweeps alpha from tight (high) to loose (low) and accepts the first
+    alpha that produces a single ``Polygon`` whose interior area is above
+    ``params.min_polygon_area_m2``.  Tight hulls hug the point cloud; the
+    looser the hull, the more empty space it encloses.  Always preferring
+    the tightest valid hull keeps the envelope from over-extending.
 
     The alphashape library can return either a single Polygon, a MultiPolygon
-    (if alpha is too tight and the cloud has gaps), or a LineString/Point
-    (if alpha is way too tight).  We treat anything but a single Polygon
-    as a hint to try a smaller alpha.
+    (alpha is too tight relative to cloud gaps), or a LineString / Point
+    (alpha is much too tight).  Anything but a single Polygon means we
+    need to relax — try the next smaller alpha.
     """
     from shapely.geometry import Polygon, MultiPolygon
     import alphashape as alpha_mod
@@ -260,38 +423,84 @@ def _alpha_shape_auto(pts: np.ndarray, params: EnvelopeParams):
     alphas = np.linspace(
         params.alpha_search_lo, params.alpha_search_hi, params.alpha_search_steps,
     )
-    # Iterate from tight (high alpha) to loose (low alpha).  At the tight end
-    # we get the most detailed hull; if it's invalid we relax until we get
-    # a usable single polygon.
-    best_poly = None
-    best_alpha = 0.0
-    best_area = 0.0
+    # First pass: find the tightest alpha that yields a single connected
+    # Polygon above the minimum area threshold.  A MultiPolygon at this
+    # alpha is the diagnostic "alpha too tight, try a smaller one" — we
+    # do NOT squash to the largest piece because that can leave most of
+    # the building outside the envelope.
     for a in alphas[::-1]:
         try:
             shp = alpha_mod.alphashape(pts.tolist(), float(a))
         except Exception:
             continue
-        if isinstance(shp, Polygon):
-            area = float(shp.area)
-            if area >= params.min_polygon_area_m2 and area > best_area:
-                best_poly = shp
-                best_alpha = float(a)
-                best_area = area
-                # Found a valid tight hull — keep going one more step in
-                # case we get something slightly better, but bail out
-                # quickly to avoid redundant work.
-                break
-        elif isinstance(shp, MultiPolygon):
-            # Pick the largest sub-polygon; if it's big enough, use it.
-            big = max(shp.geoms, key=lambda g: g.area)
-            area = float(big.area)
-            if area >= params.min_polygon_area_m2 and area > best_area:
-                best_poly = big
-                best_alpha = float(a)
-                best_area = area
-                break
+        if isinstance(shp, Polygon) and float(shp.area) >= params.min_polygon_area_m2:
+            return shp, float(a)
 
-    return best_poly, best_alpha
+    # Fallback: no single-polygon alpha worked.  Take the largest sub-
+    # polygon of the loosest alpha — that's the building, even if the
+    # alpha-shape produced sliver islands of stray noise alongside it.
+    # (Reaching this branch usually means the cloud has internal voids
+    # — e.g. a courtyard or atrium — that the alpha sweep can't span.)
+    for a in alphas:
+        try:
+            shp = alpha_mod.alphashape(pts.tolist(), float(a))
+        except Exception:
+            continue
+        if isinstance(shp, MultiPolygon):
+            biggest = max(shp.geoms, key=lambda g: g.area)
+            if float(biggest.area) >= params.min_polygon_area_m2:
+                return biggest, float(a)
+        elif isinstance(shp, Polygon) and float(shp.area) >= params.min_polygon_area_m2:
+            return shp, float(a)
+
+    return None, 0.0
+
+
+def _despike_ring(ring: np.ndarray, threshold_m: float, max_passes: int = 6) -> np.ndarray:
+    """Drop polygon vertices that stick out more than ``threshold_m`` from
+    the line between their two neighbours.
+
+    Iterative: removing a spike vertex may expose a new spike on either
+    neighbour, so we re-scan until a pass makes no changes (or we hit the
+    ``max_passes`` cap).  The cap defends against pathological inputs
+    where every other vertex spikes; in practice the loop converges in
+    2-4 passes on real-scan envelopes.
+
+    The ring is assumed closed (first vertex == last); we preserve that
+    by re-closing after edits.
+    """
+    if len(ring) < 5:
+        # Too few vertices for despiking to make sense (a triangle has
+        # no "neighbours' line" — every vertex IS one of the line's ends).
+        return ring
+    closed = np.allclose(ring[0], ring[-1])
+    work = ring[:-1].copy() if closed else ring.copy()
+    for _ in range(max_passes):
+        n = len(work)
+        if n < 4:
+            break
+        keep = np.ones(n, dtype=bool)
+        for i in range(n):
+            prev_pt = work[(i - 1) % n]
+            next_pt = work[(i + 1) % n]
+            cur = work[i]
+            # Perpendicular distance from cur to line (prev_pt, next_pt).
+            edge = next_pt - prev_pt
+            L = float(np.linalg.norm(edge))
+            if L < 1e-9:
+                continue
+            cross = abs(edge[0] * (prev_pt[1] - cur[1]) -
+                         edge[1] * (prev_pt[0] - cur[0]))
+            d = cross / L
+            if d > threshold_m:
+                keep[i] = False
+        new_work = work[keep]
+        if len(new_work) == n:
+            break  # no spike removed this pass — done
+        work = new_work
+    if closed:
+        return np.vstack([work, work[0:1]])
+    return work
 
 
 def _polygon_outer_ring(poly) -> np.ndarray:

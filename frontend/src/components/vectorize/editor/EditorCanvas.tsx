@@ -571,7 +571,8 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
             const isHover = hoverId === p.seg.id;
             const style = styleForLayer(p.seg.layer ?? 'walls');
             const stroke = isSelected ? style.selectedColor : isHover ? style.hoverColor : style.color;
-            const sw = (isSelected ? 2.8 : isHover ? 2.2 : 1.8) / view.scale;
+            const weight = style.weight ?? 1.0;
+            const sw = ((isSelected ? 2.8 : isHover ? 2.2 : 1.8) * weight) / view.scale;
             const dash = style.dashArray
               ? style.dashArray
                   .split(/\s+/)

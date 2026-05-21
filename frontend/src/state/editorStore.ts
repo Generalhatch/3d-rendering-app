@@ -34,6 +34,12 @@ export interface LayerStyle {
   selectedColor: string;
   hoverColor: string;
   dashArray?: string;
+  /**
+   * Stroke-width multiplier applied to the canvas line.  Default 1.0.
+   * Walls (centerlines) use 0.6 so they don't compete visually with the
+   * thicker WALLS_FACES double-line — the eye reads structure first.
+   */
+  weight?: number;
 }
 
 /**
@@ -47,6 +53,7 @@ export const LAYER_STYLES: Record<SegmentLayer, LayerStyle> = {
     color: '#34d399',          // emerald-400 — matches DXF ACI=3 (green)
     selectedColor: '#fde047',  // yellow-300 — high-contrast selection
     hoverColor: '#67e8f9',     // cyan-300 — subtle pre-click affordance
+    weight: 0.6,               // thin: walls_faces carry the visual structure
   },
   walls_exterior: {
     label: 'Exterior shell',
@@ -56,9 +63,10 @@ export const LAYER_STYLES: Record<SegmentLayer, LayerStyle> = {
   },
   walls_faces: {
     label: 'Wall faces (double-line)',
-    color: '#94a3b8',          // slate-400 — quieter than centerlines so the eye reads structure first
+    color: '#34d399',          // emerald-400 — primary visual structure (matches CAD-style thick walls)
     selectedColor: '#fde047',
-    hoverColor: '#cbd5e1',
+    hoverColor: '#67e8f9',
+    weight: 1.1,               // slightly bolder so paired faces dominate the render
   },
   rooms: {
     label: 'Rooms',

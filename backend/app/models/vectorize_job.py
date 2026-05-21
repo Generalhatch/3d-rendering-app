@@ -168,6 +168,92 @@ class VectorizeParams(BaseModel):
                     "thickness from the paired set.  This is the visual lift "
                     "that turns the deliverable from a sketch into CAD.",
     )
+    infer_rooms: bool = Field(
+        default=True,
+        description="After wall pairing, snap nearby endpoints into shared "
+                    "junctions, extend T-junctions onto their host walls, and "
+                    "enumerate the planar faces of the wall graph.  Each "
+                    "interior face becomes a candidate room polygon, emitted "
+                    "on the ROOMS DXF layer.  Closes the gaps and antenna "
+                    "spikes left by the regularizer and turns walls + rooms "
+                    "into editable architectural geometry.",
+    )
+
+    # ── v4 (Cloud2BIM-style classical track — see ACCURACY_TO_CAD_QUALITY_PLAN.md § 0.6) ──
+
+    voxel_downsample_m: float = Field(
+        default=0.005,
+        ge=0.0, le=0.05,
+        description="Voxel-downsample the input cloud to this XYZ grid spacing "
+                    "BEFORE any other stage.  5 mm is the production default — "
+                    "preserves every wall feature ≥ 1 cm while cutting downstream "
+                    "runtime by 2-50× on large scans depending on native point "
+                    "spacing.  Set 0 to disable (debug only).",
+    )
+    voxel_downsample_auto: bool = Field(
+        default=False,
+        description="OPT-IN: when true, after the initial voxel pass, check the "
+                    "result count and re-downsample with a larger voxel if still "
+                    "above 20 M points.  Speeds up extremely dense scans but at "
+                    "the risk of thinning walls past the morphology survival "
+                    "threshold.  Off by default — use for huge scans only after "
+                    "verifying walls survive in slice_cleaned.png.",
+    )
+    use_ceiling_band: bool = Field(
+        default=True,
+        description="Add a complementary slice at 1.9–2.3 m above the floor — well "
+                    "above most furniture, still below ducts and beams.  Combined "
+                    "with the density slicer via logical AND to gate the wall mask "
+                    "(Cloud2BIM 2025 strategy).  Disable for low-ceiling spaces "
+                    "(< 2.4 m clearance) where the band may not exist.",
+    )
+    ceiling_band_lo_m: float = Field(
+        default=1.90,
+        ge=0.50, le=4.00,
+        description="Bottom of the ceiling-adjacent slice (m above floor).  Should "
+                    "clear most office furniture (cubicle tops ~1.5 m, file "
+                    "cabinets ~1.8 m).",
+    )
+    ceiling_band_hi_m: float = Field(
+        default=2.30,
+        ge=0.50, le=4.00,
+        description="Top of the ceiling-adjacent slice (m above floor).  Should "
+                    "stay below ducts, beams, and ceiling fixtures (typically "
+                    "≥ 2.5 m for commercial, ≥ 2.4 m for residential).",
+    )
+    use_contour_walls: bool = Field(
+        default=True,
+        description="Use cv2.findContours + Douglas-Peucker on the binary wall mask "
+                    "to extract walls as continuous polylines, instead of Hough/FLD "
+                    "line segments.  Eliminates the 'walls fragment into many short "
+                    "segments' failure mode (Cloud2BIM § 2.7).  Disable to fall back "
+                    "to the v3 detector path for A/B comparison.",
+    )
+    contour_simplify_eps_m: float = Field(
+        default=0.02,
+        ge=0.005, le=0.10,
+        description="Douglas-Peucker tolerance for contour-based wall polylines.  "
+                    "2 cm is the Cloud2BIM 2025 default; below it produces jagged "
+                    "polylines, above it merges corners.",
+    )
+    snapping_distance_m: float = Field(
+        default=0.30,
+        ge=0.05, le=1.50,
+        description="Cloud2BIM-style: after wall extraction, extend each wall along "
+                    "its own axis until it intersects another wall, but only if "
+                    "the gap is ≤ this distance.  Replaces v3's snap_tol_m + "
+                    "extend_tol_m pair with a single axis-aware parameter.",
+    )
+    clip_walls_to_envelope: bool = Field(
+        default=False,
+        description="OPT-IN: drop walls whose midpoint sits outside the building "
+                    "envelope + 1 m buffer.  Useful for scans with adjacent "
+                    "buildings or window reflections that produce phantom walls "
+                    "outside the building.  OFF by default — if the envelope is "
+                    "slightly too tight, this will clip legitimate walls and the "
+                    "floor plan collapses.  Only enable after confirming the "
+                    "envelope is good.",
+    )
 
 
 class VectorizeJobCreate(BaseModel):
@@ -208,6 +294,18 @@ class VectorizeMetrics(BaseModel):
     walls_paired: Optional[int] = None              # # of double-line walls
     walls_unpaired: Optional[int] = None            # # of single-face walls
     walls_median_thickness_m: Optional[float] = None
+    # MacBook MVP (A5): topology / room inference summary.
+    rooms_detected: Optional[int] = None            # # of enclosed rooms found
+    junctions_merged: Optional[int] = None          # # of endpoints collapsed
+    t_junctions_extended: Optional[int] = None      # # of T-junctions closed
+    # v4 (Cloud2BIM-style track): voxel downsample + ceiling-band slice stats.
+    points_after_downsample: Optional[int] = None   # # of points after voxel grid
+    downsample_voxel_m: Optional[float] = None      # voxel size that was applied
+    ceiling_band_used: Optional[bool] = None        # True iff use_ceiling_band on
+    ceiling_band_n_points: Optional[int] = None     # # of points in the band
+    wall_mask_pixels: Optional[int] = None          # FG pixels after density&ceiling AND
+    # v4 contour-based wall extraction: # of contours / polylines emitted.
+    contour_walls_detected: Optional[int] = None    # # of wall polylines from contours
 
 
 class VectorizeJobDetail(BaseModel):
