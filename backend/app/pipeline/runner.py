@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..geometry.classify import COMMON_CATEGORIES
 from ..limits import JOB_SEMAPHORE
 from ..models.job import JobStatus
 from ..storage import (
@@ -33,7 +34,7 @@ from .scanplan import (
     generate_rooms_from_scan, generate_building_outline,
 )
 from .fixtures import detect_fixtures
-from .confidence import compute_confidence_pct
+from .confidence import compute_confidence_pct, compute_scan_only_confidence
 from .export import write_aligned_json, write_aligned_dxf
 from .ai_review import render_overlay_png
 
@@ -75,6 +76,18 @@ def run_pipeline(
             f"· originals preserved",
             0.20,
         )
+
+        # Registration quality gates: scans that failed the ICP fitness/RMSE
+        # gates are excluded from the merged cloud and flagged here — never
+        # silently guessed into position.
+        unplaced_scan_names = [r.scan_name for r in merge_result.unplaced]
+        if unplaced_scan_names:
+            _emit(
+                job_id, "ingest",
+                f"⚠ {len(unplaced_scan_names)} scan(s) could not be reliably "
+                f"registered and are excluded: {', '.join(unplaced_scan_names)}",
+                0.205,
+            )
 
         # Emit Z-range so we can verify the coordinate frame looks sane
         _pts = np.asarray(scan_pcd.points)
@@ -204,20 +217,25 @@ def run_pipeline(
 
             plan_lines = synthetic.segments
             transformation = np.eye(4)   # identity — scan IS the plan
-            conf_pct       = 100
             residual_rmse  = 0.0
             num_wall_planes = len(wall_planes)
+            scan_plan_source = (
+                "3d_planes" if len(wall_planes) >= 4 else "2d_projection"
+            )
 
+            # confidence / confidence_pct are filled in AFTER room extraction
+            # (compute_scan_only_confidence needs the rooms) — see step 4.
             alignment_meta = {
                 "transformation": transformation.tolist(),
                 "residual_rmse": 0.0,
                 "residual_rmse_mm": 0.0,
-                "confidence": 1.0,
-                "confidence_pct": 100,
+                "confidence": None,
+                "confidence_pct": None,
                 "inlier_ratio": 1.0,
                 "rotation_candidate_used": 0,
                 "iterations": 0,
                 "num_wall_planes": int(num_wall_planes),
+                "plan_source": scan_plan_source,
                 "mode": "scan_only",
             }
 
@@ -239,6 +257,9 @@ def run_pipeline(
                         "id": r.id, "label": r.label, "category": r.category,
                         "polygon_2d": r.polygon_2d, "centroid": list(r.centroid),
                         "area_m2": float(r.area_m2), "match_quality": r.match_quality,
+                        # DXF labels are a trusted category source → full
+                        # common-area mapping (corridor, lobby, restroom).
+                        "is_common": r.category in COMMON_CATEGORIES,
                     }
                     for r in room_objs
                 ]
@@ -248,6 +269,21 @@ def run_pipeline(
             # Scan-only: reconstruct rooms from the synthetic plan
             aligned_pts = np.asarray(wall_band.points)   # already in scan frame
             rooms_raw = generate_rooms_from_scan(wall_planes, synthetic, scan_pcd=scan_pcd, floor=floor)  # type: ignore[name-defined]
+
+            # Now we have everything the scan-only confidence model needs.
+            # No plan means no ground truth — never claim 100%.
+            confidence = compute_scan_only_confidence(
+                num_wall_planes=num_wall_planes,
+                plan_source=scan_plan_source,
+                merge_strategy=merge_result.strategy,
+                rooms=rooms_raw,
+            )
+            conf_pct = compute_confidence_pct(confidence)
+            alignment_meta["confidence"] = float(confidence)
+            alignment_meta["confidence_pct"] = conf_pct
+            _emit(job_id, "rooms",
+                  f"Scan-only confidence: {conf_pct}% "
+                  f"({num_wall_planes} planes · {merge_result.strategy})", 0.70)
 
         _emit(job_id, "rooms", f"{len(rooms_raw)} rooms extracted", 0.72)
 
@@ -325,7 +361,26 @@ def run_pipeline(
             "scan_only": scan_only,
             "num_scans": num,
             "merge_strategy": merge_result.strategy,
+            # Per-scan registration outcomes (Phase 2 quality gates).  Scans
+            # with placed=False failed the ICP fitness/RMSE gate and are NOT
+            # part of the merged geometry — surfaced so the operator can
+            # re-scan or manually place them instead of trusting a guess.
+            "scan_registrations": [
+                r.to_json_dict() for r in merge_result.registrations
+            ],
+            "unplaced_scans": unplaced_scan_names,
             "rooms": rooms_raw,
+            # Phase 2: common areas as a first-class category.  Each room dict
+            # carries is_common; this summary feeds the UI and reports.
+            "common_areas": {
+                "room_ids": [
+                    r["id"] for r in rooms_raw if r.get("is_common")
+                ],
+                "total_m2": round(sum(
+                    float(r.get("area_m2", 0.0))
+                    for r in rooms_raw if r.get("is_common")
+                ), 3),
+            },
             "fixtures": fixtures_raw,
             "plan_bounds": _compute_plan_bounds(plan_lines),
             # Store the actual wall segments so the viewer can render them
@@ -339,6 +394,70 @@ def run_pipeline(
             "merged_ply": str(decimated_path),
         }
 
+        # ── 8b. Canonical floor geometry (Phase 1) + closure validation (Phase 2)
+        # Emit the standard-agnostic FloorGeometry so the measurement engine
+        # (app.measurement) can compute BOMA/REBNY/Gross areas from this job
+        # without re-running the pipeline, then run the floor-closure sanity
+        # checks (envelope vs rooms, perimeter closure, unscanned gaps).
+        if rooms_raw:
+            try:
+                import json as _json
+
+                from ..geometry.adapters import floor_geometry_from_alignment_rooms
+                floor_geo = floor_geometry_from_alignment_rooms(
+                    rooms_raw, floor_id=job_id,
+                    envelope_xy=(
+                        np.asarray(building_outline, dtype=float)
+                        if building_outline else None
+                    ),
+                )
+                floor_geo_path = result_dir / "floor_geometry.json"
+                floor_geo_path.write_text(
+                    _json.dumps(floor_geo.to_json_dict(), indent=2)
+                )
+                result_payload["floor_geometry_json"] = str(floor_geo_path)
+
+                from ..geometry.validation import validate_floor_closure
+                validation = validate_floor_closure(floor_geo)
+                result_payload["floor_validation"] = validation.to_json_dict()
+                (result_dir / "floor_validation.json").write_text(
+                    _json.dumps(result_payload["floor_validation"], indent=2)
+                )
+                if not validation.passed:
+                    n_gaps = len(validation.unscanned_gaps)
+                    gap_m2 = sum(g.area_m2 for g in validation.unscanned_gaps)
+                    _emit(
+                        job_id, "export",
+                        f"⚠ Floor-closure checks failed "
+                        f"({len(validation.warnings)} warning(s)"
+                        + (f", {n_gaps} unscanned gap(s) totalling "
+                           f"{gap_m2:.1f} m²" if n_gaps else "")
+                        + ") — see floor_validation.json",
+                        0.885,
+                    )
+            except Exception as fg_err:
+                _emit(job_id, "export",
+                      f"Floor geometry export skipped: {fg_err}", 0.885)
+
+            # ── 8c. Floor plan sheet (Phase 3): SVG + PDF from the
+            # canonical FloorGeometry.  Guarded — never fails the job.
+            try:
+                if "floor_geometry_json" not in result_payload:
+                    raise RuntimeError("no canonical floor geometry emitted")
+                from ..sheet.service import render_job_sheet
+                sheet_render = render_job_sheet(result_dir, floor=floor_geo)
+                result_payload["sheet_svg"] = str(result_dir / "sheet.svg")
+                result_payload["sheet_pdf"] = str(result_dir / "sheet.pdf")
+                _emit(
+                    job_id, "export",
+                    f"Floor plan sheet rendered at "
+                    f"1:{sheet_render.scale_denominator}",
+                    0.887,
+                )
+            except Exception as sheet_err:
+                _emit(job_id, "export",
+                      f"Sheet rendering skipped: {sheet_err}", 0.887)
+
         write_aligned_json(result_payload, result_dir / "aligned.json")
         if not scan_only and plan_path is not None:
             write_aligned_dxf(plan_path, transformation, result_dir / "aligned.dxf")
@@ -346,7 +465,10 @@ def run_pipeline(
         elapsed = time.time() - t0
         update_job_result(job_id, result_payload, elapsed)
 
-        suffix = "· no plan required" if scan_only else f"· {conf_pct}% confidence"  # type: ignore[possibly-undefined]
+        suffix = (
+            f"· {conf_pct}% confidence (scan-only)" if scan_only  # type: ignore[possibly-undefined]
+            else f"· {conf_pct}% confidence"  # type: ignore[possibly-undefined]
+        )
         _emit(
             job_id, "complete",
             f"Done in {elapsed:.1f}s {suffix} · "
@@ -643,6 +765,7 @@ def reprocess_rooms(
                     "id": r.id, "label": r.label, "category": r.category,
                     "polygon_2d": r.polygon_2d, "centroid": list(r.centroid),
                     "area_m2": float(r.area_m2), "match_quality": r.match_quality,
+                    "is_common": r.category in COMMON_CATEGORIES,
                 }
                 for r in room_objs
             ]
@@ -696,6 +819,13 @@ def reprocess_rooms(
             stored = {}
 
         stored["rooms"] = rooms_raw
+        stored["common_areas"] = {
+            "room_ids": [r["id"] for r in rooms_raw if r.get("is_common")],
+            "total_m2": round(sum(
+                float(r.get("area_m2", 0.0))
+                for r in rooms_raw if r.get("is_common")
+            ), 3),
+        }
         stored["fixtures"] = fixtures_raw
         stored["plan_bounds"] = _compute_plan_bounds(plan_lines)
         stored["plan_segments"] = _segments_to_list(plan_lines)
@@ -705,7 +835,18 @@ def reprocess_rooms(
         if overlay_path:
             stored["overlay_png"] = overlay_path
 
-        if not scan_only:
+        if scan_only:
+            # Recompute the honest scan-only confidence from the fresh rooms.
+            conf = compute_scan_only_confidence(
+                num_wall_planes=len(wall_planes),
+                plan_source="3d_planes" if len(wall_planes) >= 4 else "2d_projection",
+                merge_strategy=str(stored.get("merge_strategy", "single")),
+                rooms=rooms_raw,
+            )
+            stored.setdefault("alignment", {})
+            stored["alignment"]["confidence"] = float(conf)
+            stored["alignment"]["confidence_pct"] = compute_confidence_pct(conf)
+        else:
             stored["alignment"]["transformation"] = transformation.tolist()
             stored["alignment"]["residual_rmse"] = float(result_align.residual_rmse)  # type: ignore[name-defined]
             stored["alignment"]["residual_rmse_mm"] = float(result_align.residual_rmse * 1000)  # type: ignore[name-defined]

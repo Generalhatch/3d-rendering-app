@@ -17,12 +17,13 @@ Endpoints
 - ``POST   /api/vectorize/{job_id}/find-duplicates``    Suggest near-duplicate pairs to merge
 - ``GET    /api/vectorize/{job_id}/edits/log``          Edit history (append-only)
 - ``POST   /api/vectorize/{job_id}/edits``              Save edits + re-emit DXF
+- ``POST   /api/vectorize/{job_id}/generate-measurement`` Rebuild BOMA from edited walls
+- ``GET    /api/vectorize/{job_id}/scan``               Original uploaded scan file
 - ``GET    /api/vectorize``                     List recent jobs
 """
 from __future__ import annotations
 
 import json
-import shutil
 import uuid
 from pathlib import Path
 
@@ -36,8 +37,12 @@ from ..models.vectorize_job import (
     DuplicatePair,
     FindDuplicatesRequest,
     FindDuplicatesResponse,
+    GenerateMeasurementRequest,
+    GenerateMeasurementResponse,
     SaveEditsRequest,
     SaveEditsResponse,
+    SheetOverridesRequest,
+    SheetOverridesResponse,
     VectorizeJobCreate,
     VectorizeJobDetail,
     VectorizeMetrics,
@@ -53,12 +58,17 @@ from ..storage import (
     load_vectorize_job,
     load_vectorize_result,
     results_dir,
+    store_upload_deduped,
     update_vectorize_params,
     update_vectorize_result,
     update_vectorize_status,
     uploads_dir,
 )
 from ..vectorize import edits as edits_mod
+from ..vectorize.measure_from_segments import (
+    RoomsNotClosedError,
+    generate_measurement_from_segments,
+)
 from ..vectorize.pipeline import run_vectorize_guarded
 
 MAX_SCAN_MB = 2048
@@ -90,6 +100,7 @@ async def create_vectorize(
     multi_elevation: bool = Form(default=True),
     detect_openings: bool = Form(default=True),
     detect_columns: bool = Form(default=True),
+    snapping_distance_m: float = Form(default=0.85),
 ):
     """Upload a scan and start a vectorize job.
 
@@ -110,11 +121,8 @@ async def create_vectorize(
         )
 
     job_id = str(uuid.uuid4())
-    upload_dir = uploads_dir(job_id)
     safe_name = _safe_filename(scan.filename)
-    scan_path = upload_dir / safe_name
 
-    # Stream to disk without copying through RAM.
     scan.file.seek(0, 2)
     size_bytes = scan.file.tell()
     scan.file.seek(0)
@@ -127,8 +135,10 @@ async def create_vectorize(
             f"{MAX_SCAN_MB // 1024} GB)",
         )
 
-    with open(scan_path, "wb") as f_out:
-        shutil.copyfileobj(scan.file, f_out)
+    # Stream to the content-addressed store (sha256 computed while writing,
+    # no second pass) — identical bytes uploaded twice are stored once, and
+    # the job dir gets a symlink to the shared blob.
+    scan_path, _scan_hash = store_upload_deduped(scan.file, job_id, safe_name)
 
     params = VectorizeParams(
         elevation_m=elevation_m,
@@ -142,6 +152,7 @@ async def create_vectorize(
         multi_elevation=multi_elevation,
         detect_openings=detect_openings,
         detect_columns=detect_columns,
+        snapping_distance_m=snapping_distance_m,
     )
 
     create_vectorize_job(job_id, safe_name, params.model_dump(mode="json"))
@@ -162,10 +173,14 @@ async def get_vectorize(job_id: str):
     artifact_dir = artifacts_dir(job_id)
     result_dir = results_dir(job_id)
     metrics: VectorizeMetrics | None = None
+    warnings: list = []
+    room_confidence: list = []
     if record["result"] is not None:
         m = record["result"].get("metrics")
         if m:
             metrics = VectorizeMetrics.model_validate(m)
+        warnings = record["result"].get("warnings") or []
+        room_confidence = record["result"].get("room_confidence") or []
 
     return VectorizeJobDetail(
         job_id=record["job_id"],
@@ -176,11 +191,16 @@ async def get_vectorize(job_id: str):
         params=VectorizeParams.model_validate(record["params"]) if record["params"] else None,
         metrics=metrics,
         error_message=record["error_message"],
+        warnings=warnings,
+        room_confidence=room_confidence,
         has_raster=(artifact_dir / "slice_cleaned.png").exists(),
         has_overlay=(artifact_dir / "overlay.png").exists(),
         has_dxf=(result_dir / "vectorized.dxf").exists(),
         has_coverage=(artifact_dir / "coverage_gaps.png").exists(),
         has_rejected=(result_dir / "rejected_segments.json").exists(),
+        has_sheet=(result_dir / "sheet.svg").exists(),
+        has_floor_geometry=(result_dir / "floor_geometry.json").exists(),
+        has_measurement_report=(result_dir / "measurement_report.json").exists(),
     )
 
 
@@ -259,6 +279,136 @@ async def get_dxf(job_id: str):
     )
 
 
+@router.get("/{job_id}/scan")
+async def get_vectorize_scan(job_id: str):
+    """Download the original uploaded scan for this vectorize job."""
+    try:
+        record = load_vectorize_job(job_id)
+    except KeyError:
+        raise HTTPException(404, f"Vectorize job {job_id} not found")
+    name = record.get("scan_filename") or ""
+    path = uploads_dir(job_id) / name if name else None
+    if path is None or not path.exists():
+        # Symlink may resolve; also try any file in the upload dir.
+        u_dir = uploads_dir(job_id)
+        candidates = [p for p in u_dir.iterdir() if p.is_file() or p.is_symlink()] if u_dir.exists() else []
+        if not candidates:
+            raise HTTPException(404, "Original scan not available for this job")
+        path = candidates[0]
+        name = path.name
+    return FileResponse(
+        str(path.resolve()),
+        media_type="application/octet-stream",
+        filename=name or path.name,
+    )
+
+
+@router.get("/{job_id}/floor-geometry.json")
+async def download_floor_geometry(job_id: str):
+    """Download ``floor_geometry.json`` as an attachment."""
+    path = results_dir(job_id) / "floor_geometry.json"
+    if not path.exists():
+        raise HTTPException(404, "Floor geometry not available for this job")
+    return FileResponse(
+        str(path),
+        media_type="application/json",
+        filename="floor_geometry.json",
+    )
+
+
+# ── Floor plan sheet (Phase 3) ───────────────────────────────────────────────
+
+@router.get("/{job_id}/sheet")
+async def get_sheet_svg(job_id: str):
+    """The rendered floor plan sheet (SVG).
+
+    Lazily renders on first request for jobs that completed before the
+    sheet stage existed (requires ``floor_geometry.json``).
+    """
+    r_dir = results_dir(job_id)
+    path = r_dir / "sheet.svg"
+    if not path.exists():
+        if not (r_dir / "floor_geometry.json").exists():
+            raise HTTPException(404, "Sheet not available — no floor geometry")
+        from ..sheet.service import render_job_sheet
+        render_job_sheet(r_dir)
+    return FileResponse(str(path), media_type="image/svg+xml", filename="sheet.svg")
+
+
+@router.get("/{job_id}/sheet.pdf")
+async def get_sheet_pdf(job_id: str):
+    """The rendered floor plan sheet (PDF, converted from the same SVG)."""
+    r_dir = results_dir(job_id)
+    path = r_dir / "sheet.pdf"
+    if not path.exists():
+        if not (r_dir / "floor_geometry.json").exists():
+            raise HTTPException(404, "Sheet not available — no floor geometry")
+        from ..sheet.service import render_job_sheet
+        render_job_sheet(r_dir)
+    return FileResponse(str(path), media_type="application/pdf", filename="sheet.pdf")
+
+
+@router.get("/{job_id}/floor-geometry")
+async def get_floor_geometry(job_id: str):
+    """The canonical FloorGeometry JSON — the sheet editor's data source."""
+    path = results_dir(job_id) / "floor_geometry.json"
+    if not path.exists():
+        raise HTTPException(404, "Floor geometry not available for this job")
+    return json.loads(path.read_text())
+
+
+@router.get("/{job_id}/measurement-report")
+async def get_measurement_report(job_id: str):
+    """BOMA/REBNY/Gross measurement report JSON — read-only deliverable."""
+    path = results_dir(job_id) / "measurement_report.json"
+    if not path.exists():
+        raise HTTPException(404, "Measurement report not available for this job")
+    return json.loads(path.read_text())
+
+
+@router.get("/{job_id}/measurement-report.pdf")
+async def get_measurement_report_pdf(job_id: str):
+    """Measurement report PDF (same numbers as the JSON report)."""
+    path = results_dir(job_id) / "measurement_report.pdf"
+    if not path.exists():
+        raise HTTPException(404, "Measurement report PDF not available for this job")
+    return FileResponse(
+        str(path), media_type="application/pdf", filename="measurement_report.pdf",
+    )
+
+
+@router.get("/{job_id}/sheet/overrides")
+async def get_sheet_overrides(job_id: str):
+    """Current operator overrides (suite labels, title block, manual grid)."""
+    from ..sheet.service import load_overrides
+    return load_overrides(results_dir(job_id))
+
+
+@router.post("/{job_id}/sheet/overrides", response_model=SheetOverridesResponse)
+async def save_sheet_overrides(job_id: str, body: SheetOverridesRequest):
+    """Persist sheet overrides and re-render sheet.svg / sheet.pdf.
+
+    ``labels`` merges per-room (empty string clears one override);
+    ``meta`` and ``manual_grid`` replace wholesale (null removes).
+    """
+    r_dir = results_dir(job_id)
+    if not (r_dir / "floor_geometry.json").exists():
+        raise HTTPException(404, "Sheet not available — no floor geometry")
+
+    from ..sheet.service import render_job_sheet, save_overrides
+    save_overrides(r_dir, body.model_dump(exclude_unset=True))
+    try:
+        render = render_job_sheet(r_dir)
+    except Exception as exc:
+        raise HTTPException(500, f"Sheet re-render failed: {exc}")
+
+    return SheetOverridesResponse(
+        job_id=job_id,
+        sheet_url=f"/api/vectorize/{job_id}/sheet",
+        scale_denominator=render.scale_denominator,
+    )
+
+
 # ── POST /api/vectorize/{job_id}/reprocess ───────────────────────────────────
 
 @router.post("/{job_id}/reprocess", response_model=VectorizeJobCreate)
@@ -298,13 +448,19 @@ async def get_segments(job_id: str):
     """Return the current editable segment list for this job.
 
     Reflects the latest save — if the operator has saved edits, those are
-    returned; otherwise the original pipeline output.
+    returned; otherwise the original pipeline output.  Also attaches
+    ``dangling_endpoints`` (degree-1 junctions) when the artifact exists so
+    the editor can highlight open wall ends without a second round-trip.
     """
+    from ..vectorize import topology as topology_mod
+
     r_dir = results_dir(job_id)
     try:
-        return edits_mod.load_segments(r_dir)
+        payload = edits_mod.load_segments(r_dir)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
+    payload["dangling_endpoints"] = topology_mod.load_dangling_endpoints(r_dir)
+    return payload
 
 
 @router.get("/{job_id}/rejected-segments")
@@ -440,6 +596,107 @@ async def save_edits(job_id: str, body: SaveEditsRequest):
         edit_version=result.edit_version,
         dxf_url=f"/api/vectorize/{job_id}/dxf",
         segments_saved=result.segments_saved,
+    )
+
+
+@router.post(
+    "/{job_id}/generate-measurement",
+    response_model=GenerateMeasurementResponse,
+)
+async def generate_measurement(job_id: str, body: GenerateMeasurementRequest | None = None):
+    """Rebuild floor geometry + BOMA from the current (edited) wall network.
+
+    Used when auto room-closing found zero rooms: the operator closes walls
+    in the editor, then calls this endpoint.  Does **not** re-ingest the scan.
+    """
+    body = body or GenerateMeasurementRequest()
+    try:
+        record = load_vectorize_job(job_id)
+    except KeyError:
+        raise HTTPException(404, f"Vectorize job {job_id} not found")
+    if record["status"] != "complete":
+        raise HTTPException(
+            409,
+            f"Cannot generate measurement on a job in status "
+            f"{record['status']!r}; wait for the pipeline to finish.",
+        )
+
+    r_dir = results_dir(job_id)
+    edit_version: int | None = None
+    if body.save_first or body.segments is not None:
+        if not body.segments:
+            raise HTTPException(
+                400,
+                "segments required when save_first is true "
+                "(or pass segments to measure without a prior save)",
+            )
+        try:
+            saved = edits_mod.save_edits(r_dir, job_id, body.segments, body.log)
+            edit_version = saved.edit_version
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    if not (r_dir / "segments.json").exists():
+        raise HTTPException(404, "No segments.json — run or save the job first")
+
+    params = VectorizeParams.model_validate(record["params"] or {})
+    try:
+        result = generate_measurement_from_segments(
+            r_dir,
+            job_id,
+            segments=body.segments,
+            snapping_distance_m=float(params.snapping_distance_m),
+        )
+    except RoomsNotClosedError as e:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(e),
+                "n_walls": e.n_walls,
+                "n_junctions": e.n_junctions,
+                "n_edges": e.n_edges,
+                "dangling_endpoints": e.dangling_endpoints,
+            },
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Measurement generation failed: {e}") from e
+
+    # Merge artifact flags + rooms_detected into the stored result so the
+    # job-detail API reflects the new deliverables without a full reprocess.
+    try:
+        stored = load_vectorize_result(job_id)
+    except KeyError:
+        stored = {"metrics": {}, "params": record.get("params") or {}, "artifacts": {}}
+    metrics = dict(stored.get("metrics") or {})
+    metrics["rooms_detected"] = result.rooms_detected
+    artifacts = dict(stored.get("artifacts") or {})
+    artifacts["floor_geometry_json"] = str(r_dir / "floor_geometry.json")
+    artifacts["measurement_report_json"] = str(r_dir / "measurement_report.json")
+    artifacts["measurement_report_pdf"] = str(r_dir / "measurement_report.pdf")
+    if result.has_sheet:
+        artifacts["sheet_svg"] = str(r_dir / "sheet.svg")
+        artifacts["sheet_pdf"] = str(r_dir / "sheet.pdf")
+    warnings = list(stored.get("warnings") or [])
+    # Drop a prior rooms_not_closed warning — rooms are closed now.
+    warnings = [w for w in warnings if w.get("code") != "rooms_not_closed"]
+    warnings.extend(result.warnings)
+    stored["metrics"] = metrics
+    stored["artifacts"] = artifacts
+    stored["warnings"] = warnings
+    update_vectorize_result(job_id, stored)
+
+    return GenerateMeasurementResponse(
+        job_id=job_id,
+        rooms_detected=result.rooms_detected,
+        has_floor_geometry=result.has_floor_geometry,
+        has_measurement_report=result.has_measurement_report,
+        has_sheet=result.has_sheet,
+        warnings=result.warnings,
+        n_walls=result.n_walls,
+        n_junctions=result.n_junctions,
+        edit_version=edit_version,
     )
 
 

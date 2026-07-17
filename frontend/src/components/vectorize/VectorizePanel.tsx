@@ -8,15 +8,126 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { useVectorizeStore } from '../../state/vectorizeStore';
-import { vectorizeApi, type DetectorName, type VectorizeParams } from '../../api/vectorize';
+import {
+  vectorizeApi,
+  type DetectorName,
+  type FloorGeometryRoom,
+  type MeasurementReportPayload,
+  type PipelineWarning,
+  type RoomConfidence,
+  type SheetOverrides,
+  type SheetStyle,
+  type VectorizeParams,
+} from '../../api/vectorize';
 
 const VALID_EXTENSIONS = ['.las', '.laz', '.ply', '.e57'];
 
-export function VectorizePanel() {
+/** Compact Upload → BOMA checklist driven by existing job/editor state. */
+function WorkflowChecklist({
+  phase,
+  jobId,
+  hasRaster,
+  wallsCount,
+  hasFloorGeometry,
+  hasMeasurementReport,
+  hasDxf,
+  variant = 'default',
+}: {
+  phase: string;
+  jobId: string | null;
+  hasRaster: boolean;
+  wallsCount: number;
+  hasFloorGeometry: boolean;
+  hasMeasurementReport: boolean;
+  hasDxf: boolean;
+  variant?: 'default' | 'sheet';
+}) {
+  const uploaded = Boolean(jobId) || phase === 'uploading' || phase === 'processing' || phase === 'complete';
+  const viewing = (hasRaster || phase === 'complete') && phase !== 'idle';
+  const wallsReady = phase === 'complete' && wallsCount > 0;
+  const gapsClosed = hasFloorGeometry;
+  const bomaReady = hasMeasurementReport;
+  const downloadReady = bomaReady && (hasDxf || hasMeasurementReport);
+
+  const display = [
+    { id: 'upload', label: 'Upload', done: uploaded && phase !== 'idle' },
+    { id: 'view', label: 'View scan', done: viewing && (phase === 'complete' || phase === 'processing') },
+    { id: 'walls', label: 'Generate Walls', done: wallsReady },
+    { id: 'gaps', label: 'Close gaps', done: gapsClosed },
+    { id: 'boma', label: 'Generate BOMA', done: bomaReady },
+    { id: 'download', label: 'Download', done: downloadReady },
+  ];
+  // Cascade: later completion implies earlier steps are done.
+  if (wallsReady) {
+    display[0].done = true;
+    display[1].done = true;
+  }
+  if (gapsClosed) {
+    display[0].done = true;
+    display[1].done = true;
+    display[2].done = true;
+  }
+  if (bomaReady) {
+    for (const s of display) {
+      if (s.id !== 'download') s.done = true;
+    }
+  }
+  const firstOpen = display.findIndex((s) => !s.done);
+
+  const box =
+    variant === 'sheet'
+      ? 'rounded-lg border border-gray-200 bg-white p-3 space-y-2'
+      : 'rounded-lg border border-gray-700 bg-gray-800 p-3 space-y-2';
+  const titleCls =
+    variant === 'sheet'
+      ? 'text-[11px] uppercase tracking-wider text-gray-500 font-semibold'
+      : 'text-[11px] uppercase tracking-wider text-gray-300 font-semibold';
+  const doneCls = variant === 'sheet' ? 'text-emerald-700' : 'text-emerald-400';
+  const curCls = variant === 'sheet' ? 'text-amber-800 font-semibold' : 'text-amber-300 font-semibold';
+  const todoCls = variant === 'sheet' ? 'text-gray-400' : 'text-gray-400';
+
+  return (
+    <section className={box}>
+      <h3 className={titleCls}>Path to BOMA</h3>
+      <ol className="space-y-1">
+        {display.map((s, i) => {
+          const current = firstOpen === i;
+          return (
+            <li
+              key={s.id}
+              className={`flex items-center gap-2 text-xs ${
+                s.done ? doneCls : current ? curCls : todoCls
+              }`}
+            >
+              <span className="w-4 text-center font-mono text-[10px] opacity-70">
+                {s.done ? '✓' : current ? '→' : String(i + 1)}
+              </span>
+              <span>{s.label}</span>
+            </li>
+          );
+        })}
+      </ol>
+      {!gapsClosed && wallsReady && (
+        <p className={`text-[11px] leading-snug ${variant === 'sheet' ? 'text-amber-900/80' : 'text-amber-200/80'}`}>
+          Green walls + scan underlay are the trusted draft. Close open ends
+          (coral markers), then Generate BOMA. Exterior shell is optional until rooms close.
+        </p>
+      )}
+    </section>
+  );
+}
+
+interface PanelProps {
+  /** ``sheet`` variant is used in the slide-over deliver sidebar. */
+  variant?: 'default' | 'sheet';
+}
+
+export function VectorizePanel({ variant = 'default' }: PanelProps) {
   const {
     phase, jobId, scanFile, params, job, logs, overallProgress,
+    sidebarTab, setSidebarTab,
     setPhase, setJobId, setScanFile, patchParams, setParams,
-    setJob, appendLog, setOverallProgress, clearLogs, reset,
+    setJob, appendLog, setOverallProgress, clearLogs, reset, bumpSheetVersion,
   } = useVectorizeStore();
 
   const sseHandle = useRef<{ close: () => void } | null>(null);
@@ -169,23 +280,48 @@ export function VectorizePanel() {
   }, [jobId, phase, scanFile, reset]);
 
   return (
-    <div className="flex flex-col gap-4 p-5 text-gray-200">
-      <div className="flex items-center justify-between">
+    <div className={`flex flex-col gap-5 p-5 ${variant === 'sheet' ? 'text-gray-800' : 'text-gray-100'}`}>
+      <div className="flex items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-bold text-white">Vectorize</h1>
-          <p className="text-xs text-gray-500">Scan → CAD line geometry (DXF)</p>
+          <h1 className={`text-lg font-semibold tracking-tight ${variant === 'sheet' ? 'text-gray-900' : 'text-white'}`}>
+            {variant === 'sheet' ? 'Deliver' : 'Vectorize'}
+          </h1>
+          <p className={`text-xs mt-0.5 ${variant === 'sheet' ? 'text-gray-600' : 'text-gray-400'}`}>
+            {variant === 'sheet' ? 'Sheet metadata, numbering, export' : 'Scan → CAD line geometry (DXF)'}
+          </p>
         </div>
-        {(phase !== 'idle' || jobId !== null || scanFile !== null) && (
+        {variant === 'default' && (phase !== 'idle' || jobId !== null || scanFile !== null) && (
           <button
             onClick={startNew}
             title="Clear everything and start a new submission"
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-gray-700 bg-gray-800/60 hover:bg-gray-700 hover:border-gray-600 text-xs text-gray-300 transition-colors"
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md border border-gray-600 bg-gray-800 hover:bg-gray-700 hover:border-gray-500 text-xs font-medium text-gray-100 transition-colors"
           >
-            <span aria-hidden>✕</span> Clear
+            Clear
           </button>
         )}
       </div>
 
+      {phase === 'complete' && jobId && (
+        <SidebarTabBar tab={sidebarTab} onTab={setSidebarTab} variant={variant} />
+      )}
+
+      {(phase === 'processing' || phase === 'complete' || phase === 'uploading') && (
+        <WorkflowChecklist
+          phase={phase}
+          jobId={jobId}
+          hasRaster={Boolean(job?.has_raster)}
+          wallsCount={job?.metrics?.segments_after_regularize ?? 0}
+          hasFloorGeometry={Boolean(job?.has_floor_geometry)}
+          hasMeasurementReport={Boolean(job?.has_measurement_report)}
+          hasDxf={Boolean(job?.has_dxf)}
+          variant={variant}
+        />
+      )}
+
+      {phase === 'complete' && jobId && sidebarTab === 'deliver' ? (
+        <SheetDeliverPanel jobId={jobId} job={job} onSaved={bumpSheetVersion} />
+      ) : (
+        <>
       {/* Upload zone — only while idle / failed before a job exists */}
       {(phase === 'idle' || (phase === 'failed' && !jobId)) && (
         <VectorizeUpload
@@ -195,13 +331,15 @@ export function VectorizePanel() {
         />
       )}
 
-      {/* Params — always shown, but disabled while running */}
-      <ParamsPanel
-        params={params}
-        onPatch={patchParams}
-        onReset={() => setParams({ ...params, elevation_m: null })}
-        disabled={phase === 'uploading' || phase === 'processing'}
-      />
+      {/* Params — hidden in deliver tab on completed jobs */}
+      {!(phase === 'complete' && sidebarTab === 'deliver') && (
+        <ParamsPanel
+          params={params}
+          onPatch={patchParams}
+          onReset={() => setParams({ ...params, elevation_m: null })}
+          disabled={phase === 'uploading' || phase === 'processing'}
+        />
+      )}
 
       {/* Action button */}
       {!jobId && (
@@ -211,21 +349,21 @@ export function VectorizePanel() {
           className={`
             w-full py-3 rounded-lg font-semibold text-sm transition-all
             ${scanFile
-              ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/30'
+              ? 'bg-emerald-700 hover:bg-emerald-600 text-white'
               : 'bg-gray-700 text-gray-500 cursor-not-allowed'}
           `}
         >
-          {phase === 'uploading' ? 'Uploading…' : '⚡ Vectorize'}
+          {phase === 'uploading' ? 'Uploading…' : 'Vectorize'}
         </button>
       )}
 
       {/* Re-run with new params */}
-      {jobId && (phase === 'complete' || phase === 'failed') && (
+      {jobId && (phase === 'complete' || phase === 'failed') && sidebarTab === 'process' && (
         <button
           onClick={reprocess}
           className="w-full py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-sm transition-all"
         >
-          ↻ Re-run with current params
+          Re-run with current params
         </button>
       )}
 
@@ -235,8 +373,20 @@ export function VectorizePanel() {
       )}
 
       {/* Result */}
-      {phase === 'complete' && job?.metrics && jobId && (
+      {phase === 'complete' && job?.metrics && jobId && sidebarTab === 'process' && (
         <ResultPanel jobId={jobId} job={job} />
+      )}
+
+      {/* Phase 4: structured pipeline warnings (fallbacks that fired) */}
+      {phase === 'complete' && sidebarTab === 'process' && (job?.warnings?.length ?? 0) > 0 && (
+        <WarningsPanel warnings={job!.warnings} />
+      )}
+
+      {/* Phase 4: per-room confidence */}
+      {phase === 'complete' && sidebarTab === 'process' && (job?.room_confidence?.length ?? 0) > 0 && (
+        <RoomConfidencePanel rooms={job!.room_confidence} />
+      )}
+        </>
       )}
 
       {/* Error */}
@@ -248,14 +398,451 @@ export function VectorizePanel() {
 
       {/* Always-visible bottom clear — only when there's actually something
           to clear. Mirrors the header button but harder to miss. */}
-      {(jobId !== null || phase !== 'idle' || scanFile !== null) && (
+      {variant === 'default' && (jobId !== null || phase !== 'idle' || scanFile !== null) && (
         <button
           onClick={startNew}
-          className="w-full py-2.5 rounded-lg border border-gray-700 bg-gray-800/40 hover:bg-gray-800 hover:border-gray-600 text-sm font-medium text-gray-300 transition-colors"
+          className="w-full py-2.5 rounded-lg border border-gray-600 bg-gray-800 hover:bg-gray-700 hover:border-gray-500 text-sm font-medium text-gray-100 transition-colors"
         >
-          ✕ Clear & start a new submission
+          Clear and start new
         </button>
       )}
+    </div>
+  );
+}
+
+// ── Deliver / process tabs + sheet deliverables ───────────────────────────────
+
+function SidebarTabBar({
+  tab, onTab, variant,
+}: {
+  tab: 'deliver' | 'process';
+  onTab: (t: 'deliver' | 'process') => void;
+  variant: 'default' | 'sheet';
+}) {
+  const base = variant === 'sheet'
+    ? 'flex rounded-lg overflow-hidden border border-gray-300 text-xs font-medium bg-white'
+    : 'flex rounded-lg overflow-hidden border border-gray-700 text-xs font-medium';
+  const active = variant === 'sheet'
+    ? 'flex-1 px-3 py-2 bg-gray-800 text-white'
+    : 'flex-1 px-3 py-2 bg-emerald-700 text-white';
+  const idle = variant === 'sheet'
+    ? 'flex-1 px-3 py-2 text-gray-600 hover:bg-gray-50'
+    : 'flex-1 px-3 py-2 text-gray-400 hover:bg-gray-800';
+  return (
+    <div className={base}>
+      <button type="button" onClick={() => onTab('deliver')} className={tab === 'deliver' ? active : idle}>
+        Deliver
+      </button>
+      <button type="button" onClick={() => onTab('process')} className={tab === 'process' ? active : idle}>
+        Process
+      </button>
+    </div>
+  );
+}
+
+interface MetaDraft {
+  building_name: string;
+  address: string;
+  floor_name: string;
+  north_angle_deg: number;
+}
+
+const EMPTY_META: MetaDraft = {
+  building_name: '',
+  address: '',
+  floor_name: '',
+  north_angle_deg: 0,
+};
+
+function parseOffsets(text: string): number[] {
+  return text
+    .split(/[,\s]+/)
+    .map((t) => Number(t))
+    .filter((v) => Number.isFinite(v));
+}
+
+function SheetDeliverPanel({
+  jobId,
+  job,
+  onSaved,
+}: {
+  jobId: string;
+  job: ReturnType<typeof useVectorizeStore.getState>['job'];
+  onSaved: () => void;
+}) {
+  const [rooms, setRooms] = useState<FloorGeometryRoom[]>([]);
+  const [labels, setLabels] = useState<Record<string, string>>({});
+  const [meta, setMeta] = useState<MetaDraft>(EMPTY_META);
+  const [gridU, setGridU] = useState('');
+  const [gridV, setGridV] = useState('');
+  const [gridRotation, setGridRotation] = useState('0');
+  const [style, setStyle] = useState<SheetStyle>('stevenson_minimal');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [report, setReport] = useState<MeasurementReportPayload | null>(null);
+  const [reportTab, setReportTab] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        // Floor geometry is only present after rooms close (auto or Generate BOMA).
+        // Fetching it unconditionally caused a noisy 404 on incomplete jobs.
+        if (job?.has_floor_geometry) {
+          const [geo, overrides] = await Promise.all([
+            vectorizeApi.getFloorGeometry(jobId),
+            vectorizeApi.getSheetOverrides(jobId),
+          ]);
+          if (cancelled) return;
+          setRooms(geo.rooms);
+          setLabels(overrides.labels ?? {});
+          if (overrides.meta) setMeta({ ...EMPTY_META, ...overrides.meta });
+          if (overrides.manual_grid) {
+            setGridU(overrides.manual_grid.u_offsets_m.join(', '));
+            setGridV(overrides.manual_grid.v_offsets_m.join(', '));
+            setGridRotation(String(overrides.manual_grid.rotation_deg));
+          }
+          if (overrides.style) setStyle(overrides.style);
+          setError(null);
+        } else {
+          const overrides = await vectorizeApi.getSheetOverrides(jobId);
+          if (cancelled) return;
+          setRooms([]);
+          setLabels(overrides.labels ?? {});
+          if (overrides.meta) setMeta({ ...EMPTY_META, ...overrides.meta });
+          if (overrides.manual_grid) {
+            setGridU(overrides.manual_grid.u_offsets_m.join(', '));
+            setGridV(overrides.manual_grid.v_offsets_m.join(', '));
+            setGridRotation(String(overrides.manual_grid.rotation_deg));
+          }
+          if (overrides.style) setStyle(overrides.style);
+          setError(null);
+        }
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Sheet data unavailable');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [jobId, job?.has_floor_geometry]);
+
+  useEffect(() => {
+    if (!job?.has_measurement_report) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await vectorizeApi.getMeasurementReport(jobId);
+        if (!cancelled) setReport(data);
+      } catch {
+        if (!cancelled) setReport(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [jobId, job?.has_measurement_report]);
+
+  const handleSave = useCallback(async () => {
+    if (saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const overrides: SheetOverrides = { labels, meta, style };
+      const u = parseOffsets(gridU);
+      const v = parseOffsets(gridV);
+      if (u.length > 0 || v.length > 0) {
+        overrides.manual_grid = {
+          rotation_deg: Number(gridRotation) || 0,
+          u_offsets_m: u,
+          v_offsets_m: v,
+        };
+      } else {
+        overrides.manual_grid = null;
+      }
+      await vectorizeApi.saveSheetOverrides(jobId, overrides);
+      onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Save failed');
+    } finally {
+      setSaving(false);
+    }
+  }, [saving, labels, meta, style, gridU, gridV, gridRotation, jobId, onSaved]);
+
+  const suites = rooms.filter((r) => !r.is_common);
+  const standard = report?.measurements[reportTab];
+
+  return (
+    <div className="flex flex-col gap-4 text-xs">
+      {!job?.has_floor_geometry && (
+        <section className="rounded-lg border border-amber-300 bg-amber-50 p-3 space-y-1.5">
+          <h3 className="text-[11px] uppercase tracking-wider text-amber-800 font-semibold">
+            Rooms not closed yet
+          </h3>
+          <p className="text-amber-900/80 leading-snug">
+            The wall network did not enclose any rooms, so BOMA and the floor
+            sheet are not available yet.  In the editor, close open wall ends
+            (coral markers), then click{' '}
+            <span className="font-semibold">Generate BOMA</span>.  Green walls
+            + the scan underlay are the trusted draft — the blue exterior shell
+            is optional until rooms close.
+          </p>
+        </section>
+      )}
+
+      <section className="rounded-lg border border-gray-200 bg-white p-3 space-y-2">
+        <h3 className="text-[11px] uppercase tracking-wider text-gray-500">Downloads</h3>
+        <div className="flex flex-col gap-1.5">
+          {job?.scan_filename && (
+            <a
+              href={vectorizeApi.scanUrl(jobId)}
+              download={job.scan_filename}
+              className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+            >
+              Original scan ({job.scan_filename})
+            </a>
+          )}
+          {job?.has_dxf && (
+            <a
+              href={vectorizeApi.dxfUrl(jobId)}
+              download
+              className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+            >
+              DXF
+            </a>
+          )}
+          {job?.has_overlay && (
+            <a
+              href={vectorizeApi.overlayUrl(jobId)}
+              download
+              className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+            >
+              Overlay PNG
+            </a>
+          )}
+          {job?.has_raster && (
+            <a
+              href={vectorizeApi.rasterUrl(jobId)}
+              download
+              className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+            >
+              Raster PNG
+            </a>
+          )}
+          {job?.has_floor_geometry && (
+            <a
+              href={vectorizeApi.floorGeometryDownloadUrl(jobId)}
+              download
+              className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+            >
+              Floor geometry JSON
+            </a>
+          )}
+          {job?.has_measurement_report && (
+            <>
+              <a
+                href={vectorizeApi.measurementReportUrl(jobId)}
+                download
+                className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+              >
+                BOMA report JSON
+              </a>
+              <a
+                href={vectorizeApi.measurementReportPdfUrl(jobId)}
+                download
+                className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+              >
+                BOMA report PDF
+              </a>
+            </>
+          )}
+          {job?.has_sheet && (
+            <>
+              <a
+                href={vectorizeApi.sheetUrl(jobId)}
+                download
+                className="block w-full text-center py-1.5 rounded-md border border-gray-200 hover:bg-gray-50 text-gray-700"
+              >
+                Sheet SVG
+              </a>
+              <a
+                href={vectorizeApi.sheetPdfUrl(jobId)}
+                download
+                className="block w-full text-center py-1.5 rounded-md border border-gray-300 hover:bg-gray-50 text-gray-700 font-medium"
+              >
+                Sheet PDF
+              </a>
+            </>
+          )}
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-gray-200 bg-white p-3 space-y-2">
+        <h3 className="text-[11px] uppercase tracking-wider text-gray-500">Sheet style</h3>
+        <div className="flex gap-2">
+          {(
+            [
+              ['stevenson_minimal', 'Minimal'],
+              ['full', 'Title block'],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => setStyle(value)}
+              className={`flex-1 rounded-md px-2 py-1.5 border text-center ${
+                style === value
+                  ? 'bg-gray-800 border-gray-800 text-white'
+                  : 'bg-white border-gray-200 text-gray-600 hover:border-gray-300'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-gray-200 bg-white p-3 space-y-2">
+        <h3 className="text-[11px] uppercase tracking-wider text-gray-500">Building metadata</h3>
+        <input
+          value={meta.building_name}
+          onChange={(e) => setMeta({ ...meta, building_name: e.target.value })}
+          placeholder="Building name"
+          className="w-full rounded-md bg-white border border-gray-200 px-2 py-1.5 text-gray-800 focus:border-gray-400 outline-none"
+        />
+        <input
+          value={meta.address}
+          onChange={(e) => setMeta({ ...meta, address: e.target.value })}
+          placeholder="Address (footer centre line)"
+          className="w-full rounded-md bg-white border border-gray-200 px-2 py-1.5 text-gray-800 focus:border-gray-400 outline-none"
+        />
+        <input
+          value={meta.floor_name}
+          onChange={(e) => setMeta({ ...meta, floor_name: e.target.value })}
+          placeholder="Floor (e.g. Level 3)"
+          className="w-full rounded-md bg-white border border-gray-200 px-2 py-1.5 text-gray-800 focus:border-gray-400 outline-none"
+        />
+      </section>
+
+      <section className="rounded-lg border border-gray-200 bg-white p-3 space-y-2">
+        <h3 className="text-[11px] uppercase tracking-wider text-gray-500">Suite numbering</h3>
+        {suites.length === 0 && <p className="text-gray-500">No suites detected.</p>}
+        <div className="flex flex-col gap-1.5 max-h-40 overflow-y-auto">
+          {suites.map((room) => (
+            <div key={room.id} className="flex items-center gap-2">
+              <span className="w-20 truncate text-gray-500" title={room.id}>
+                {room.label || room.id.slice(0, 8)}
+              </span>
+              <input
+                value={labels[room.id] ?? ''}
+                onChange={(e) => setLabels({ ...labels, [room.id]: e.target.value })}
+                placeholder="320"
+                className="flex-1 rounded-md bg-white border border-gray-200 px-2 py-1 text-gray-800 focus:border-gray-400 outline-none"
+              />
+              <span className="text-gray-400 w-14 text-right tabular-nums">
+                {room.area_m2.toFixed(1)}
+              </span>
+            </div>
+          ))}
+        </div>
+        <p className="text-[11px] text-gray-500">Bare digits render as &quot;Suite N&quot; on the sheet.</p>
+      </section>
+
+      <section className="rounded-lg border border-gray-200 bg-white p-3 space-y-2">
+        <h3 className="text-[11px] uppercase tracking-wider text-gray-500">Manual column grid</h3>
+        <p className="text-gray-500">Comma-separated offsets in metres (optional).</p>
+        <label className="flex items-center gap-2">
+          <span className="w-16 text-gray-500">Numbered</span>
+          <input
+            value={gridU}
+            onChange={(e) => setGridU(e.target.value)}
+            placeholder="0, 6, 12"
+            className="flex-1 rounded-md border border-gray-200 px-2 py-1 focus:border-gray-400 outline-none"
+          />
+        </label>
+        <label className="flex items-center gap-2">
+          <span className="w-16 text-gray-500">Lettered</span>
+          <input
+            value={gridV}
+            onChange={(e) => setGridV(e.target.value)}
+            placeholder="0, 5, 10"
+            className="flex-1 rounded-md border border-gray-200 px-2 py-1 focus:border-gray-400 outline-none"
+          />
+        </label>
+      </section>
+
+      {job?.has_measurement_report && (
+        <section className="rounded-lg border border-gray-200 bg-white p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <h3 className="text-[11px] uppercase tracking-wider text-gray-500">Measurement report</h3>
+            <a
+              href={vectorizeApi.measurementReportPdfUrl(jobId)}
+              download
+              className="text-[11px] text-gray-600 hover:text-gray-900 underline"
+            >
+              PDF
+            </a>
+          </div>
+          {report ? (
+            <>
+              <div className="flex flex-wrap gap-1">
+                {report.measurements.map((m, i) => (
+                  <button
+                    key={`${m.standard}-${m.method}`}
+                    type="button"
+                    onClick={() => setReportTab(i)}
+                    className={`px-2 py-0.5 rounded border text-[11px] ${
+                      reportTab === i
+                        ? 'bg-gray-800 text-white border-gray-800'
+                        : 'border-gray-200 text-gray-600'
+                    }`}
+                  >
+                    {m.standard}{m.method ? ` ${m.method}` : ''}
+                  </button>
+                ))}
+              </div>
+              {standard && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[11px]">
+                    <thead>
+                      <tr className="text-left text-gray-500 border-b border-gray-100">
+                        <th className="py-1 pr-2">Suite</th>
+                        <th className="py-1 pr-2 text-right">Usable</th>
+                        <th className="py-1 text-right">Rentable</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {standard.suites.map((s) => (
+                        <tr key={s.suite_id} className="border-b border-gray-50">
+                          <td className="py-1 pr-2">{s.label}</td>
+                          <td className="py-1 pr-2 text-right tabular-nums">
+                            {s.usable.value_m2.toFixed(1)} m²
+                          </td>
+                          <td className="py-1 text-right tabular-nums">
+                            {s.rentable.value_m2.toFixed(1)} m²
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <p className="mt-2 text-gray-500 tabular-nums">
+                    Floor usable {standard.floor_usable.value_m2.toFixed(1)} m² ·
+                    rentable {standard.floor_rentable.value_m2.toFixed(1)} m²
+                  </p>
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="text-gray-500">Loading report…</p>
+          )}
+        </section>
+      )}
+
+      {error && <p className="text-rose-600">{error}</p>}
+      <button
+        type="button"
+        onClick={handleSave}
+        disabled={saving || !job?.has_floor_geometry}
+        className="rounded-lg bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-white font-medium py-2.5"
+      >
+        {saving ? 'Re-rendering…' : 'Save and re-render sheet'}
+      </button>
     </div>
   );
 }
@@ -298,31 +885,31 @@ function VectorizeUpload({
       }}
       className={`
         flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed
-        p-5 text-center transition-colors cursor-pointer
+        p-6 text-center transition-colors cursor-pointer
         ${dragging
-          ? 'border-emerald-400 bg-emerald-950/30'
+          ? 'border-emerald-400 bg-emerald-900/40'
           : file
-            ? 'border-emerald-700 bg-emerald-950/20'
-            : 'border-gray-600 bg-gray-800/40 hover:border-gray-500'}
+            ? 'border-emerald-500 bg-emerald-950/40'
+            : 'border-gray-500 bg-gray-800 hover:border-gray-400 hover:bg-gray-800/80'}
         ${disabled ? 'opacity-50 pointer-events-none' : ''}
       `}
     >
-      <div className="text-2xl">{file ? '✅' : '📁'}</div>
+      <div className="text-2xl font-light text-gray-300">{file ? 'Scan' : '+'}</div>
       {file ? (
         <div className="w-full">
           <p className="text-sm font-medium text-emerald-200 truncate">{file.name}</p>
-          <p className="text-xs text-gray-500">{(file.size / 1024 / 1024).toFixed(1)} MB</p>
+          <p className="text-xs text-gray-400">{(file.size / 1024 / 1024).toFixed(1)} MB</p>
           <button
             onClick={(e) => { e.stopPropagation(); onFile(null); }}
-            className="mt-1 text-[11px] text-gray-500 hover:text-gray-300"
+            className="mt-1 text-[11px] text-gray-400 hover:text-white underline-offset-2 hover:underline"
           >
-            ✕ remove
+            remove
           </button>
         </div>
       ) : (
         <div>
-          <p className="text-sm font-medium text-gray-200">Drop a scan to vectorize</p>
-          <p className="text-xs text-gray-500 mt-0.5">.las · .laz · .ply · .e57 — one file</p>
+          <p className="text-sm font-medium text-white">Drop a scan to vectorize</p>
+          <p className="text-xs text-gray-400 mt-1">.las · .laz · .ply · .e57 — one file</p>
         </div>
       )}
     </div>
@@ -340,16 +927,16 @@ function ParamsPanel({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   return (
-    <div className={`rounded-xl border border-gray-700 bg-gray-800/30 ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
-      <div className="px-3 py-2 border-b border-gray-700 text-xs font-semibold text-emerald-300">
+    <div className={`rounded-xl border border-gray-700 bg-gray-800 ${disabled ? 'opacity-60 pointer-events-none' : ''}`}>
+      <div className="px-3.5 py-2.5 border-b border-gray-700 text-xs font-semibold uppercase tracking-wide text-emerald-400">
         Parameters
       </div>
 
-      <div className="px-3 py-3 space-y-3">
+      <div className="px-3.5 py-4 space-y-4">
         {/* Elevation */}
-        <div className="space-y-1">
+        <div className="space-y-1.5">
           <div className="flex items-center justify-between">
-            <label className="text-xs font-medium text-gray-300 inline-flex items-center">
+            <label className="text-sm font-medium text-gray-100 inline-flex items-center">
               Elevation (m)
               <InfoTip>
                 <p className="font-semibold text-gray-100 mb-1">What it does</p>
@@ -361,7 +948,7 @@ function ParamsPanel({
             {params.elevation_m !== null && (
               <button
                 onClick={onReset}
-                className="text-[11px] text-gray-500 hover:text-gray-300"
+                className="text-[11px] text-gray-400 hover:text-white"
                 title="Auto-detect floor + 1.6 m"
               >
                 use auto
@@ -377,17 +964,17 @@ function ParamsPanel({
               onChange={(e) =>
                 onPatch({ elevation_m: e.target.value === '' ? null : parseFloat(e.target.value) })
               }
-              className="flex-1 px-2 py-1 rounded bg-gray-900 border border-gray-700 text-xs text-gray-100 placeholder-gray-600"
+              className="flex-1 px-2.5 py-2 rounded-md bg-gray-950 border border-gray-600 text-sm text-white placeholder-gray-500 focus:border-emerald-500 focus:outline-none"
             />
           </div>
-          <p className="text-[11px] text-gray-500">
+          <p className="text-xs text-gray-400 leading-snug">
             Leave blank to auto-pick shoulder height above the detected floor.
           </p>
         </div>
 
         {/* Detector */}
-        <div className="space-y-1">
-          <label className="text-xs font-medium text-gray-300 inline-flex items-center">
+        <div className="space-y-1.5">
+          <label className="text-sm font-medium text-gray-100 inline-flex items-center">
             Line detector
             <InfoTip>
               <p className="font-semibold text-gray-100 mb-1">Which algorithm finds the walls</p>
@@ -396,21 +983,21 @@ function ParamsPanel({
               <p className="mt-1"><span className="text-emerald-300">Both</span> — runs FLD + Hough and merges. Slower; mainly for comparing quality.</p>
             </InfoTip>
           </label>
-          <div className="flex gap-1">
+          <div className="flex gap-1.5">
             {(['fld', 'hough', 'both'] as DetectorName[]).map((d) => (
               <button
                 key={d}
                 onClick={() => onPatch({ detector: d })}
-                className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition-colors
+                className={`flex-1 px-2 py-2 rounded-md text-xs font-semibold transition-colors
                   ${params.detector === d
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-gray-900 text-gray-400 hover:text-gray-200 border border-gray-700'}`}
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'bg-gray-950 text-gray-300 hover:text-white border border-gray-600 hover:border-gray-500'}`}
               >
                 {d === 'fld' ? 'FLD' : d === 'hough' ? 'Hough' : 'Both'}
               </button>
             ))}
           </div>
-          <p className="text-[11px] text-gray-500">
+          <p className="text-xs text-gray-400 leading-snug">
             {params.detector === 'fld' && 'Fast Line Detector — clean long segments. Recommended.'}
             {params.detector === 'hough' && 'Probabilistic Hough — robust, more fragments.'}
             {params.detector === 'both' && 'Merge both detectors — slower, useful for comparison.'}
@@ -530,13 +1117,34 @@ function ParamsPanel({
           <button
             type="button"
             onClick={() => setShowAdvanced((v) => !v)}
-            className="w-full flex items-center justify-between text-xs text-gray-500 hover:text-gray-300 py-1"
+            className="w-full flex items-center justify-between text-xs font-medium text-gray-300 hover:text-white py-1.5"
           >
             <span>Advanced settings</span>
-            <span>{showAdvanced ? '▲' : '▼'}</span>
+            <span className="text-gray-400">{showAdvanced ? '▲' : '▼'}</span>
           </button>
           {showAdvanced && (
             <div className="space-y-3 pt-2">
+              <SliderRow
+                label="Corner join (m)"
+                value={params.snapping_distance_m}
+                min={0.30} max={1.20} step={0.05}
+                onChange={(v) => onPatch({ snapping_distance_m: v })}
+                help="How far free wall ends may extend or trim to meet at L/T corners. 0.85 m is the production default."
+                tip={
+                  <>
+                    <p className="font-semibold text-gray-100 mb-1">Corner join / snapping distance</p>
+                    <p>
+                      After walls are detected, each free end is allowed to grow
+                      (or trim) along its own axis until it hits another wall —
+                      the Cloud2BIM / BricsCAD-style extend-trim step that closes
+                      open corners.
+                    </p>
+                    <p className="mt-2"><span className="text-emerald-300">0.60&nbsp;m:</span> conservative — fewer false door closes, more open corners.</p>
+                    <p className="mt-1"><span className="text-emerald-300">0.85&nbsp;m (default):</span> closes typical 10–80&nbsp;cm undershoot on real scans.</p>
+                    <p className="mt-1"><span className="text-emerald-300">1.00–1.20&nbsp;m:</span> aggressive — use when corners still gap; may bridge narrow openings.</p>
+                  </>
+                }
+              />
               <SliderRow
                 label="Slab thickness (m)"
                 value={params.slab_thickness_m}
@@ -591,9 +1199,9 @@ function SliderRow({
   tip?: ReactNode;
 }) {
   return (
-    <div className="space-y-1">
+    <div className="space-y-1.5">
       <div className="flex items-center gap-2">
-        <span className="text-xs text-gray-400 w-36 flex-shrink-0 inline-flex items-center">
+        <span className="text-sm font-medium text-gray-100 w-40 flex-shrink-0 inline-flex items-center gap-0.5">
           {label}
           {tip && <InfoTip>{tip}</InfoTip>}
         </span>
@@ -602,11 +1210,11 @@ function SliderRow({
           min={min} max={max} step={step}
           value={value}
           onChange={(e) => onChange(parseFloat(e.target.value))}
-          className="flex-1 accent-emerald-500"
+          className="flex-1 accent-emerald-500 h-2"
         />
-        <span className="text-xs text-gray-300 w-12 text-right font-mono">{value.toFixed(fixed)}</span>
+        <span className="text-sm text-white w-12 text-right font-mono tabular-nums">{value.toFixed(fixed)}</span>
       </div>
-      {help && <p className="text-[11px] text-gray-500 pl-0">{help}</p>}
+      {help && <p className="text-xs text-gray-400 leading-snug">{help}</p>}
     </div>
   );
 }
@@ -621,19 +1229,19 @@ function Toggle({
   tip?: ReactNode;
 }) {
   return (
-    <label className="flex items-start gap-2 cursor-pointer">
+    <label className="flex items-start gap-2.5 cursor-pointer rounded-md px-1 py-1 -mx-1 hover:bg-gray-700/50">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
-        className="mt-0.5 accent-emerald-500"
+        className="mt-0.5 h-4 w-4 rounded border-gray-500 accent-emerald-500"
       />
-      <div className="flex-1">
-        <div className="text-xs text-gray-200 inline-flex items-center">
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium text-gray-100 inline-flex items-center gap-0.5">
           {label}
           {tip && <InfoTip>{tip}</InfoTip>}
         </div>
-        {help && <div className="text-[11px] text-gray-500">{help}</div>}
+        {help && <div className="text-xs text-gray-400 leading-snug mt-0.5">{help}</div>}
       </div>
     </label>
   );
@@ -739,7 +1347,7 @@ function InfoTip({ children }: { children: ReactNode }) {
         onMouseLeave={() => setOpen(false)}
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
-        className="ml-1 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full bg-gray-700 text-[9px] font-bold text-gray-300 cursor-help select-none align-middle hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
+        className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-full bg-gray-600 text-[10px] font-bold text-white cursor-help select-none align-middle hover:bg-emerald-600 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
       >
         ?
       </span>
@@ -754,7 +1362,7 @@ function InfoTip({ children }: { children: ReactNode }) {
             width: `min(${TOOLTIP_WIDTH_PX}px, calc(100vw - ${TOOLTIP_MARGIN_PX * 2}px))`,
             zIndex: 9999,
           }}
-          className="pointer-events-none rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-[11px] leading-snug text-gray-300 shadow-xl"
+          className="pointer-events-none rounded-md border border-gray-600 bg-gray-950 px-3 py-2.5 text-xs leading-snug text-gray-100 shadow-xl"
         >
           {children}
         </div>,
@@ -797,12 +1405,12 @@ function ProgressLog({
     : 'Waiting for progress…';
 
   return (
-    <div className="rounded-xl border border-gray-700 bg-gray-800/30 overflow-hidden">
-      <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between">
-        <span className="text-xs font-semibold text-emerald-300">{headerLabel}</span>
-        <span className="text-xs font-mono text-gray-400">{(progress * 100).toFixed(0)}%</span>
+    <div className="rounded-xl border border-gray-700 bg-gray-800 overflow-hidden">
+      <div className="px-3 py-2.5 border-b border-gray-700 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-wide text-emerald-400">{headerLabel}</span>
+        <span className="text-xs font-mono text-gray-300">{(progress * 100).toFixed(0)}%</span>
       </div>
-      <div className="h-1.5 bg-gray-900 relative overflow-hidden">
+      <div className="h-1.5 bg-gray-950 relative overflow-hidden">
         <div
           className="h-full bg-emerald-500 transition-all duration-300"
           style={{ width: `${progress * 100}%` }}
@@ -816,16 +1424,16 @@ function ProgressLog({
       </div>
       <div
         ref={scrollRef}
-        className="max-h-48 overflow-y-auto side-panel-scroll px-3 py-2 space-y-1 text-[11px] font-mono"
+        className="max-h-48 overflow-y-auto side-panel-scroll px-3 py-2 space-y-1 text-xs font-mono"
       >
         {recent.map((log, i) => (
-          <div key={i} className="text-gray-400">
+          <div key={i} className="text-gray-300">
             <span className="text-emerald-400 mr-2">{log.stage}</span>
             {log.message}
           </div>
         ))}
         {recent.length === 0 && (
-          <div className="text-gray-600 italic">{emptyLabel}</div>
+          <div className="text-gray-500 italic">{emptyLabel}</div>
         )}
       </div>
     </div>
@@ -884,17 +1492,58 @@ function ResultPanel({ jobId, job }: { jobId: string; job: NonNullable<ReturnTyp
           }
           hint={m.elevations_used_m && m.elevations_used_m.length > 1 ? '(3-slab OR-merged)' : undefined}
         />
+        {m.gravity_relevel_applied === true && (
+          <Stat
+            label="Gravity re-level"
+            value={`${(m.gravity_tilt_deg ?? 0).toFixed(1)}°`}
+            hint="(scanner tilt corrected before slicing)"
+          />
+        )}
+        {typeof m.ceiling_clearance_m === 'number' && (
+          <Stat
+            label="Ceiling clearance"
+            value={`${m.ceiling_clearance_m.toFixed(2)} m`}
+            hint={m.slice_band_adjusted ? '(low — slice bands scaled down)' : undefined}
+          />
+        )}
         <Stat label="Detector" value={m.detector.toUpperCase()} />
         <Stat label="Raster" value={`${m.raster_width_px}×${m.raster_height_px} px`} hint={`(${m.raster_world_width_m.toFixed(1)}×${m.raster_world_height_m.toFixed(1)} m)`} />
         <Stat label="Points in slab" value={m.points_in_slab.toLocaleString()} hint={`(${m.raw_points.toLocaleString()} total)`} />
+        {typeof m.rooms_detected === 'number' && (
+          <Stat
+            label="Rooms"
+            value={m.rooms_detected}
+            hint={m.rooms_detected === 0
+              ? '(none closed — use editor → Generate BOMA)'
+              : undefined}
+          />
+        )}
 
-        <a
-          href={vectorizeApi.dxfUrl(jobId)}
-          download
-          className="block mt-3 w-full text-center py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm transition-colors"
-        >
-          ⬇ Download DXF
-        </a>
+        <div className="mt-3 space-y-1.5">
+          <a
+            href={vectorizeApi.dxfUrl(jobId)}
+            download
+            className="block w-full text-center py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white font-semibold text-sm transition-colors"
+          >
+            Download DXF
+          </a>
+          <a
+            href={vectorizeApi.scanUrl(jobId)}
+            download={job.scan_filename}
+            className="block w-full text-center py-2 rounded-lg border border-emerald-800 text-emerald-200 hover:bg-emerald-950/40 text-sm transition-colors"
+          >
+            Download original scan
+          </a>
+          {job.has_measurement_report && (
+            <a
+              href={vectorizeApi.measurementReportPdfUrl(jobId)}
+              download
+              className="block w-full text-center py-2 rounded-lg border border-emerald-800 text-emerald-200 hover:bg-emerald-950/40 text-sm transition-colors"
+            >
+              Download BOMA PDF
+            </a>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -997,12 +1646,129 @@ function CoverageStat({
   );
 }
 
+/**
+ * Structured pipeline warnings — the honest-fallback report (Phase 4).
+ *
+ * Every entry is a place where the pipeline degraded gracefully instead of
+ * failing (ceiling gate skipped, Manhattan snap bailed, …).  Zero warnings =
+ * clean run = this panel doesn't render at all.
+ */
+function WarningsPanel({ warnings }: { warnings: PipelineWarning[] }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="rounded-xl border border-amber-800/70 bg-amber-950/20 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full px-3 py-2 border-b border-amber-800/70 flex items-center justify-between text-xs font-semibold text-amber-300"
+      >
+        <span>⚠ Pipeline warnings · {warnings.length}</span>
+        <span>{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="px-3 py-2 space-y-2 text-[11px]">
+          {warnings.map((w, i) => (
+            <div key={i} className="flex gap-2">
+              <span
+                className="flex-shrink-0 px-1.5 py-0.5 h-fit rounded border border-amber-700/60 bg-amber-900/40 text-amber-200 font-mono text-[10px]"
+                title={`Stage: ${w.stage}`}
+              >
+                {w.code}
+              </span>
+              <span className="text-gray-300 leading-snug">{w.message}</span>
+            </div>
+          ))}
+          <p className="text-gray-400 pt-1">
+            Each warning is a fallback that fired during the run — the output is
+            still usable, but these areas deserve a closer look in the editor.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Per-room confidence list (Phase 4).
+ *
+ * Trust score per inferred room from boundary coverage (how much of the room
+ * outline is supported by observed scan data) and snap correction (how far
+ * topology moved the corners).  Flagged rooms sort first so the operator's
+ * eye lands on what needs review.
+ */
+function RoomConfidencePanel({ rooms }: { rooms: RoomConfidence[] }) {
+  const [open, setOpen] = useState(true);
+  const nFlagged = rooms.filter((r) => r.flagged).length;
+  const sorted = useMemo(
+    () => [...rooms].sort((a, b) => Number(b.flagged) - Number(a.flagged) || a.confidence - b.confidence),
+    [rooms],
+  );
+  return (
+    <div className="rounded-xl border border-gray-700 bg-gray-800 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full px-3 py-2.5 border-b border-gray-700 flex items-center justify-between text-xs font-semibold"
+      >
+        <span className={nFlagged > 0 ? 'text-amber-300' : 'text-emerald-400'}>
+          Room confidence · {rooms.length} room{rooms.length === 1 ? '' : 's'}
+          {nFlagged > 0 && ` · ${nFlagged} flagged`}
+        </span>
+        <span className="text-gray-400">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="px-3 py-2 space-y-1.5 text-[11px]">
+          {sorted.map((r) => {
+            const pct = Math.round(r.confidence * 100);
+            const tone = r.flagged
+              ? 'border-rose-800/70 bg-rose-950/40'
+              : r.confidence >= 0.85
+                ? 'border-emerald-800/60 bg-emerald-950/20'
+                : 'border-amber-800/60 bg-amber-950/20';
+            const barTone = r.flagged
+              ? 'bg-rose-500'
+              : r.confidence >= 0.85 ? 'bg-emerald-500' : 'bg-amber-500';
+            return (
+              <div
+                key={r.room_index}
+                className={`rounded-lg border px-2 py-1.5 ${tone}`}
+                title={
+                  `Boundary coverage: ${(r.boundary_coverage * 100).toFixed(0)} % of the room outline is supported by scan data.\n` +
+                  `Snap correction: corners moved ${(r.snap_correction_m * 100).toFixed(1)} cm on average during topology cleanup.`
+                }
+              >
+                <div className="flex items-baseline justify-between">
+                  <span className="text-gray-200 font-medium">
+                    Room {r.room_index + 1}
+                    {r.flagged && <span className="ml-1.5 text-rose-300">⚑ review</span>}
+                  </span>
+                  <span className="font-mono text-gray-300">
+                    {r.area_m2.toFixed(1)} m² · {pct}%
+                  </span>
+                </div>
+                <div className="mt-1 h-1 rounded bg-gray-900 overflow-hidden">
+                  <div className={`h-full ${barTone}`} style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+            );
+          })}
+          <p className="text-gray-400 pt-1">
+            Confidence combines boundary coverage (scan support along the room
+            outline) and how far corners were moved during cleanup. Flagged
+            rooms should be verified in the editor before measuring.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Stat({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
   return (
-    <div className="flex items-baseline justify-between">
-      <span className="text-gray-400">{label}</span>
-      <span className="text-gray-100 font-mono">
-        {value} {hint && <span className="text-gray-500">{hint}</span>}
+    <div className="flex items-baseline justify-between gap-2">
+      <span className="text-gray-300">{label}</span>
+      <span className="text-white font-mono">
+        {value} {hint && <span className="text-gray-400">{hint}</span>}
       </span>
     </div>
   );

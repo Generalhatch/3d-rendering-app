@@ -56,6 +56,14 @@ interface VectorizeState {
   overallProgress: number;
   /** Which overlay to show in the viewer. */
   overlayMode: 'clean' | 'raw' | 'raster';
+  /** Main-area view on completed jobs: line editor or floor plan sheet. */
+  viewMode: 'editor' | 'sheet';
+  /** Sidebar tab when a job is complete: deliverables vs pipeline controls. */
+  sidebarTab: 'deliver' | 'process';
+  /** Slide-over sidebar visible in sheet view. */
+  sheetSidebarOpen: boolean;
+  /** Incremented when sheet overrides are saved — reloads inline SVG. */
+  sheetVersion: number;
 
   setPhase: (phase: VectorizePhase) => void;
   setJobId: (id: string | null) => void;
@@ -68,6 +76,10 @@ interface VectorizeState {
   setOverallProgress: (progress: number) => void;
   clearLogs: () => void;
   setOverlayMode: (mode: 'clean' | 'raw' | 'raster') => void;
+  setViewMode: (mode: 'editor' | 'sheet') => void;
+  setSidebarTab: (tab: 'deliver' | 'process') => void;
+  setSheetSidebarOpen: (open: boolean) => void;
+  bumpSheetVersion: () => void;
   reset: () => void;
 }
 
@@ -83,6 +95,10 @@ const initialState = {
   logs: [] as VectorizeLogEntry[],
   overallProgress: 0,
   overlayMode: 'clean' as const,
+  viewMode: 'editor' as const,
+  sidebarTab: 'deliver' as const,
+  sheetSidebarOpen: false,
+  sheetVersion: 0,
 };
 
 export const useVectorizeStore = create<VectorizeState>((set) => ({
@@ -94,8 +110,9 @@ export const useVectorizeStore = create<VectorizeState>((set) => ({
     set({ jobId });
   },
   setScanFile: (scanFile) => set({ scanFile }),
-  setParams: (params) => set({ params }),
-  patchParams: (patch) => set((s) => ({ params: { ...s.params, ...patch } })),
+  setParams: (params) => set({ params: { ...DEFAULT_VECTORIZE_PARAMS, ...params } }),
+  patchParams: (patch) =>
+    set((s) => ({ params: { ...DEFAULT_VECTORIZE_PARAMS, ...s.params, ...patch } })),
   setJob: (job) => set({ job }),
   appendLog: (event) =>
     set((s) => ({
@@ -117,6 +134,10 @@ export const useVectorizeStore = create<VectorizeState>((set) => ({
     set((s) => ({ overallProgress: Math.max(s.overallProgress, overallProgress) })),
   clearLogs: () => set({ logs: [], overallProgress: 0 }),
   setOverlayMode: (overlayMode) => set({ overlayMode }),
+  setViewMode: (viewMode) => set({ viewMode }),
+  setSidebarTab: (sidebarTab) => set({ sidebarTab }),
+  setSheetSidebarOpen: (sheetSidebarOpen) => set({ sheetSidebarOpen }),
+  bumpSheetVersion: () => set((s) => ({ sheetVersion: s.sheetVersion + 1 })),
   reset: () => {
     persistActiveJob(null);
     set({ ...initialState, jobId: null });

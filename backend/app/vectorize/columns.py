@@ -154,10 +154,11 @@ def detect_columns(
     wall_mask = np.zeros((h, w), dtype=np.uint8)
     if len(walls_world) > 0:
         for seg in walls_world:
-            x1 = int(round((seg[0, 0] - affine.origin_x) / res))
-            y1 = int(round((seg[0, 1] - affine.origin_y) / res))
-            x2 = int(round((seg[1, 0] - affine.origin_x) / res))
-            y2 = int(round((seg[1, 1] - affine.origin_y) / res))
+            # Pixel-centre convention: idx = (world - origin) / res - 0.5.
+            x1 = int(round((seg[0, 0] - affine.origin_x) / res - 0.5))
+            y1 = int(round((seg[0, 1] - affine.origin_y) / res - 0.5))
+            x2 = int(round((seg[1, 0] - affine.origin_x) / res - 0.5))
+            y2 = int(round((seg[1, 1] - affine.origin_y) / res - 0.5))
             cv2.line(wall_mask, (x1, y1), (x2, y2), color=255, thickness=1)
         clear_px = max(1, int(round(params.wall_clear_m / res)))
         # Dilate the wall mask outward so wall-adjacent pixels are removed.
@@ -330,15 +331,15 @@ def render_columns_overlay(
     for col in columns:
         pts_px = np.empty((4, 2), dtype=np.int32)
         for i in range(4):
-            pts_px[i, 0] = int(round((col.corners[i, 0] - affine.origin_x) / res))
-            pts_px[i, 1] = int(round((col.corners[i, 1] - affine.origin_y) / res))
+            pts_px[i, 0] = int(round((col.corners[i, 0] - affine.origin_x) / res - 0.5))
+            pts_px[i, 1] = int(round((col.corners[i, 1] - affine.origin_y) / res - 0.5))
         cv2.polylines(bgr, [pts_px], isClosed=True, color=(255, 0, 220), thickness=2)
     return bgr
 
 
 def _px_to_world(col: float, row: float, affine: RasterAffine) -> tuple[float, float]:
-    """Inverse of the world→pixel conversion used elsewhere in the pipeline."""
+    """Pixel-centre convention, matching ``RasterAffine.pixel_to_world``."""
     return (
-        affine.origin_x + col * affine.resolution_m_per_px,
-        affine.origin_y + row * affine.resolution_m_per_px,
+        affine.origin_x + (col + 0.5) * affine.resolution_m_per_px,
+        affine.origin_y + (row + 0.5) * affine.resolution_m_per_px,
     )

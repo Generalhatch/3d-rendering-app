@@ -8,9 +8,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useEditorStore } from '../../../state/editorStore';
 import { useVectorizeStore } from '../../../state/vectorizeStore';
-import { vectorizeApi, type RasterAffine, type SegmentLayer } from '../../../api/vectorize';
+import {
+  VectorizeApiError,
+  vectorizeApi,
+  type DanglingEndpoint,
+  type RasterAffine,
+  type RoomsNotClosedDetail,
+  type SegmentLayer,
+} from '../../../api/vectorize';
 import { EditorCanvas } from './EditorCanvas';
 import { EditorToolbar } from './EditorToolbar';
+import { computeDanglingEndpoints } from './danglingEndpoints';
 
 interface Props {
   jobId: string;
@@ -59,12 +67,44 @@ export function EditorSurface({ jobId }: Props) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [finding, setFinding] = useState(false);
   const [findError, setFindError] = useState<string | null>(null);
+  const [generatingBoma, setGeneratingBoma] = useState(false);
+  const [bomaError, setBomaError] = useState<string | null>(null);
+  const [bomaSuccess, setBomaSuccess] = useState<string | null>(null);
+  const [serverDangling, setServerDangling] = useState<DanglingEndpoint[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Pull `has_coverage` from the rehydrated job detail so we only render the
   // diagnostic toggle when the artifact actually exists (legacy jobs lack it).
   const hasCoverage = useVectorizeStore((s) => s.job?.has_coverage ?? false);
   const hasRejected = useVectorizeStore((s) => s.job?.has_rejected ?? false);
+  const hasMeasurementReport = useVectorizeStore((s) => s.job?.has_measurement_report ?? false);
+  const hasFloorGeometry = useVectorizeStore((s) => s.job?.has_floor_geometry ?? false);
+  const roomsDetected = useVectorizeStore((s) => s.job?.metrics?.rooms_detected ?? null);
+  const setJob = useVectorizeStore((s) => s.setJob);
+  const bumpSheetVersion = useVectorizeStore((s) => s.bumpSheetVersion);
+  const setViewMode = useVectorizeStore((s) => s.setViewMode);
+  const setSidebarTab = useVectorizeStore((s) => s.setSidebarTab);
+  const setLayerVisible = useEditorStore((s) => s.setLayerVisible);
+
+  // Demote the blue exterior-shell scribble when rooms aren't closed — green
+  // walls + raster are the trusted draft.  Power users can re-enable via Layers.
+  const exteriorUnreliable = !hasFloorGeometry || roomsDetected === 0;
+  useEffect(() => {
+    if (exteriorUnreliable) {
+      setLayerVisible('walls_exterior', false);
+    }
+  }, [exteriorUnreliable, setLayerVisible, jobId]);
+
+  // Rooms layer: only auto-show when rings closed and floor geometry exists
+  // (isoperimetric filter already dropped spiky candidates server-side).
+  // Keep hidden when rooms_detected is 0 / null so orange garbage stays off.
+  useEffect(() => {
+    if (roomsDetected != null && roomsDetected > 0 && hasFloorGeometry) {
+      setLayerVisible('rooms', true);
+    } else {
+      setLayerVisible('rooms', false);
+    }
+  }, [roomsDetected, hasFloorGeometry, setLayerVisible, jobId]);
 
   // ── Load segments + affine from backend ────────────────────────────────
   useEffect(() => {
@@ -85,6 +125,7 @@ export function EditorSurface({ jobId }: Props) {
         }
         setAffine(payload.affine);
         loadSegments(payload.segments);
+        setServerDangling(payload.dangling_endpoints ?? []);
 
         // Also fetch the pipeline-rejected ghost candidates if the artifact
         // exists for this job.  Failure is non-fatal — the editor still works
@@ -140,6 +181,59 @@ export function EditorSurface({ jobId }: Props) {
       setSaving(false);
     }
   }, [saving, dirty, segments, editLog, jobId, markSaved, autoSaveError, setAutoSaveError]);
+
+  const handleGenerateBoma = useCallback(async () => {
+    if (generatingBoma || saving) return;
+    setGeneratingBoma(true);
+    setBomaError(null);
+    setBomaSuccess(null);
+    try {
+      const active = segments.filter((s) => s.status === 'active').map((s) => ({
+        id: s.id,
+        layer: s.layer,
+        x1: s.x1,
+        y1: s.y1,
+        x2: s.x2,
+        y2: s.y2,
+      }));
+      const response = await vectorizeApi.generateMeasurement(jobId, {
+        segments: active,
+        log: editLog,
+        save_first: dirty,
+      });
+      if (response.edit_version != null) {
+        markSaved(response.edit_version);
+      }
+      const refreshed = await vectorizeApi.get(jobId);
+      setJob(refreshed);
+      bumpSheetVersion();
+      setBomaSuccess(
+        `BOMA ready — ${response.rooms_detected} room(s) measured`,
+      );
+      setServerDangling([]);
+      setSidebarTab('deliver');
+      setViewMode('sheet');
+    } catch (err) {
+      if (err instanceof VectorizeApiError && err.status === 422) {
+        const detail = err.detail as RoomsNotClosedDetail | string;
+        if (detail && typeof detail === 'object') {
+          if (Array.isArray(detail.dangling_endpoints)) {
+            setServerDangling(detail.dangling_endpoints);
+          }
+          setBomaError(detail.message || err.message);
+        } else {
+          setBomaError(err.message);
+        }
+      } else {
+        setBomaError(err instanceof Error ? err.message : 'Generate BOMA failed');
+      }
+    } finally {
+      setGeneratingBoma(false);
+    }
+  }, [
+    generatingBoma, saving, segments, editLog, dirty, jobId, markSaved,
+    setJob, bumpSheetVersion, setSidebarTab, setViewMode,
+  ]);
 
   // ── Auto-save loop ─────────────────────────────────────────────────────
   // Every 30 s, if (a) auto-save is enabled, (b) we have unsaved changes, and
@@ -297,6 +391,16 @@ export function EditorSurface({ jobId }: Props) {
     };
   }, [segments, selectedIds, ghosts.length]);
 
+  const liveDangling = useMemo(
+    () => (dirty ? computeDanglingEndpoints(segments) : []),
+    [dirty, segments],
+  );
+  const danglingCount = dirty && liveDangling.length > 0
+    ? liveDangling.length
+    : serverDangling.length;
+  const showCloseGapsHint = exteriorUnreliable
+    && (segmentCounts.byLayer.walls ?? 0) >= 3;
+
   // ── Render ─────────────────────────────────────────────────────────────
   if (loadError) {
     return (
@@ -322,6 +426,9 @@ export function EditorSurface({ jobId }: Props) {
         affine={affine}
         rasterUrl={vectorizeApi.rasterUrl(jobId)}
         coverageUrl={hasCoverage ? vectorizeApi.coverageUrl(jobId) : null}
+        serverDangling={serverDangling}
+        showDangling={exteriorUnreliable}
+        liveDangling={dirty}
       />
       <EditorToolbar
         saving={saving}
@@ -331,13 +438,35 @@ export function EditorSurface({ jobId }: Props) {
         segmentCounts={segmentCounts}
         onFindDuplicates={handleFindDuplicates}
         finding={finding}
+        onGenerateBoma={handleGenerateBoma}
+        generatingBoma={generatingBoma}
+        hasMeasurementReport={hasMeasurementReport}
+        exteriorUnreliable={exteriorUnreliable}
+        showCloseGapsHint={showCloseGapsHint}
+        danglingCount={danglingCount}
       />
-      {saveError && (
+      {bomaSuccess && !bomaError && (
+        <div className="absolute bottom-12 left-3 rounded-lg bg-emerald-950/80 border border-emerald-700 px-3 py-2 text-xs text-emerald-200 backdrop-blur-sm flex items-center gap-2">
+          <span>{bomaSuccess}</span>
+          <button
+            onClick={() => setBomaSuccess(null)}
+            className="text-emerald-300 hover:text-emerald-100 text-[10px] underline"
+          >
+            dismiss
+          </button>
+        </div>
+      )}
+      {bomaError && (
+        <div className="absolute bottom-12 left-3 max-w-md rounded-lg bg-rose-950/80 border border-rose-700 px-3 py-2 text-xs text-rose-200 backdrop-blur-sm">
+          {bomaError}
+        </div>
+      )}
+      {saveError && !bomaError && (
         <div className="absolute bottom-12 left-3 rounded-lg bg-rose-950/80 border border-rose-700 px-3 py-2 text-xs text-rose-200 backdrop-blur-sm">
           {saveError}
         </div>
       )}
-      {autoSaveError && !saveError && (
+      {autoSaveError && !saveError && !bomaError && (
         <div className="absolute bottom-12 left-3 rounded-lg bg-amber-950/80 border border-amber-700 px-3 py-2 text-xs text-amber-200 backdrop-blur-sm flex items-center gap-2">
           <span>Auto-save failed: {autoSaveError}</span>
           <button

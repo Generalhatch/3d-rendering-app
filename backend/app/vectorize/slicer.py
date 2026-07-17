@@ -8,14 +8,16 @@ detection stages.
 
 Coordinate convention
 ---------------------
-Internal: pixel ``(col=x_idx, row=y_idx)`` maps to world ``(X, Y)`` as
+Internal: integer pixel ``(col=x_idx, row=y_idx)`` covers the world square
+``[origin + idx * res, origin + (idx + 1) * res)`` and its CENTRE lies at
 
-    world_x = origin_x + col * resolution
-    world_y = origin_y + row * resolution
+    world_x = origin_x + (col + 0.5) * resolution
+    world_y = origin_y + (row + 0.5) * resolution
 
-That is, ``row=0`` is the lowest Y in the world (south).  This matches the
-inline convention used in ``app/pipeline/scanplan.py`` so utility code can be
-reused across both pipelines.
+``row=0`` is the lowest Y in the world (south).  All pixel→world conversions
+in the vectorize stack use the pixel-centre (+0.5) form; world→pixel uses
+``floor((world - origin) / res)`` for binning or
+``round((world - origin) / res - 0.5)`` for nearest-pixel lookup.
 
 On disk, the PNG is written with row=0 flipped to the top (north-up) so that
 the image looks like a normal plan view in any image viewer.  The
@@ -44,8 +46,9 @@ MAX_RASTER_DIM_PX = 16_384
 class RasterAffine:
     """World ↔ pixel mapping for a raster slice.
 
-    Pixel ``(col, row)`` centre lies at world ``(origin_x + col * res,
-    origin_y + row * res)``.
+    Pixel ``(col, row)`` centre lies at world
+    ``(origin_x + (col + 0.5) * res, origin_y + (row + 0.5) * res)`` —
+    see :meth:`pixel_to_world`.
     """
     origin_x: float
     origin_y: float

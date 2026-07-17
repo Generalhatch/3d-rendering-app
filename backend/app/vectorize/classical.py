@@ -133,6 +133,10 @@ def segments_pixels_to_world(
 
     The output shape ``(N, 2, 2)`` is ``[[x1, y1], [x2, y2]]`` per segment —
     the same shape used elsewhere in the codebase (see ``scanplan.py``).
+
+    Uses the pixel-CENTRE convention (+0.5) to match
+    ``RasterAffine.pixel_to_world`` — omitting it introduced a systematic
+    half-pixel (5 mm at 1 cm/px) bias versus the contour wall extractor.
     """
     if len(segments_px) == 0:
         return np.zeros((0, 2, 2), dtype=np.float64)
@@ -141,10 +145,10 @@ def segments_pixels_to_world(
     res = affine.resolution_m_per_px
     ox, oy = affine.origin_x, affine.origin_y
 
-    x1w = ox + seg[:, 0] * res
-    y1w = oy + seg[:, 1] * res
-    x2w = ox + seg[:, 2] * res
-    y2w = oy + seg[:, 3] * res
+    x1w = ox + (seg[:, 0] + 0.5) * res
+    y1w = oy + (seg[:, 1] + 0.5) * res
+    x2w = ox + (seg[:, 2] + 0.5) * res
+    y2w = oy + (seg[:, 3] + 0.5) * res
 
     out = np.zeros((len(seg), 2, 2), dtype=np.float64)
     out[:, 0, 0] = x1w

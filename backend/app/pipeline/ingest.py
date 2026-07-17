@@ -15,10 +15,27 @@ Phase 4 fixes applied:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 import open3d as o3d
+
+# Progress callback for long loads: ``on_progress(points_read, total_points)``.
+# Invoked after every chunk in the chunked LAS path so callers can surface
+# incremental progress during multi-minute loads of multi-GB scans.
+ProgressCallback = Callable[[int, int], None]
+
+# Assembly-phase callback: fired once per named phase AFTER the last chunk,
+# so callers can keep the progress bar moving through the (previously silent)
+# window between "last chunk read" and "cloud ready".  Phases, in order:
+#   "classify"    — building + applying the file-global classification mask
+#   "assemble"    — copying the surviving points into Open3D
+#   "colors"      — color / intensity normalization (only when loaded)
+#   "unit_detect" — feet/metres detection over the assembled cloud
+# Callers must tolerate unknown phase names (forward compatibility).
+PhaseCallback = Callable[[str], None]
 
 # ASPRS noise classes always excluded when classification data is available.
 _NOISE_CLASSES = frozenset({7, 18})  # Low noise (7), High noise (18)
@@ -26,27 +43,283 @@ _NOISE_CLASSES = frozenset({7, 18})  # Low noise (7), High noise (18)
 # Files larger than this are read in chunks to cap peak RAM usage.
 _CHUNK_THRESHOLD_BYTES = 500 * 1024 * 1024  # 500 MB
 
+# US survey / international foot → metre.
+_FT_TO_M = 0.3048
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+# Plausible interior floor-to-ceiling heights, in metres.  Covers residential
+# (2.2 m) through warehouse/office-lobby (5.5 m).  A feet-based scan read as
+# metres shows 7–15 "metre" ceilings — far outside this window — which is the
+# unambiguous detection signal (10.76× area error if missed).
+_CEILING_MIN_M = 2.0
+_CEILING_MAX_M = 5.5
 
-def load_point_cloud(path: Path) -> o3d.geometry.PointCloud:
-    """Load a point cloud from LAS/LAZ, PLY, or E57."""
+# Plausible wall thickness in metres (drywall partition → thick masonry).
+_WALL_THICKNESS_MIN_M = 0.04
+_WALL_THICKNESS_MAX_M = 0.70
+
+# Unit detection only needs a height histogram + a mid-height wall slice.
+# Running those over a 140 M-point cloud is minutes of pure numpy with no
+# progress events — the UI looks hung at "Detecting scan units…".  2 M
+# random samples is plenty for a stable floor/ceiling peak gap.
+_UNIT_DETECT_MAX_POINTS = 2_000_000
+
+
+class UnitDetectionError(ValueError):
+    """Raised when the scan's linear unit cannot be determined and the
+    geometry is implausible under both metres and feet."""
+
+
+@dataclass
+class UnitDetection:
+    """Result of the ingest-time unit heuristic.
+
+    ``unit`` is the detected unit of the RAW file ("m" or "ft");
+    ``scale_to_m`` is the factor applied to convert to metres (1.0 for
+    metres).  ``method`` records which heuristic decided:
+
+    - ``ceiling_gap``: floor→ceiling peak gap fell in the plausible window
+      for exactly one unit.
+    - ``wall_thickness``: ceiling gap was inconclusive but the median wall
+      thickness was plausible for exactly one unit.
+    - ``assumed_metres``: no usable vertical structure (e.g. outdoor or
+      single-plane scan) — left unchanged, flagged for the caller.
+    """
+    unit: str                          # "m" | "ft"
+    scale_to_m: float
+    method: str                        # "ceiling_gap" | "wall_thickness" | "assumed_metres"
+    floor_to_ceiling_raw: float | None  # in raw file units, None if not found
+    wall_thickness_raw: float | None    # in raw file units, None if not measured
+
+
+def load_point_cloud(
+    path: Path,
+    normalize_units: bool = True,
+    on_progress: Optional[ProgressCallback] = None,
+    load_colors: bool = True,
+    on_phase: Optional[PhaseCallback] = None,
+) -> o3d.geometry.PointCloud:
+    """Load a point cloud from LAS/LAZ, PLY, or E57.
+
+    When ``normalize_units`` is True (default), the linear unit of the file
+    is detected from interior geometry (floor-to-ceiling height, wall
+    thickness) and feet-based scans are converted to metres in place.  A scan
+    whose geometry is implausible under both interpretations raises
+    :class:`UnitDetectionError` — a silent wrong-unit assumption corrupts
+    every downstream area by 10.76×, so we fail loudly instead.
+
+    ``on_progress(points_read, total_points)`` is invoked periodically during
+    chunked LAS/LAZ streaming (files > 500 MB) so a multi-minute load isn't
+    silent.  Other formats load in one shot and don't report progress.
+
+    ``load_colors=False`` skips LAS/LAZ color/intensity loading entirely —
+    the vectorize pipeline only consumes geometry, and accumulating colors
+    for a 680 MB scan wastes gigabytes of RAM.  (PLY/E57 loads are one-shot
+    and keep whatever the file carries.)
+
+    ``on_phase(name)`` is fired once per post-read assembly phase
+    ("classify" / "assemble" / "colors" / "unit_detect") so callers can keep
+    the progress bar honest during the memory-hungry window after the last
+    chunk callback.
+    """
     suffix = path.suffix.lower()
     if suffix in (".las", ".laz"):
-        return _load_las(path)
+        pcd = _load_las(
+            path, on_progress=on_progress, load_colors=load_colors,
+            on_phase=on_phase,
+        )
     elif suffix == ".ply":
         pcd = o3d.io.read_point_cloud(str(path))
         if len(pcd.points) == 0:
             raise ValueError(f"Empty point cloud: {path}")
-        return pcd
     elif suffix == ".e57":
-        return _load_e57(path)
+        pcd = _load_e57(path)
     else:
         raise ValueError(
             f"Unsupported scan format: {suffix}. Expected .las, .laz, .ply, .e57"
         )
+
+    if normalize_units:
+        if on_phase is not None:
+            on_phase("unit_detect")
+        pcd, detection = normalize_units_to_metres(pcd)
+        if detection.scale_to_m != 1.0:
+            print(
+                f"  Units: detected {detection.unit} (method={detection.method}, "
+                f"floor-to-ceiling={detection.floor_to_ceiling_raw}) — converted to metres"
+            )
+    return pcd
+
+
+# ---------------------------------------------------------------------------
+# Unit detection (feet vs metres)
+# ---------------------------------------------------------------------------
+
+def _find_floor_ceiling_gap(pts: np.ndarray, axis_idx: int = 2) -> float | None:
+    """Estimate the floor-to-ceiling distance from vertical density peaks.
+
+    Interior scans put dense horizontal slabs at the floor and ceiling.  We
+    histogram the vertical coordinate and take the gap between the two most
+    populated well-separated peaks.  Returns None when no such structure
+    exists (outdoor scan, single plane, too few points).
+    """
+    if len(pts) < 1_000:
+        return None
+    z = pts[:, axis_idx]
+    z_min, z_max = float(z.min()), float(z.max())
+    extent = z_max - z_min
+    if extent <= 0:
+        return None
+
+    n_bins = 256
+    counts, bin_edges = np.histogram(z, bins=n_bins)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    # Local maxima above a noise floor.  Boundary bins use a one-sided test —
+    # the floor slab is often exactly at z_min (bin 0).
+    noise_floor = max(float(np.median(counts)) * 2.0, len(pts) / n_bins * 0.5)
+    def _is_peak(i: int) -> bool:
+        left_ok = i == 0 or counts[i] >= counts[i - 1]
+        right_ok = i == n_bins - 1 or counts[i] >= counts[i + 1]
+        return left_ok and right_ok and counts[i] > noise_floor
+    peak_idx = [i for i in range(n_bins) if _is_peak(i)]
+    if len(peak_idx) < 2:
+        return None
+
+    # Strongest peak = one slab (usually the floor).  Partner = the strongest
+    # peak at least 25% of the extent away (the other slab).  This tolerates
+    # furniture bands and mid-height clutter peaks in between.
+    peak_idx.sort(key=lambda i: -counts[i])
+    a = peak_idx[0]
+    min_sep = 0.25 * extent
+    partner = None
+    for i in peak_idx[1:]:
+        if abs(bin_centers[i] - bin_centers[a]) >= min_sep:
+            partner = i
+            break
+    if partner is None:
+        return None
+    return float(abs(bin_centers[partner] - bin_centers[a]))
+
+
+def _estimate_wall_thickness(
+    pts: np.ndarray,
+    axis_idx: int,
+    z_low: float,
+    z_high: float,
+    raster_res: float = 0.02,
+) -> float | None:
+    """Rough median wall thickness (raw units) from a mid-height slice.
+
+    Rasterizes the band ``[z_low, z_high]`` to a coarse occupancy grid and
+    uses a distance transform: for wall pixels, twice the median distance to
+    free space approximates the wall thickness.  Cheap (single slice, coarse
+    grid) — good enough to distinguish 0.1 m walls from 0.1 ft (0.03 m) ones.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    band_mask = (pts[:, axis_idx] >= z_low) & (pts[:, axis_idx] <= z_high)
+    band = pts[band_mask]
+    if len(band) < 500:
+        return None
+    plan_axes = [i for i in range(3) if i != axis_idx]
+    xy = band[:, plan_axes]
+    mins = xy.min(axis=0)
+    span = xy.max(axis=0) - mins
+    w = int(np.ceil(span[0] / raster_res)) + 1
+    h = int(np.ceil(span[1] / raster_res)) + 1
+    if w * h > 8_000_000 or w < 4 or h < 4:
+        return None
+
+    occ = np.zeros((h, w), dtype=np.uint8)
+    cols = np.clip(((xy[:, 0] - mins[0]) / raster_res).astype(np.int32), 0, w - 1)
+    rows = np.clip(((xy[:, 1] - mins[1]) / raster_res).astype(np.int32), 0, h - 1)
+    occ[rows, cols] = 255
+
+    # Distance (in px) from each wall pixel to the nearest free pixel; a wall
+    # of thickness T has interior distances up to T/2.  The 90th percentile
+    # over wall pixels approximates half the typical thickness.
+    dist = cv2.distanceTransform(occ, distanceType=cv2.DIST_L2, maskSize=3)
+    wall_dist = dist[occ > 0]
+    if len(wall_dist) == 0:
+        return None
+    half_px = float(np.percentile(wall_dist, 90))
+    return 2.0 * half_px * raster_res
+
+
+def detect_units(pts: np.ndarray, axis_idx: int = 2) -> UnitDetection:
+    """Detect whether a point cloud is in metres or feet.
+
+    Primary heuristic: floor-to-ceiling peak gap.  Secondary: median wall
+    thickness from a mid-height slice.  Raises :class:`UnitDetectionError`
+    when vertical structure IS present but implausible under both units.
+
+    Huge clouds are randomly subsampled to :data:`_UNIT_DETECT_MAX_POINTS`
+    first — the histogram is stable well below that, and scanning every
+    point of a 100 M+ cloud freezes the job with no progress updates.
+    """
+    if len(pts) > _UNIT_DETECT_MAX_POINTS:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(len(pts), size=_UNIT_DETECT_MAX_POINTS, replace=False)
+        pts = pts[idx]
+
+    gap = _find_floor_ceiling_gap(pts, axis_idx)
+
+    if gap is not None:
+        plausible_m = _CEILING_MIN_M <= gap <= _CEILING_MAX_M
+        plausible_ft = _CEILING_MIN_M <= gap * _FT_TO_M <= _CEILING_MAX_M
+        if plausible_m and not plausible_ft:
+            return UnitDetection("m", 1.0, "ceiling_gap", gap, None)
+        if plausible_ft and not plausible_m:
+            return UnitDetection("ft", _FT_TO_M, "ceiling_gap", gap, None)
+
+        # Gap found but fits neither unit (e.g. 5.8 raw units) — try wall
+        # thickness as a tie-break before failing.
+        z = pts[:, axis_idx]
+        mid = float(np.median(z))
+        band = 0.15 * gap
+        thickness = _estimate_wall_thickness(pts, axis_idx, mid - band, mid + band)
+        if thickness is not None and thickness > 0:
+            t_m_ok = _WALL_THICKNESS_MIN_M <= thickness <= _WALL_THICKNESS_MAX_M
+            t_ft_ok = (
+                _WALL_THICKNESS_MIN_M <= thickness * _FT_TO_M <= _WALL_THICKNESS_MAX_M
+            )
+            if t_m_ok and not t_ft_ok:
+                return UnitDetection("m", 1.0, "wall_thickness", gap, thickness)
+            if t_ft_ok and not t_m_ok:
+                return UnitDetection("ft", _FT_TO_M, "wall_thickness", gap, thickness)
+
+        raise UnitDetectionError(
+            f"Cannot determine scan units: floor-to-ceiling distance is "
+            f"{gap:.2f} raw units — implausible as metres "
+            f"({_CEILING_MIN_M}–{_CEILING_MAX_M} m) and as feet "
+            f"({gap * _FT_TO_M:.2f} m after conversion). "
+            f"Re-export the scan in metres or feet, or verify the vertical axis."
+        )
+
+    # No floor/ceiling structure found (outdoor scan, single plane, sparse
+    # cloud).  Assume metres but tell the caller detection didn't run.
+    return UnitDetection("m", 1.0, "assumed_metres", None, None)
+
+
+def normalize_units_to_metres(
+    pcd: o3d.geometry.PointCloud,
+    axis_idx: int = 2,
+) -> tuple[o3d.geometry.PointCloud, UnitDetection]:
+    """Detect the unit of ``pcd`` and scale it to metres in place.
+
+    Returns ``(pcd, detection)``.  Raises :class:`UnitDetectionError` when
+    the unit cannot be determined (see :func:`detect_units`).
+    """
+    pts = np.asarray(pcd.points)
+    if len(pts) == 0:
+        return pcd, UnitDetection("m", 1.0, "assumed_metres", None, None)
+    detection = detect_units(pts, axis_idx)
+    if detection.scale_to_m != 1.0:
+        pcd.points = o3d.utility.Vector3dVector(pts * detection.scale_to_m)
+    return pcd, detection
 
 
 def write_decimated_ply(
@@ -212,14 +485,22 @@ def _apply_intensity_colors(pcd: o3d.geometry.PointCloud, intens: np.ndarray) ->
 # LAS / LAZ loaders
 # ---------------------------------------------------------------------------
 
-def _load_las(path: Path) -> o3d.geometry.PointCloud:
+def _load_las(
+    path: Path,
+    on_progress: Optional[ProgressCallback] = None,
+    load_colors: bool = True,
+    on_phase: Optional[PhaseCallback] = None,
+) -> o3d.geometry.PointCloud:
     """Load a LAS/LAZ file.  Routes to chunked streaming for files > 500 MB."""
     import laspy
 
     file_size = os.path.getsize(path)
     if file_size > _CHUNK_THRESHOLD_BYTES:
         print(f"  Large scan ({file_size / 1e6:.0f} MB) — using chunked streaming")
-        return _load_las_chunked(path)
+        return _load_las_chunked(
+            path, on_progress=on_progress, load_colors=load_colors,
+            on_phase=on_phase,
+        )
 
     las = laspy.read(str(path))
 
@@ -244,8 +525,9 @@ def _load_las(path: Path) -> o3d.geometry.PointCloud:
     pcd.points = o3d.utility.Vector3dVector(pts)
 
     # Colors: prefer true RGB; fall back to intensity; fall back to no colors.
+    # Skipped entirely for geometry-only callers (vectorize never uses them).
     color_set = False
-    if hasattr(las, "red") and hasattr(las, "green") and hasattr(las, "blue"):
+    if load_colors and hasattr(las, "red") and hasattr(las, "green") and hasattr(las, "blue"):
         try:
             r_raw = np.asarray(las.red,   dtype=np.float64)[mask]
             g_raw = np.asarray(las.green, dtype=np.float64)[mask]
@@ -256,7 +538,7 @@ def _load_las(path: Path) -> o3d.geometry.PointCloud:
         except Exception:
             pass
 
-    if not color_set:
+    if load_colors and not color_set:
         try:
             intens = np.asarray(las.intensity, dtype=np.float64)[mask]
             _apply_intensity_colors(pcd, intens)
@@ -266,40 +548,106 @@ def _load_las(path: Path) -> o3d.geometry.PointCloud:
     return pcd
 
 
-def _load_las_chunked(path: Path) -> o3d.geometry.PointCloud:
-    """LAZ-5: stream-read large LAS/LAZ files in 1M-point chunks to cap peak RAM.
+def _grow_buffer(arr: np.ndarray, new_capacity: int) -> np.ndarray:
+    """Grow a preallocated fill buffer to ``new_capacity`` rows, copying the
+    existing contents.  Only used when the LAS header undercounts."""
+    shape = (new_capacity,) if arr.ndim == 1 else (new_capacity, arr.shape[1])
+    out = np.empty(shape, dtype=arr.dtype)
+    out[: len(arr)] = arr
+    return out
+
+
+def _load_las_chunked(
+    path: Path,
+    chunk_points: int = 1_000_000,
+    on_progress: Optional[ProgressCallback] = None,
+    load_colors: bool = True,
+    on_phase: Optional[PhaseCallback] = None,
+) -> o3d.geometry.PointCloud:
+    """LAZ-5: stream-read large LAS/LAZ files in 1M-point chunks.
 
     laspy.read() loads the complete file before returning.  For a 2 GB LAZ file
     this means 2 GB sits in RAM alongside the Open3D objects being built from
-    it — peak usage ~4 GB for one scan before any downsampling.  Chunked
-    streaming keeps peak usage close to one chunk (~100 MB uncompressed).
+    it.  Chunked streaming decompresses one ~1 M-point chunk at a time.
+
+    Memory discipline (Phase 4.5 — a 680 MB LAS previously peaked at ~22 GB
+    RSS and thrashed a 32 GB machine):
+
+    - ``xyz`` is PREALLOCATED from ``reader.header.point_count`` and filled
+      per chunk.  The old list-of-chunks + ``np.vstack`` pattern briefly held
+      TWO full copies of the coordinates (24 B/point each).  Headers can lie:
+      a short read is trimmed at the end; an undercount grows the buffer.
+    - Colors are kept as raw ``uint16`` (6 B/point vs 24 B/point float64)
+      until AFTER the classification mask is applied, and only when
+      ``load_colors`` is True.  Geometry-only callers (the vectorize
+      pipeline) skip color accumulation entirely.
+
+    The classification mask is FILE-GLOBAL: chunks accumulate raw points plus
+    their classification codes, and :func:`_build_classification_mask` is
+    applied once over the whole file at the end.  Deciding the regime per
+    chunk was a correctness bug — an aerial survey whose class-6 percentage
+    varies across chunks would keep "class 6 only" in one chunk and "all
+    non-noise" in the next, silently mixing filtering policies within one
+    scan (and disagreeing with the unchunked loader).
+
+    ``on_progress(points_read, total_points)`` fires after every chunk —
+    a 689 MB scan takes minutes to decompress, and without these callbacks
+    the job looks hung.  ``total_points`` comes from the LAS header; if the
+    header count is missing/zero, the running count is passed as both args.
+
+    ``on_phase(name)`` fires once per post-read assembly phase ("classify",
+    "assemble", "colors") — the window after the last chunk is the most
+    memory-hungry part of the load and previously emitted nothing, making
+    honest assembly work indistinguishable from a hang.
     """
     import laspy
 
-    pts_chunks: list[np.ndarray] = []
-    color_chunks: list[np.ndarray] = []  # raw (pre-normalization) for global scale detection
-    intens_chunks: list[np.ndarray] = []
+    def _phase(name: str) -> None:
+        if on_phase is not None:
+            on_phase(name)
 
-    has_rgb: bool | None = None      # None = not yet detected
-    has_intensity: bool | None = None
+    has_rgb: bool | None = None if load_colors else False
+    has_intensity: bool | None = None if load_colors else False
 
+    write_pos = 0
     with laspy.open(str(path)) as reader:
-        for chunk in reader.chunk_iterator(1_000_000):
-            n_chunk = len(chunk.x)
-            mask = np.ones(n_chunk, dtype=bool)
-            try:
-                cls = np.asarray(chunk.classification, dtype=np.int32)
-                mask = _build_classification_mask(cls, n_chunk)
-            except Exception:
-                pass
+        try:
+            total_points = int(reader.header.point_count)
+        except Exception:
+            total_points = 0
 
-            pts_chunks.append(
-                np.vstack([
-                    np.asarray(chunk.x, dtype=np.float64)[mask],
-                    np.asarray(chunk.y, dtype=np.float64)[mask],
-                    np.asarray(chunk.z, dtype=np.float64)[mask],
-                ]).T
-            )
+        # Preallocate fill buffers from the header count (no list + vstack).
+        capacity = max(total_points, chunk_points)
+        xyz = np.empty((capacity, 3), dtype=np.float64)
+        cls_buf: np.ndarray | None = np.empty(capacity, dtype=np.uint8)
+        colors_buf: np.ndarray | None = None   # uint16 (N, 3), lazy-allocated
+        intens_buf: np.ndarray | None = None   # uint16 (N,),  lazy-allocated
+
+        for chunk in reader.chunk_iterator(chunk_points):
+            n = len(chunk.x)
+            end = write_pos + n
+            if end > capacity:
+                # Header undercounted — grow every live buffer (rare).
+                capacity = max(end, capacity + chunk_points)
+                xyz = _grow_buffer(xyz, capacity)
+                if cls_buf is not None:
+                    cls_buf = _grow_buffer(cls_buf, capacity)
+                if colors_buf is not None:
+                    colors_buf = _grow_buffer(colors_buf, capacity)
+                if intens_buf is not None:
+                    intens_buf = _grow_buffer(intens_buf, capacity)
+
+            xyz[write_pos:end, 0] = chunk.x
+            xyz[write_pos:end, 1] = chunk.y
+            xyz[write_pos:end, 2] = chunk.z
+
+            if cls_buf is not None:
+                try:
+                    cls_buf[write_pos:end] = np.asarray(
+                        chunk.classification, dtype=np.uint8,
+                    )
+                except Exception:
+                    cls_buf = None
 
             # Auto-detect color/intensity fields from the first chunk.
             if has_rgb is None:
@@ -313,40 +661,77 @@ def _load_las_chunked(path: Path) -> o3d.geometry.PointCloud:
 
             if has_rgb:
                 try:
-                    r_raw = np.asarray(chunk.red,   dtype=np.float64)[mask]
-                    g_raw = np.asarray(chunk.green, dtype=np.float64)[mask]
-                    b_raw = np.asarray(chunk.blue,  dtype=np.float64)[mask]
-                    color_chunks.append(np.vstack([r_raw, g_raw, b_raw]).T)
+                    if colors_buf is None:
+                        colors_buf = np.empty((capacity, 3), dtype=np.uint16)
+                    colors_buf[write_pos:end, 0] = np.asarray(chunk.red,   dtype=np.uint16)
+                    colors_buf[write_pos:end, 1] = np.asarray(chunk.green, dtype=np.uint16)
+                    colors_buf[write_pos:end, 2] = np.asarray(chunk.blue,  dtype=np.uint16)
                 except Exception:
                     has_rgb = False
-                    color_chunks.clear()  # discard partial accumulation
+                    colors_buf = None  # discard partial accumulation
 
             if not has_rgb and has_intensity:
                 try:
-                    intens_chunks.append(
-                        np.asarray(chunk.intensity, dtype=np.float64)[mask]
+                    if intens_buf is None:
+                        intens_buf = np.empty(capacity, dtype=np.uint16)
+                    intens_buf[write_pos:end] = np.asarray(
+                        chunk.intensity, dtype=np.uint16,
                     )
                 except Exception:
                     has_intensity = False
-                    intens_chunks.clear()
+                    intens_buf = None
 
-    if not pts_chunks:
+            write_pos = end
+            if on_progress is not None:
+                on_progress(write_pos, total_points or write_pos)
+
+    if write_pos == 0:
         raise ValueError(f"No points read from {path}")
 
-    pts = np.vstack(pts_chunks)
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts)
+    # Trim short reads.  These are views — no copy; the (rare) capacity slack
+    # is released once the masked copies below replace the last references.
+    xyz = xyz[:write_pos]
 
-    if has_rgb and color_chunks:
+    # File-global classification mask — same decision the unchunked loader
+    # would make on the complete file.  uint8 comparisons are identical to
+    # the unchunked loader's int32 ones; skipping the cast avoids a 4× copy.
+    _phase("classify")
+    if cls_buf is not None:
+        mask = _build_classification_mask(cls_buf[:write_pos], write_pos)
+        cls_buf = None
+        keep_all = bool(mask.all())
+    else:
+        mask = None
+        keep_all = True
+
+    _phase("assemble")
+    pcd = o3d.geometry.PointCloud()
+    # When the mask keeps everything, skip the fancy-index copy — Open3D
+    # copies into its own storage anyway.
+    pcd.points = o3d.utility.Vector3dVector(xyz if keep_all else xyz[mask])
+    del xyz
+
+    if colors_buf is not None:
+        _phase("colors")
         try:
-            all_raw = np.vstack(color_chunks)
-            r, g, b = _normalize_rgb(all_raw[:, 0], all_raw[:, 1], all_raw[:, 2])
+            raw = colors_buf[:write_pos]
+            if not keep_all:
+                raw = raw[mask]
+            colors_buf = None
+            # uint16 / float divides to float64 — normalization happens on
+            # the (smaller) post-mask array only.
+            r, g, b = _normalize_rgb(raw[:, 0], raw[:, 1], raw[:, 2])
             pcd.colors = o3d.utility.Vector3dVector(np.vstack([r, g, b]).T)
         except Exception:
             pass
-    elif intens_chunks:
+    elif intens_buf is not None:
+        _phase("colors")
         try:
-            _apply_intensity_colors(pcd, np.concatenate(intens_chunks))
+            intens = intens_buf[:write_pos]
+            if not keep_all:
+                intens = intens[mask]
+            intens_buf = None
+            _apply_intensity_colors(pcd, intens.astype(np.float64))
         except Exception:
             pass
 

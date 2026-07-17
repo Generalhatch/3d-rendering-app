@@ -26,7 +26,8 @@ import {
   useEditorStore,
   type EditorSegment,
 } from '../../../state/editorStore';
-import type { RasterAffine, RejectedSegmentPayload } from '../../../api/vectorize';
+import type { DanglingEndpoint, RasterAffine, RejectedSegmentPayload } from '../../../api/vectorize';
+import { computeDanglingEndpoints } from './danglingEndpoints';
 
 const HIT_TOLERANCE_PX = 6;          // mouse must be within this many svg-pixels of a segment to hit it
 const ENDPOINT_PICK_PX = 10;         // distance to grab an endpoint vs the body of the segment
@@ -41,9 +42,18 @@ interface Props {
   rasterUrl: string;
   /** Optional coverage-gaps RGBA overlay (red where uncovered). */
   coverageUrl?: string | null;
+  /** Server-persisted dangling ends (overridden by live recompute while editing). */
+  serverDangling?: DanglingEndpoint[];
+  /** When true, show always-on dangling markers (rooms not closed). */
+  showDangling?: boolean;
+  /** When true, recompute dangling from current segments (live edit feedback). */
+  liveDangling?: boolean;
 }
 
-export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: Props) {
+export function EditorCanvas({
+  jobId: _jobId, affine, rasterUrl, coverageUrl,
+  serverDangling = [], showDangling = false, liveDangling = false,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
 
@@ -430,6 +440,17 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
     });
   }, [ghosts, ghostsVisible, worldToPx]);
 
+  // Prefer server topology dangling on load / BOMA failure; recompute live
+  // only while the operator is editing so markers track drag/draw.
+  const danglingMarkers = useMemo(() => {
+    if (!showDangling) return [] as DanglingEndpoint[];
+    if (liveDangling) {
+      const live = computeDanglingEndpoints(segments);
+      return live;
+    }
+    return serverDangling;
+  }, [showDangling, liveDangling, segments, serverDangling]);
+
   // Active merge suggestion preview (the pair the operator is about to act on).
   const currentSuggestion = useMemo(() => {
     if (!mergeSuggestions.length || mergeCursor >= mergeSuggestions.length) return null;
@@ -597,6 +618,15 @@ export function EditorCanvas({ jobId: _jobId, affine, rasterUrl, coverageUrl }: 
               </g>
             );
           })}
+
+        {/* Always-on dangling (degree-1) wall ends — coral rings so operators
+            know what to close before Generate BOMA. */}
+        {showDangling && isLayerVisible('walls') && danglingMarkers.map((d, i) => {
+          const [cx, cy] = worldToPx(d.x, d.y);
+          return (
+            <DanglingMarker key={`dang-${i}-${d.x}-${d.y}`} cx={cx} cy={cy} scale={view.scale} />
+          );
+        })}
 
         {/* Ghost line during endpoint drag — shows where the endpoint will land on release. */}
         {dragging && (() => {
@@ -906,6 +936,31 @@ function Endpoint({ cx, cy, scale, active }: { cx: number; cy: number; scale: nu
       stroke="#0f172a"
       strokeWidth={1 / scale}
     />
+  );
+}
+
+/** Always-on open-end marker — coral ring, distinct from yellow selection handles. */
+function DanglingMarker({ cx, cy, scale }: { cx: number; cy: number; scale: number }) {
+  return (
+    <g>
+      <circle
+        cx={cx}
+        cy={cy}
+        r={7 / scale}
+        fill="none"
+        stroke="#f97316"
+        strokeWidth={2.2 / scale}
+        opacity={0.95}
+      />
+      <circle
+        cx={cx}
+        cy={cy}
+        r={3 / scale}
+        fill="#fb923c"
+        stroke="#7c2d12"
+        strokeWidth={1 / scale}
+      />
+    </g>
   );
 }
 

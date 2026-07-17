@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import numpy as np
 import open3d as o3d
 
+from ..geometry.classify import SHAPE_COMMON_CATEGORIES
 from .segment import WallPlane
 from .slicing import FloorReference
 
@@ -449,58 +450,14 @@ def generate_rooms_from_scan(
 # ── Room helpers ──────────────────────────────────────────────────────────────
 
 def _classify_room(area_m2: float, eccentricity: float, solidity: float) -> tuple[str, str, float]:
-    """Classify a room from shape metrics. Returns (label, category, confidence: 0.0–1.0).
+    """Classify a room from shape metrics. Returns (label, category, confidence).
 
-    Uses watershed regionprops values that are already computed for each room:
-      eccentricity  — 0=square, 1=very elongated line (>0.85 suggests corridor)
-      solidity      — area / convex_hull_area (1=convex, <0.7=highly irregular)
-      area_m2       — floor area in square metres
-
-    Confidence reflects how strongly the metrics match the assigned category.
-    A score of 0.95 means the room clearly fits; 0.50 means it is a weak match.
+    The implementation lives in :func:`app.geometry.classify.classify_room_shape`
+    so both pipelines classify rooms with identical rules; this wrapper keeps
+    the historical import path (`from app.pipeline.scanplan import _classify_room`).
     """
-    def _clamp01(x: float) -> float:
-        return max(0.0, min(1.0, x))
-
-    # ── Hallway / Corridor ────────────────────────────────────────────────────
-    # Key signal: high eccentricity (elongated shape).  Area must be reasonable.
-    if eccentricity > 0.85 and area_m2 < 40:
-        ecc_conf = _clamp01((eccentricity - 0.85) / 0.12)   # 0 at 0.85 → 1 at 0.97
-        area_conf = _clamp01(1.0 - area_m2 / 45.0)
-        return "Hallway / Corridor", "hallway", _clamp01(0.55 + ecc_conf * 0.38 + area_conf * 0.07)
-
-    # ── Bathroom / Storage ────────────────────────────────────────────────────
-    # Key signal: unusually small floor area.
-    if area_m2 < 7.0:
-        # Score scales from 0.55 (just-under-7 m²) up to 0.92 (≤2 m²)
-        conf = _clamp01(0.55 + (7.0 - area_m2) / 14.0)
-        return "Bathroom / Storage", "bathroom", conf
-
-    # ── Open Plan / Lobby ─────────────────────────────────────────────────────
-    # Key signals: large area AND convex shape.  Both criteria needed.
-    if area_m2 > 80.0 and solidity > 0.85:
-        area_conf = _clamp01((area_m2 - 80.0) / 120.0)       # 0 at 80 m² → 1 at 200 m²
-        sol_conf  = _clamp01((solidity - 0.85) / 0.14)        # 0 at 0.85 → 1 at 0.99
-        return "Open Plan / Lobby", "common", _clamp01(0.60 + area_conf * 0.25 + sol_conf * 0.15)
-
-    # ── Conference Room ───────────────────────────────────────────────────────
-    # Medium-large area; confidence grows with size above the threshold.
-    if area_m2 > 40.0:
-        conf = _clamp01(0.55 + (area_m2 - 40.0) / 100.0)     # 0.55 at 40 m² → ~0.90 at 75 m²
-        return "Conference Room", "office", conf
-
-    # ── Irregular Space ───────────────────────────────────────────────────────
-    # Low solidity indicates a complex, non-convex polygon.
-    if solidity < 0.70:
-        conf = _clamp01(0.50 + (0.70 - solidity) / 0.60)      # 0.50 at 0.70 → 0.83 at 0.40
-        return "Irregular Space", "unknown", conf
-
-    # ── Office / Meeting ─────────────────────────────────────────────────────
-    # Default: regular shape, typical office size (8–30 m²).
-    area_fit = 1.0 - abs(area_m2 - 18.0) / 25.0              # peak at 18 m²
-    sol_fit  = _clamp01((solidity - 0.60) / 0.35)
-    conf = _clamp01(0.50 + max(0.0, area_fit) * 0.25 + sol_fit * 0.15)
-    return "Office / Meeting", "office", conf
+    from ..geometry.classify import classify_room_shape
+    return classify_room_shape(area_m2, eccentricity, solidity)
 
 
 def _rooms_from_occupancy(
@@ -738,6 +695,10 @@ def _rooms_from_occupancy(
             "solidity": float(region.solidity),             # 1=convex, <0.8=irregular
             # MJ1: classifier confidence — how strongly the metrics fit this category
             "classification_confidence": round(clf_conf, 3),
+            # Phase 2: common-area flag feeding measurement apportionment.
+            # Shape-derived, so use the conservative mapping (corridor/restroom
+            # only — never assume a large convex room is a lobby).
+            "is_common": category in SHAPE_COMMON_CATEGORIES,
         })
         if len(rooms) >= max_rooms:
             break
@@ -805,6 +766,7 @@ def _rooms_from_polygonize(synthetic_plan: SyntheticPlan) -> list[dict]:
             "solidity": solidity,
             "orientation_deg": 0.0,
             "classification_confidence": round(clf_conf, 3),
+            "is_common": category in SHAPE_COMMON_CATEGORIES,
         })
     return rooms
 
@@ -825,4 +787,5 @@ def _building_as_single_room(synthetic_plan: SyntheticPlan) -> list[dict]:
         "area_m2": float(area),
         "match_quality": None,
         "classification_confidence": 0.30,   # fallback path — low confidence
+        "is_common": False,
     }]

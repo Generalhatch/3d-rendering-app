@@ -54,18 +54,23 @@ def extract_rooms(dxf_path: str) -> list[Room]:
 
     labels = _extract_text_entities(msp)
 
+    # Area via the consolidated geometry-model helper (Phase 1) so every
+    # pipeline reports areas from the same code path.
+    from ..geometry.model import polygon_area
+
     rooms: list[Room] = []
     for i, poly in enumerate(closed_polys):
         label = _match_label_to_polygon(poly, labels) or f"Room-{i + 1:03d}"
         category = _categorize(label)
         centroid = poly.centroid
+        exterior = [(x, y) for x, y in poly.exterior.coords]
         rooms.append(Room(
             id=f"room-{i + 1:03d}",
             label=label,
             category=category,
-            polygon_2d=[(x, y) for x, y in poly.exterior.coords],
+            polygon_2d=exterior,
             centroid=(float(centroid.x), float(centroid.y)),
-            area_m2=float(poly.area),
+            area_m2=polygon_area(exterior),
         ))
     return rooms
 

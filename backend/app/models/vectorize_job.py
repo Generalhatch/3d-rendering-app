@@ -191,13 +191,14 @@ class VectorizeParams(BaseModel):
                     "spacing.  Set 0 to disable (debug only).",
     )
     voxel_downsample_auto: bool = Field(
-        default=False,
-        description="OPT-IN: when true, after the initial voxel pass, check the "
-                    "result count and re-downsample with a larger voxel if still "
-                    "above 20 M points.  Speeds up extremely dense scans but at "
-                    "the risk of thinning walls past the morphology survival "
-                    "threshold.  Off by default — use for huge scans only after "
-                    "verifying walls survive in slice_cleaned.png.",
+        default=True,
+        description="After the initial voxel pass, re-downsample with a larger "
+                    "voxel (up to 10 mm — the accuracy ceiling) if the cloud is "
+                    "still above 20 M points.  Dense multi-scan mosaics often "
+                    "keep ~80 M points at 5 mm; without this the pipeline can "
+                    "thrash for hours.  Escalation never exceeds 10 mm so wall "
+                    "features ≥ 1 cm and door frames stay intact.  Disable only "
+                    "when debugging a scan that needs native density.",
     )
     use_ceiling_band: bool = Field(
         default=True,
@@ -237,13 +238,39 @@ class VectorizeParams(BaseModel):
                     "polylines, above it merges corners.",
     )
     snapping_distance_m: float = Field(
-        default=0.30,
+        default=0.85,
         ge=0.05, le=1.50,
-        description="Cloud2BIM-style: after wall extraction, extend each wall along "
-                    "its own axis until it intersects another wall, but only if "
-                    "the gap is ≤ this distance.  Replaces v3's snap_tol_m + "
-                    "extend_tol_m pair with a single axis-aware parameter.",
+        description="Cloud2BIM / Phase-3 corner join: extend each wall along "
+                    "its own axis (and trim overshoots) until it meets a host "
+                    "or L-partner, but only if the gap is ≤ this distance.  "
+                    "0.85 m closes typical 10–80 cm undershoots on real scans "
+                    "without bridging most door leaves (~0.9 m).  Drop toward "
+                    "0.60 m if doors start closing; raise toward 1.0 m for "
+                    "messy contour corners.",
     )
+    # ── Phase 4 (robustness + trust) ──
+
+    gravity_relevel: bool = Field(
+        default=True,
+        description="After floor detection, rotate the cloud so the detected "
+                    "floor plane is exactly level (and at height 0) before "
+                    "slicing.  Fixes tilted-scanner scans where a horizontal "
+                    "slice catches ceiling at one end of the building and "
+                    "desks at the other.  Tilts under 0.5° are ignored; tilts "
+                    "over 15° are refused (almost certainly a mis-detected "
+                    "ramp) and surfaced as a warning.  Only applies when "
+                    "elevation_m is auto.",
+    )
+    adaptive_slice_band: bool = Field(
+        default=True,
+        description="Measure the actual floor-to-ceiling clearance from the "
+                    "height histogram and scale the slice elevation + ceiling "
+                    "band down for low-clearance spaces (data centers, old "
+                    "basements) where the defaults would straddle the ceiling. "
+                    "Tall rooms keep the defaults unchanged.  Only applies "
+                    "when elevation_m is auto.",
+    )
+
     clip_walls_to_envelope: bool = Field(
         default=False,
         description="OPT-IN: drop walls whose midpoint sits outside the building "
@@ -298,6 +325,12 @@ class VectorizeMetrics(BaseModel):
     rooms_detected: Optional[int] = None            # # of enclosed rooms found
     junctions_merged: Optional[int] = None          # # of endpoints collapsed
     t_junctions_extended: Optional[int] = None      # # of T-junctions closed
+    # Phase 2 continuity: residual gap-close + envelope projection.
+    gaps_closed: Optional[int] = None               # collinear degree-1 bridges
+    envelope_projections: Optional[int] = None      # dangling ends snapped to hull
+    dangling_before: Optional[int] = None           # degree-1 count pre-continuity
+    dangling_after: Optional[int] = None            # degree-1 count post-continuity
+    envelope_edges_injected: Optional[int] = None   # virtual hull edges in topology
     # v4 (Cloud2BIM-style track): voxel downsample + ceiling-band slice stats.
     points_after_downsample: Optional[int] = None   # # of points after voxel grid
     downsample_voxel_m: Optional[float] = None      # voxel size that was applied
@@ -306,6 +339,39 @@ class VectorizeMetrics(BaseModel):
     wall_mask_pixels: Optional[int] = None          # FG pixels after density&ceiling AND
     # v4 contour-based wall extraction: # of contours / polylines emitted.
     contour_walls_detected: Optional[int] = None    # # of wall polylines from contours
+    # Phase 4: gravity re-level + adaptive slice band + per-room confidence.
+    gravity_relevel_applied: Optional[bool] = None  # True iff cloud was releveled
+    gravity_tilt_deg: Optional[float] = None        # detected floor-plane tilt
+    ceiling_clearance_m: Optional[float] = None     # floor→ceiling from histogram
+    slice_band_adjusted: Optional[bool] = None      # True iff bands were scaled down
+    rooms_flagged: Optional[int] = None             # # rooms below confidence threshold
+
+
+class PipelineWarningPayload(BaseModel):
+    """One structured pipeline fallback warning (Phase 4).
+
+    ``code`` is a stable snake_case identifier (see
+    ``app.vectorize.pipeline_warnings.KNOWN_CODES``); ``stage`` is the SSE
+    stage where the fallback fired.
+    """
+    code: str
+    stage: str
+    message: str
+
+
+class RoomConfidencePayload(BaseModel):
+    """Per-room trust score (Phase 4) — surfaced in the editor.
+
+    ``polygon`` is the room ring in world metres so the editor can
+    highlight flagged rooms without re-deriving them from segments.
+    """
+    room_index: int
+    area_m2: float
+    boundary_coverage: float
+    snap_correction_m: float
+    confidence: float
+    flagged: bool
+    polygon: list[list[float]]
 
 
 class VectorizeJobDetail(BaseModel):
@@ -318,12 +384,19 @@ class VectorizeJobDetail(BaseModel):
     params: Optional[VectorizeParams] = None
     metrics: Optional[VectorizeMetrics] = None
     error_message: Optional[str] = None
+    # Phase 4: structured fallback warnings + per-room confidence from
+    # result.json.  Empty lists on legacy jobs.
+    warnings: list[PipelineWarningPayload] = []
+    room_confidence: list[RoomConfidencePayload] = []
 
     has_raster: bool = False
     has_overlay: bool = False
     has_dxf: bool = False
     has_coverage: bool = False
     has_rejected: bool = False     # True when ``rejected_segments.json`` exists
+    has_sheet: bool = False        # True when ``sheet.svg`` exists (Phase 3)
+    has_floor_geometry: bool = False   # True when ``floor_geometry.json`` exists
+    has_measurement_report: bool = False  # True when ``measurement_report.json`` exists
 
 
 class VectorizeReprocessRequest(BaseModel):
@@ -449,3 +522,75 @@ class SaveEditsResponse(BaseModel):
     edit_version: int                  # monotonic — increments on every save
     dxf_url: str
     segments_saved: int
+
+
+class GenerateMeasurementRequest(BaseModel):
+    """Body for POST /api/vectorize/{id}/generate-measurement.
+
+    When ``segments`` is provided the server saves them first (same as
+    POST /edits), then rebuilds floor geometry + BOMA from that wall
+    network.  When omitted, uses the current ``segments.json`` on disk.
+    """
+    segments: Optional[list[EditableSegment]] = None
+    log: list[EditEvent] = []
+    save_first: bool = False
+
+
+class GenerateMeasurementResponse(BaseModel):
+    job_id: str
+    rooms_detected: int
+    has_floor_geometry: bool
+    has_measurement_report: bool
+    has_sheet: bool
+    warnings: list[dict] = []
+    n_walls: int = 0
+    n_junctions: int = 0
+    edit_version: Optional[int] = None
+
+
+# ── Floor plan sheet (Phase 3) schemas ───────────────────────────────────────
+
+class ManualGridSpec(BaseModel):
+    """Operator-entered column grid — the fallback when no columns were
+    detected (or the fitted grid is wrong).  Offsets are in metres, in the
+    grid frame rotated ``rotation_deg`` from world axes."""
+    rotation_deg: float = 0.0
+    u_offsets_m: list[float] = []      # numbered lines (1, 2, 3…)
+    v_offsets_m: list[float] = []      # lettered lines (A, B, C…)
+
+
+class SheetMetaSpec(BaseModel):
+    """Title block fields the operator can fill in."""
+    building_name: str = ""
+    address: str = ""
+    floor_name: str = ""
+    north_angle_deg: float = 0.0
+
+
+class DoorSwingSpec(BaseModel):
+    """Per-opening door swing override — lets the operator flip a door the
+    scanner couldn't observe.  ``side`` is relative to the opening
+    segment's direction ("left" = +90° CCW)."""
+    hinge: str = "start"               # "start" | "end"
+    side: str = "left"                 # "left" | "right"
+
+
+class SheetOverridesRequest(BaseModel):
+    """Body for POST /api/vectorize/{id}/sheet/overrides.
+
+    All fields optional: ``labels`` / ``door_swings`` merge per-key (empty
+    value clears an override); ``meta`` / ``manual_grid`` / ``style``
+    replace wholesale (null removes).  ``style`` is "full" or
+    "stevenson_minimal".
+    """
+    labels: Optional[dict[str, str]] = None
+    meta: Optional[SheetMetaSpec] = None
+    manual_grid: Optional[ManualGridSpec] = None
+    style: Optional[str] = None
+    door_swings: Optional[dict[str, DoorSwingSpec]] = None
+
+
+class SheetOverridesResponse(BaseModel):
+    job_id: str
+    sheet_url: str
+    scale_denominator: int

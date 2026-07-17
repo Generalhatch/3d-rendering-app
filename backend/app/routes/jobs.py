@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import uuid
 from pathlib import Path
 
@@ -29,8 +28,8 @@ from ..models.job import FloorCandidate, JobCreate, JobDetail, JobStatus, Reproc
 from ..models.room import RoomSchema
 from ..models.fixture import FixtureSchema
 from ..storage import (
-    create_job, load_job, load_result_json, update_job_status,
-    uploads_dir, results_dir, artifacts_dir,
+    create_job, load_job, load_result_json, store_upload_deduped,
+    update_job_status, uploads_dir, results_dir, artifacts_dir,
 )
 from ..sse import progress_generator
 from ..pipeline.runner import run_pipeline, run_pipeline_guarded, reprocess_rooms_guarded
@@ -94,12 +93,11 @@ async def create_job_endpoint(
             )
 
         safe_name = f"{i:02d}_{_safe_filename(scan_file.filename or f'scan_{i}.laz')}"
-        path = upload_dir / safe_name
 
-        # Stream directly from the spooled upload buffer to disk — avoids
-        # creating a second in-memory copy of the entire file.
-        with open(path, "wb") as f_out:
-            shutil.copyfileobj(scan_file.file, f_out)
+        # Stream to the content-addressed store (sha256 computed while
+        # writing) — identical scans uploaded to multiple jobs are stored
+        # once; the job dir gets a symlink to the shared blob.
+        path, _scan_hash = store_upload_deduped(scan_file.file, job_id, safe_name)
 
         # Magic-byte validation reads only the first 4 bytes from the saved file.
         with open(path, "rb") as f_head:

@@ -78,11 +78,25 @@ class DownsampleResult:
         )
 
 
+# Accuracy ceiling for auto-escalation.  The CAD-quality plan (and Bassier &
+# Vergauwen 2020) treat 10 mm as the coarsest spacing that still preserves
+# wall features ≥ 1 cm and door frames.  Going coarser (e.g. 50 mm) would
+# thin partitions below the morphology survival threshold — never do that
+# automatically.  Prefer a slower run over a wrong floor plan.
+ACCURACY_MAX_VOXEL_M = 0.01
+
+# Point-count target after downsample.  Empirically a 5 mm pass on a typical
+# terrestrial scan lands ~3 M points; dense multi-scan mosaics may still be
+# above this at the 10 mm accuracy ceiling — in that case we STOP escalating
+# and accept the runtime hit rather than sacrifice geometry.
+DEFAULT_TARGET_MAX_POINTS = 20_000_000
+
+
 def voxel_downsample_auto(
     pcd: o3d.geometry.PointCloud,
     initial_voxel_m: float,
-    target_max_points: int = 20_000_000,
-    max_voxel_m: float = 0.05,
+    target_max_points: int = DEFAULT_TARGET_MAX_POINTS,
+    max_voxel_m: float = ACCURACY_MAX_VOXEL_M,
 ) -> DownsampleResult:
     """Voxel-downsample with auto-rescale until under ``target_max_points``.
 
@@ -95,11 +109,12 @@ def voxel_downsample_auto(
     The fixed 5 mm default underdownsamples the dense composites,
     leaving runtime stuck.  This function repeatedly increases voxel
     size (by 50 % each pass) until the result is under
-    ``target_max_points`` or until we hit ``max_voxel_m`` (a safety cap
-    so we never thin walls to invisibility).
+    ``target_max_points`` **or** until we hit ``max_voxel_m``.
 
-    Practically: typical large scans converge in 1-3 passes; the cost
-    is negligible compared to a single full-pipeline run.
+    ``max_voxel_m`` defaults to :data:`ACCURACY_MAX_VOXEL_M` (10 mm) — the
+    coarsest spacing the accuracy plan allows.  If the cloud is still above
+    ``target_max_points`` at that ceiling, we keep the 10 mm result and let
+    the pipeline run slower rather than destroy wall geometry.
     """
     n_before = int(len(pcd.points))
     if n_before == 0:
@@ -107,13 +122,17 @@ def voxel_downsample_auto(
     if n_before <= target_max_points and initial_voxel_m <= 0:
         return DownsampleResult(pcd=pcd, voxel_m=0.0, n_before=n_before, n_after=n_before)
 
-    voxel = max(1e-3, float(initial_voxel_m or 0.01))
+    # Never escalate past the accuracy ceiling, even if a caller passes a
+    # larger max — silent 50 mm thinning is how you lose partitions.
+    max_voxel_m = min(float(max_voxel_m), ACCURACY_MAX_VOXEL_M)
+    voxel = max(1e-3, float(initial_voxel_m or 0.005))
+    voxel = min(voxel, max_voxel_m)
     cur = pcd
     n_after = n_before
-    for _ in range(6):  # at most 6 doublings: 5mm → 38mm
+    for _ in range(6):  # 5 mm → 7.5 → 10 mm (then stop at ceiling)
         cur = pcd.voxel_down_sample(voxel_size=voxel)
         n_after = int(len(cur.points))
-        if n_after <= target_max_points or voxel >= max_voxel_m:
+        if n_after <= target_max_points or voxel >= max_voxel_m - 1e-9:
             break
         voxel = min(max_voxel_m, voxel * 1.5)
 

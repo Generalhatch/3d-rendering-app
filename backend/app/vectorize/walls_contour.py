@@ -92,10 +92,21 @@ class WallContourParams:
     # are simplified to nearly-coincident vertices.
     min_segment_length_m: float = 0.08
 
-    # Internal CLOSE before findContours.  Bridges sub-cm gaps left by
-    # the gate-AND step (a single missing pixel in either the density or
-    # ceiling mask would otherwise split a wall into two contours).
-    close_kernel_px: int = 3
+    # Internal CLOSE before findContours.  Must be large enough to heal
+    # dashed wall strokes in the density∩ceiling mask (this scan had ~842
+    # connected components at 3 px CLOSE; BricsCAD's POINTCLOUDPROJECTSECTION
+    # "Gap" tolerance does the same job).  ~9–11 px ≈ 9–11 cm at 1 cm/px —
+    # half a typical interior wall — without swallowing standard door gaps.
+    close_kernel_px: int = 9
+
+    # BricsCAD OPTIMIZE-equivalent: after shattering contours into edges,
+    # fuse near-collinear near-touching runs into long wall axes.  Cloud2BIM
+    # § 2.7 does this explicitly; without it every Douglas-Peucker edge
+    # becomes its own CAD entity (median wall ~0.8 m on real scans).
+    merge_collinear: bool = True
+    merge_parallel_tol_deg: float = 6.0
+    merge_perp_distance_m: float = 0.12
+    merge_endpoint_gap_m: float = 1.00
 
 
 @dataclass
@@ -280,6 +291,22 @@ def extract_wall_contours(
     else:
         flat = np.concatenate(seg_chunks, axis=0)
 
+    # BricsCAD OPTIMIZE / Cloud2BIM post-contour collinear join: turn the
+    # edge soup into long wall axes before pairing/topology see them.
+    n_before_merge = int(flat.shape[0])
+    if params.merge_collinear and n_before_merge > 1:
+        from . import regularize as regularize_mod
+        flat = regularize_mod.merge_collinear_segments(
+            flat,
+            parallel_tol_deg=params.merge_parallel_tol_deg,
+            perp_distance_m=params.merge_perp_distance_m,
+            endpoint_gap_m=params.merge_endpoint_gap_m,
+        )
+        # Drop residual dust after merging (shorter than min segment).
+        if len(flat) > 0:
+            lens = np.linalg.norm(flat[:, 1] - flat[:, 0], axis=1)
+            flat = flat[lens >= params.min_segment_length_m]
+
     return WallContourResult(
         walls=walls,
         flat_segments=flat,
@@ -295,8 +322,14 @@ def contour_summary(result: WallContourResult) -> str:
     """One-line human-readable summary for SSE progress."""
     n_holes = sum(1 for w in result.walls if w.is_hole)
     n_outer = len(result.walls) - n_holes
+    med = 0.0
+    if result.n_segments_total > 0 and len(result.flat_segments) > 0:
+        lens = np.linalg.norm(
+            result.flat_segments[:, 1] - result.flat_segments[:, 0], axis=1,
+        )
+        med = float(np.median(lens))
     return (
         f"contours: {result.n_contours_raw} raw → {result.n_contours_kept} kept "
-        f"({n_outer} outer + {n_holes} hole) → "
-        f"{result.n_segments_total} wall segments"
+        f"({n_outer} outer + {n_holes} holes) → {result.n_segments_total} axes "
+        f"(median {med:.2f} m)"
     )

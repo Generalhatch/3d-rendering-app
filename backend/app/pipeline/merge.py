@@ -12,9 +12,13 @@ Strategy:
        that all scan centroids are within a reasonable proximity of each other
        (same building floor = centroids within ~200m of each other).
   3. If pre-registered: concatenate the downsampled clouds. Done.
-  4. If NOT pre-registered: run a lightweight pairwise ICP in "star" topology
-       (each scan registered to scan[0] as reference). Uses only the already-
-       downsampled clouds — no extra memory overhead.
+  4. If NOT pre-registered: sequential pairwise ICP in upload/walking order
+       (scan i registers to the most recent successfully-placed scan — field
+       technicians scan room-to-room, so consecutive uploads overlap), followed
+       by Open3D pose-graph global optimization to distribute drift over any
+       loop closures.  Every pairwise fit is checked against explicit
+       fitness/RMSE quality gates: scans that fail are flagged UNPLACED and
+       excluded from the merge — never silently guessed into position.
   5. Final voxel downsample of the merged result.
 
 Memory profile (6 scans × 500M points each, 3cm voxel):
@@ -23,7 +27,7 @@ Memory profile (6 scans × 500M points each, 3cm voxel):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +35,81 @@ import numpy as np
 import open3d as o3d
 
 from .ingest import load_point_cloud
+
+
+# ── Registration quality gates ────────────────────────────────────────────────
+
+# Explicit thresholds a pairwise ICP fit must clear before a scan is accepted
+# into the floor assembly.  Fitness is the fraction of source points with a
+# correspondence within the ICP distance threshold; inlier RMSE is the RMS
+# residual of those correspondences.  A garbage FPFH init refined by ICP
+# typically lands at fitness < 0.10; genuinely overlapping room-to-room scans
+# land at 0.30+.
+#
+# The RMSE threshold scales with the registration voxel size: pairwise ICP
+# runs on clouds downsampled at 3× the merge voxel, so even a PERFECT
+# alignment carries an RMSE of roughly the downsample spacing / 2 (the two
+# clouds' voxel centroids don't coincide).  1.6 × voxel leaves headroom for
+# that sampling mismatch while still rejecting fits misaligned by more than
+# about one voxel.  At the production 3 cm voxel this is a 4.8 cm gate.
+DEFAULT_MIN_ICP_FITNESS = 0.25
+DEFAULT_MAX_ICP_RMSE_PER_VOXEL = 1.6
+
+
+def default_gate_for_voxel(voxel_size: float) -> "RegistrationGate":
+    """The registration gate used by :func:`merge_scans` at a given voxel size."""
+    return RegistrationGate(
+        min_fitness=DEFAULT_MIN_ICP_FITNESS,
+        max_inlier_rmse_m=voxel_size * DEFAULT_MAX_ICP_RMSE_PER_VOXEL,
+    )
+
+
+@dataclass(frozen=True)
+class RegistrationGate:
+    """Quality gate for one pairwise registration result."""
+    min_fitness: float
+    max_inlier_rmse_m: float
+
+    def check(self, fitness: float, inlier_rmse_m: float) -> tuple[bool, str]:
+        """Return ``(passed, reason)``; ``reason`` is "" when passed."""
+        reasons: list[str] = []
+        if fitness < self.min_fitness:
+            reasons.append(
+                f"fitness {fitness:.3f} < required {self.min_fitness:.3f}"
+            )
+        if inlier_rmse_m > self.max_inlier_rmse_m:
+            reasons.append(
+                f"inlier RMSE {inlier_rmse_m * 1000:.1f}mm > allowed "
+                f"{self.max_inlier_rmse_m * 1000:.1f}mm"
+            )
+        return (not reasons, "; ".join(reasons))
+
+
+@dataclass
+class ScanRegistration:
+    """Registration outcome for one input scan — placed or flagged unplaced."""
+    scan_index: int
+    scan_name: str
+    placed: bool
+    fitness: float
+    inlier_rmse_m: float
+    transformation: np.ndarray     # (4, 4) pose: scan-local frame → reference frame
+    method: str                    # reference | sequential_icp | pose_graph |
+                                   # pre_registered | single
+    reason: str = ""               # why the scan is unplaced ("" when placed)
+
+    def to_json_dict(self) -> dict:
+        return {
+            "scan_index": int(self.scan_index),
+            "scan_name": self.scan_name,
+            "placed": bool(self.placed),
+            "fitness": float(self.fitness),
+            "inlier_rmse_m": float(self.inlier_rmse_m),
+            "inlier_rmse_mm": float(self.inlier_rmse_m * 1000.0),
+            "transformation": np.asarray(self.transformation, dtype=float).tolist(),
+            "method": self.method,
+            "reason": self.reason,
+        }
 
 
 @dataclass
@@ -42,6 +121,11 @@ class MergeResult:
     strategy: str                 # "concatenate" | "icp_registered" | "single"
     centroid_offset: np.ndarray   # 3-vector subtracted by _center_cloud; add it back
                                   # to convert centered coords → original scan frame
+    registrations: list[ScanRegistration] = field(default_factory=list)
+
+    @property
+    def unplaced(self) -> list[ScanRegistration]:
+        return [r for r in self.registrations if not r.placed]
 
 
 # Minimum centroid spread (metres) that indicates scans are in a shared large-scale
@@ -85,6 +169,11 @@ def merge_scans(
             total_points_after=len(ds.points),
             strategy="single",
             centroid_offset=centroid_offset,
+            registrations=[ScanRegistration(
+                scan_index=0, scan_name=scan_paths[0].name, placed=True,
+                fitness=1.0, inlier_rmse_m=0.0, transformation=np.eye(4),
+                method="single",
+            )],
         )
 
     # ── Step 1: Stream-load, downsample, and clean each scan ─────────────────
@@ -113,9 +202,31 @@ def merge_scans(
 
     if pre_registered:
         _emit(f"Pre-registered scans detected — concatenating {n} clouds…", 0.62)
+        registrations = [
+            ScanRegistration(
+                scan_index=i, scan_name=scan_paths[i].name, placed=True,
+                fitness=1.0, inlier_rmse_m=0.0, transformation=np.eye(4),
+                method="pre_registered",
+            )
+            for i in range(n)
+        ]
     else:
-        _emit(f"Scans appear to be in different frames — running pairwise ICP…", 0.62)
-        downsampled = _register_pairwise(downsampled, voxel_size, _emit)
+        _emit("Scans appear to be in different frames — sequential pairwise ICP "
+              "(upload order prior)…", 0.62)
+        downsampled, registrations = register_scans_sequential(
+            downsampled,
+            voxel_size,
+            scan_names=[p.name for p in scan_paths],
+            emit=_emit,
+        )
+        n_unplaced = sum(1 for r in registrations if not r.placed)
+        if n_unplaced:
+            names = ", ".join(r.scan_name for r in registrations if not r.placed)
+            _emit(
+                f"⚠ {n_unplaced} scan(s) failed registration gates and are "
+                f"UNPLACED (excluded from merge): {names}",
+                0.80,
+            )
 
     # ── Step 3: Concatenate ───────────────────────────────────────────────────
     _emit("Concatenating…", 0.82)
@@ -148,6 +259,7 @@ def merge_scans(
         total_points_after=len(merged.points),
         strategy=strategy,
         centroid_offset=centroid_offset,
+        registrations=registrations,
     )
 
 
@@ -238,50 +350,256 @@ def _clouds_have_spatial_overlap(
     return fraction >= min_overlap_fraction
 
 
-# ── Pairwise ICP registration (fallback for unregistered scans) ───────────────
+# ── Sequential pairwise ICP + pose-graph registration ────────────────────────
 
-def _register_pairwise(
+def register_scans_sequential(
     clouds: list[o3d.geometry.PointCloud],
     voxel_size: float,
-    emit: Callable[[str, float], None],
-) -> list[o3d.geometry.PointCloud]:
-    """Register each scan to clouds[0] via FPFH + RANSAC → ICP.
+    gate: RegistrationGate | None = None,
+    scan_names: list[str] | None = None,
+    emit: Callable[[str, float], None] | None = None,
+    pose_graph_optimize: bool = True,
+) -> tuple[list[o3d.geometry.PointCloud], list[ScanRegistration]]:
+    """Sequential pairwise registration in upload/walking order + pose-graph
+    global optimization.
 
-    "Star" topology: every scan registers to the first scan as reference.
-    Works well when scans have reasonable pairwise overlap (adjacent rooms,
-    hallway to office, etc.). For very disconnected scans (e.g. opposite ends
-    of a huge warehouse with nothing in common), this will struggle — but
-    that scenario is rare in building floor scanning.
+    Replaces the previous "star" topology (every scan → scan 0).  Field
+    technicians scan room-to-room, so consecutive uploads overlap while the
+    first and last scan of a large floor often share nothing — the upload
+    order IS the adjacency prior.  Each scan is registered (FPFH global init
+    → ICP refine) against the most recent successfully-placed scan.
+
+    Every pairwise fit is checked against ``gate``: a scan whose fitness /
+    inlier RMSE fails the gate is flagged UNPLACED, excluded from the output
+    clouds, and never guessed into position.  Subsequent scans register
+    against the last scan that *did* place.
+
+    When ≥ 3 scans place, an Open3D pose graph is built (odometry edges from
+    the sequential chain + uncertain loop-closure edges for any non-adjacent
+    overlapping pair) and globally optimized so loop-closure drift is
+    distributed instead of accumulating in the last scan.
+
+    Returns ``(placed_clouds, registrations)`` — ``placed_clouds`` are the
+    placed scans transformed into scan 0's frame (in scan order);
+    ``registrations`` has one :class:`ScanRegistration` per input scan.
     """
-    reference = _prepare_for_registration(clouds[0], voxel_size)
-    registered = [clouds[0]]
+    if gate is None:
+        gate = default_gate_for_voxel(voxel_size)
+    n = len(clouds)
+    names = scan_names or [f"scan_{i}" for i in range(n)]
 
-    for i, pcd in enumerate(clouds[1:], start=1):
-        emit(
-            f"Registering scan {i + 1}/{len(clouds)} to reference…",
-            0.62 + (i / len(clouds)) * 0.18,
+    def _msg(msg: str, p: float) -> None:
+        if emit:
+            emit(msg, p)
+
+    prepared = [_prepare_for_registration(c, voxel_size) for c in clouds]
+    max_corr = voxel_size * 2.0
+
+    def _register_pair(
+        src_idx: int, tgt_idx: int, n_attempts: int = 3,
+    ) -> tuple[float, float, np.ndarray]:
+        """Multi-start FPFH → ICP between two prepared scans.
+
+        FPFH + RANSAC is stochastic, and on repetitive architecture a wrong
+        global init (the classic "slid one room over" failure) can still
+        reach moderate ICP consensus.  A genuinely correct alignment,
+        however, has strictly lower inlier RMSE than a plausible-but-wrong
+        one.  So: run several independent global inits, refine each with
+        ICP, and keep the gate-passing candidate with the LOWEST inlier
+        RMSE (falling back to best fitness when none pass, so the unplaced
+        record carries honest metrics).
+        """
+        sp, tp = prepared[src_idx], prepared[tgt_idx]
+        candidates: list[tuple[float, float, np.ndarray]] = []
+        for _ in range(n_attempts):
+            T_init = _fpfh_global_registration(
+                sp["ds"], tp["ds"], sp["fpfh"], tp["fpfh"], voxel_size,
+            )
+            icp = o3d.pipelines.registration.registration_icp(
+                sp["ds"], tp["ds"],
+                max_corr,
+                T_init,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+            )
+            candidates.append((
+                float(icp.fitness),
+                float(icp.inlier_rmse),
+                np.array(icp.transformation),
+            ))
+        passing = [c for c in candidates if gate.check(c[0], c[1])[0]]
+        if passing:
+            return min(passing, key=lambda c: c[1])
+        return max(candidates, key=lambda c: c[0])
+
+    registrations: list[ScanRegistration] = [
+        ScanRegistration(
+            scan_index=0, scan_name=names[0], placed=True,
+            fitness=1.0, inlier_rmse_m=0.0, transformation=np.eye(4),
+            method="reference",
         )
-        source = _prepare_for_registration(pcd, voxel_size)
+    ]
+    poses: dict[int, np.ndarray] = {0: np.eye(4)}   # scan idx → local→reference pose
+    placed_order: list[int] = [0]
+    # Relative ICP transforms along the placed chain, for pose-graph odometry
+    # edges: chain_edges[k] = (src_idx, tgt_idx, T_icp src-local → tgt-local).
+    chain_edges: list[tuple[int, int, np.ndarray]] = []
 
-        # Global init via FPFH features
-        T_init = _fpfh_global_registration(source["ds"], reference["ds"],
-                                            source["fpfh"], reference["fpfh"],
-                                            voxel_size)
+    for i in range(1, n):
+        prev = placed_order[-1]
+        _msg(
+            f"Registering scan {i + 1}/{n} to scan {prev + 1} (walking-order prior)…",
+            0.62 + (i / n) * 0.14,
+        )
+        fitness, rmse, T_icp = _register_pair(i, prev)
+        passed, reason = gate.check(fitness, rmse)
 
-        # ICP refinement with the init transform
-        result = o3d.pipelines.registration.registration_icp(
-            source["ds"], reference["ds"],
-            voxel_size * 2,
-            T_init,
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+        if not passed:
+            registrations.append(ScanRegistration(
+                scan_index=i, scan_name=names[i], placed=False,
+                fitness=fitness, inlier_rmse_m=rmse, transformation=np.eye(4),
+                method="sequential_icp",
+                reason=f"failed registration gate vs scan {prev + 1}: {reason}",
+            ))
+            _msg(
+                f"  ✗ scan {i + 1} UNPLACED — {reason}",
+                0.62 + (i / n) * 0.14,
+            )
+            continue
+
+        poses[i] = poses[prev] @ T_icp
+        placed_order.append(i)
+        chain_edges.append((i, prev, T_icp))
+        registrations.append(ScanRegistration(
+            scan_index=i, scan_name=names[i], placed=True,
+            fitness=fitness, inlier_rmse_m=rmse,
+            transformation=poses[i].copy(),
+            method="sequential_icp",
+        ))
+        _msg(
+            f"  ✓ scan {i + 1} placed — fitness {fitness:.2f}, "
+            f"RMSE {rmse * 1000:.1f}mm",
+            0.62 + (i / n) * 0.14,
         )
 
-        transformed = o3d.geometry.PointCloud(pcd)
-        transformed.transform(result.transformation)
-        registered.append(transformed)
+    # ── Pose-graph global optimization over the placed scans ─────────────────
+    if pose_graph_optimize and len(placed_order) >= 3:
+        try:
+            optimized = _pose_graph_refine(
+                prepared, poses, placed_order, chain_edges, gate,
+                max_corr, _msg,
+            )
+            if optimized is not None:
+                for idx in placed_order:
+                    poses[idx] = optimized[idx]
+                for reg in registrations:
+                    if reg.placed and reg.scan_index != 0:
+                        reg.transformation = poses[reg.scan_index].copy()
+                        reg.method = "pose_graph"
+        except Exception as pg_err:  # optimization is a refinement, not a gate
+            _msg(f"Pose-graph optimization skipped: {pg_err}", 0.79)
 
-    return registered
+    placed_clouds: list[o3d.geometry.PointCloud] = []
+    for idx in placed_order:
+        transformed = o3d.geometry.PointCloud(clouds[idx])
+        transformed.transform(poses[idx])
+        placed_clouds.append(transformed)
+
+    return placed_clouds, registrations
+
+
+def _pose_graph_refine(
+    prepared: list[dict],
+    poses: dict[int, np.ndarray],
+    placed_order: list[int],
+    chain_edges: list[tuple[int, int, np.ndarray]],
+    gate: RegistrationGate,
+    max_corr: float,
+    msg: Callable[[str, float], None],
+) -> dict[int, np.ndarray] | None:
+    """Build + globally optimize an Open3D pose graph over the placed scans.
+
+    Nodes carry the sequential poses (scan-local → reference).  Odometry
+    edges come from the sequential chain; loop-closure edges are added for
+    every non-adjacent placed pair whose clouds overlap under the current
+    poses AND whose pairwise ICP passes the same quality gate (uncertain
+    edges — the optimizer may prune them).  Returns the optimized poses, or
+    None when there was nothing to optimize.
+    """
+    reg = o3d.pipelines.registration
+
+    node_of = {scan_idx: k for k, scan_idx in enumerate(placed_order)}
+    pose_graph = reg.PoseGraph()
+    for scan_idx in placed_order:
+        pose_graph.nodes.append(reg.PoseGraphNode(poses[scan_idx].copy()))
+
+    # Odometry edges from the sequential chain.  Edge convention (matches the
+    # Open3D multiway-registration tutorial): edge (s, t, T) with T mapping
+    # s-local → t-local constrains pose_s ≈ pose_t @ T.
+    for src, tgt, T_icp in chain_edges:
+        info = reg.get_information_matrix_from_point_clouds(
+            prepared[src]["ds"], prepared[tgt]["ds"], max_corr, T_icp,
+        )
+        pose_graph.edges.append(reg.PoseGraphEdge(
+            node_of[src], node_of[tgt], T_icp, info, uncertain=False,
+        ))
+
+    # Loop-closure edges: non-adjacent placed pairs that overlap under the
+    # current pose estimates.
+    n_loops = 0
+    for a_pos in range(len(placed_order)):
+        for b_pos in range(a_pos + 2, len(placed_order)):
+            a, b = placed_order[a_pos], placed_order[b_pos]
+            # Current relative estimate: a-local → b-local.
+            T_ab = np.linalg.inv(poses[b]) @ poses[a]
+            ds_a_in_b = o3d.geometry.PointCloud(prepared[a]["ds"])
+            ds_a_in_b.transform(T_ab)
+            if not _clouds_have_spatial_overlap(
+                ds_a_in_b, prepared[b]["ds"], voxel_size=0.20,
+            ):
+                continue
+            icp = reg.registration_icp(
+                prepared[a]["ds"], prepared[b]["ds"],
+                max_corr,
+                T_ab,
+                reg.TransformationEstimationPointToPoint(),
+                reg.ICPConvergenceCriteria(max_iteration=50),
+            )
+            passed, _reason = gate.check(float(icp.fitness), float(icp.inlier_rmse))
+            if not passed:
+                continue
+            T_loop = np.array(icp.transformation)
+            info = reg.get_information_matrix_from_point_clouds(
+                prepared[a]["ds"], prepared[b]["ds"], max_corr, T_loop,
+            )
+            pose_graph.edges.append(reg.PoseGraphEdge(
+                node_of[a], node_of[b], T_loop, info, uncertain=True,
+            ))
+            n_loops += 1
+
+    if n_loops == 0 and len(chain_edges) < 2:
+        return None   # a bare 2-node chain gains nothing from optimization
+
+    msg(
+        f"Pose-graph optimization: {len(placed_order)} nodes, "
+        f"{len(chain_edges)} odometry + {n_loops} loop-closure edges…",
+        0.78,
+    )
+    option = reg.GlobalOptimizationOption(
+        max_correspondence_distance=max_corr,
+        edge_prune_threshold=0.25,
+        reference_node=0,
+    )
+    reg.global_optimization(
+        pose_graph,
+        reg.GlobalOptimizationLevenbergMarquardt(),
+        reg.GlobalOptimizationConvergenceCriteria(),
+        option,
+    )
+    return {
+        scan_idx: np.array(pose_graph.nodes[node_of[scan_idx]].pose)
+        for scan_idx in placed_order
+    }
 
 
 def _prepare_for_registration(pcd: o3d.geometry.PointCloud, voxel_size: float) -> dict:

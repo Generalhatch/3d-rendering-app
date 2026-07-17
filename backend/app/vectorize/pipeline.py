@@ -31,11 +31,13 @@ from ..limits import JOB_SEMAPHORE
 from ..models.vectorize_job import VectorizeMetrics, VectorizeParams, VectorizeStatus
 from ..sse import publish
 from . import (
+    adaptive_band as adaptive_band_mod,
     ceiling_band_slicer as ceiling_band_mod,
     classical,
     clip_to_envelope as clip_mod,
     columns as columns_mod,
     density_slicer as density_slicer_mod,
+    downsample_cache as downsample_cache_mod,
     dxf_writer,
     envelope as envelope_mod,
     ingest_downsample as downsample_mod,
@@ -43,11 +45,13 @@ from . import (
     openings as openings_mod,
     preprocess,
     regularize,
+    room_confidence as room_confidence_mod,
     slicer,
     topology as topology_mod,
     walls as walls_mod,
     walls_contour as walls_contour_mod,
 )
+from .pipeline_warnings import WarningCollector
 
 
 # Coverage tolerance: a foreground (wall) pixel counts as "covered" if any
@@ -59,6 +63,83 @@ COVERAGE_RADIUS_M = 0.08
 
 def _emit(job_id: str, stage: str, message: str, progress: float) -> None:
     publish(job_id, stage, message, progress)
+
+
+# Progress span of the scan-loading step within stage 1.  Loading a 689 MB
+# chunked LAS is silent for minutes without incremental emission — the UI
+# looks hung at 5%.
+INGEST_PROGRESS_LO = 0.05
+INGEST_PROGRESS_HI = 0.12
+
+# Minimum fraction-of-file advance between two ingest progress events.  A
+# multi-GB scan has hundreds of 1M-point chunks; emitting every chunk would
+# flush the SSE replay ring buffer.  5% steps → at most 20 events per load.
+_INGEST_EMIT_STEP = 0.05
+
+# Post-read assembly phases (Phase 4.5).  Everything after the last chunk
+# callback — classification mask, Open3D copy, unit detection — is the most
+# memory-hungry part of a huge load and used to emit NOTHING between 0.12
+# and the downsample emit at 0.135, so honest assembly work and a genuine
+# hang were indistinguishable.  Progress values sit strictly inside
+# (INGEST_PROGRESS_HI, 0.135).
+INGEST_ASSEMBLY_PHASES: dict[str, tuple[float, str]] = {
+    "classify":    (0.122, "Applying classification mask…"),
+    "assemble":    (0.126, "Assembling point cloud…"),
+    "colors":      (0.128, "Normalizing colors…"),
+    "unit_detect": (0.131, "Detecting scan units…"),
+}
+
+# The "Loaded N points" emit must land AFTER the assembly-phase span so the
+# bar never moves backwards.
+INGEST_LOADED_PROGRESS = 0.133
+
+
+def _make_ingest_phase_emitter(job_id: str, scan_name: str):
+    """Build the ``on_phase(name)`` callback for
+    :func:`app.pipeline.ingest.load_point_cloud`.
+
+    Unknown phase names are tolerated (ignored) so the loader can add
+    phases without breaking this mapping.
+    """
+    def _on_phase(name: str) -> None:
+        entry = INGEST_ASSEMBLY_PHASES.get(name)
+        if entry is None:
+            return
+        progress, message = entry
+        _emit(job_id, "ingest", f"{message} ({scan_name})", progress)
+
+    return _on_phase
+
+
+def _make_ingest_progress_emitter(
+    job_id: str,
+    scan_name: str,
+    lo: float = INGEST_PROGRESS_LO,
+    hi: float = INGEST_PROGRESS_HI,
+    min_step: float = _INGEST_EMIT_STEP,
+):
+    """Build the ``on_progress(points_read, total_points)`` callback for
+    :func:`app.pipeline.ingest.load_point_cloud`.
+
+    Maps load fraction onto the ``[lo, hi]`` progress span of the ingest
+    stage and throttles emission to ``min_step`` fraction increments so the
+    bounded SSE replay buffer isn't flooded by per-chunk events.
+    """
+    last_emitted = {"frac": -1.0}
+
+    def _on_progress(points_read: int, total_points: int) -> None:
+        frac = min(1.0, points_read / max(total_points, 1))
+        if frac - last_emitted["frac"] < min_step and frac < 1.0:
+            return
+        last_emitted["frac"] = frac
+        _emit(
+            job_id, "ingest",
+            f"Loading scan ({scan_name})… {points_read:,} / "
+            f"{total_points:,} points ({frac * 100:.0f}%)",
+            lo + (hi - lo) * frac,
+        )
+
+    return _on_progress
 
 
 def _compute_coverage(
@@ -85,10 +166,11 @@ def _compute_coverage(
     if len(segments_world) > 0:
         res = affine.resolution_m_per_px
         for seg in segments_world:
-            x1 = int(round((seg[0, 0] - affine.origin_x) / res))
-            y1 = int(round((seg[0, 1] - affine.origin_y) / res))
-            x2 = int(round((seg[1, 0] - affine.origin_x) / res))
-            y2 = int(round((seg[1, 1] - affine.origin_y) / res))
+            # Pixel-centre convention: idx = (world - origin) / res - 0.5.
+            x1 = int(round((seg[0, 0] - affine.origin_x) / res - 0.5))
+            y1 = int(round((seg[0, 1] - affine.origin_y) / res - 0.5))
+            x2 = int(round((seg[1, 0] - affine.origin_x) / res - 0.5))
+            y2 = int(round((seg[1, 1] - affine.origin_y) / res - 0.5))
             cv2.line(seg_mask, (x1, y1), (x2, y2), color=255, thickness=1)
 
     # Distance transform: for every pixel, distance (in px) to the nearest
@@ -123,65 +205,268 @@ def run_vectorize(
     function never re-raises.
     """
     t0 = time.time()
+    # Phase 4: every silent fallback appends a structured warning; the full
+    # list is persisted in result.json (see pipeline_warnings.py).
+    warnings = WarningCollector()
     try:
         # ── 1. Load point cloud ──────────────────────────────────────────
-        _emit(job_id, "ingest", f"Loading scan ({scan_path.name})…", 0.05)
-        from ..pipeline.ingest import load_point_cloud   # local import: heavy module
-        pcd = load_point_cloud(scan_path)
-        raw_points = int(len(pcd.points))
-        _emit(job_id, "ingest", f"Loaded {raw_points:,} points", 0.12)
-
-        # ── 1b. Voxel downsample (v4 Phase A — see ACCURACY_TO_CAD_QUALITY_PLAN.md § 0.6) ──
-        # Single biggest speed lever in the pipeline.  At 5 mm voxel spacing,
-        # walls are still represented by hundreds of points per metre, every
-        # door frame by dozens.  Density rasters and alpha-shapes are
-        # visually indistinguishable from native-resolution output, but every
-        # downstream stage runs 10–50× faster.
-        #
-        # Done HERE, before envelope/normals/slice, so every other stage
-        # benefits.  Envelope works correctly post-downsample because it
-        # depends on the *spatial extent* of low-band points, not their
-        # density (downsample preserves extent, only thins density).
-        downsample_result: downsample_mod.DownsampleResult | None = None
+        # Phase 4.5: reprocess runs skip raw re-ingest entirely when the
+        # voxel-downsampled cloud for (scan hash, voxel size) is cached —
+        # the cached cloud is byte-identical to what load + downsample
+        # would produce (lossless float64, captured post-unit-normalization).
+        _emit(job_id, "ingest", f"Loading scan ({scan_path.name})…", INGEST_PROGRESS_LO)
+        downsample_auto = bool(getattr(params, "voxel_downsample_auto", True))
+        scan_hash: str | None = None
+        cached_downsample: downsample_cache_mod.CachedDownsample | None = None
         if params.voxel_downsample_m > 0:
-            _emit(job_id, "ingest", "Voxel-downsampling cloud…", 0.135)
             try:
-                if getattr(params, "voxel_downsample_auto", True):
-                    downsample_result = downsample_mod.voxel_downsample_auto(
-                        pcd, initial_voxel_m=params.voxel_downsample_m,
-                    )
-                else:
-                    downsample_result = downsample_mod.voxel_downsample(
-                        pcd, voxel_m=params.voxel_downsample_m,
-                    )
-                pcd = downsample_result.pcd
-                _emit(job_id, "ingest", downsample_result.summary(), 0.15)
-            except Exception as ds_err:
-                # Downsampling should never fail on a non-empty cloud, but
-                # if Open3D throws on some pathological input we'd rather
-                # eat the runtime hit than abort the entire job.
-                _emit(
-                    job_id, "ingest",
-                    f"Voxel downsample skipped: {ds_err} — running at native resolution",
-                    0.15,
+                from ..storage import scan_content_hash
+                scan_hash = scan_content_hash(scan_path)
+                cached_downsample = downsample_cache_mod.load_cache(
+                    scan_hash, params.voxel_downsample_m, downsample_auto,
                 )
+            except Exception:
+                cached_downsample = None  # cache is an optimization only
+
+        if cached_downsample is not None:
+            # A prior run with auto=off can leave an 80 M-point "downsampled"
+            # cache that never hit the 10 mm accuracy ceiling.  Treat that as
+            # a miss so we re-ingest and escalate.  A cloud that is still a
+            # bit over the point target *at* the 10 mm ceiling is kept —
+            # re-ingesting 140 M points would not improve accuracy.
+            meta_n = int(cached_downsample.meta.get("n_after", 0))
+            meta_voxel = float(cached_downsample.meta.get("voxel_m", 0.0))
+            if (
+                meta_n > downsample_mod.DEFAULT_TARGET_MAX_POINTS
+                and meta_voxel < downsample_mod.ACCURACY_MAX_VOXEL_M - 1e-9
+            ):
+                cached_downsample = None
+
+        downsample_result: downsample_mod.DownsampleResult | None = None
+        if cached_downsample is not None:
+            pcd = cached_downsample.to_point_cloud()
+            meta = cached_downsample.meta
+            raw_points = int(meta["raw_points"])
+            downsample_result = downsample_mod.DownsampleResult(
+                pcd=pcd,
+                voxel_m=float(meta["voxel_m"]),
+                n_before=int(meta["n_before"]),
+                n_after=int(meta["n_after"]),
+            )
+            _emit(
+                job_id, "ingest",
+                f"Loaded cached downsampled cloud "
+                f"({downsample_result.n_after:,} points @ "
+                f"{downsample_result.voxel_m * 1000:.0f} mm voxel) — "
+                f"skipped raw re-ingest",
+                0.15,
+            )
         else:
-            _emit(job_id, "ingest", f"Loaded {raw_points:,} points (downsample disabled)", 0.15)
+            # Geometry-only (load_colors=False): the vectorize pipeline never
+            # reads colors, and accumulating them for a 680 MB scan wastes GBs.
+            from ..pipeline.ingest import load_point_cloud   # local import: heavy module
+            pcd = load_point_cloud(
+                scan_path,
+                on_progress=_make_ingest_progress_emitter(job_id, scan_path.name),
+                load_colors=False,
+                on_phase=_make_ingest_phase_emitter(job_id, scan_path.name),
+            )
+            raw_points = int(len(pcd.points))
+            _emit(job_id, "ingest", f"Loaded {raw_points:,} points", INGEST_LOADED_PROGRESS)
+
+            # ── 1b. Voxel downsample (v4 Phase A — see ACCURACY_TO_CAD_QUALITY_PLAN.md § 0.6) ──
+            # Single biggest speed lever in the pipeline.  At 5 mm voxel spacing,
+            # walls are still represented by hundreds of points per metre, every
+            # door frame by dozens.  Density rasters and alpha-shapes are
+            # visually indistinguishable from native-resolution output, but every
+            # downstream stage runs 10–50× faster.
+            #
+            # Done HERE, before envelope/normals/slice, so every other stage
+            # benefits.  Envelope works correctly post-downsample because it
+            # depends on the *spatial extent* of low-band points, not their
+            # density (downsample preserves extent, only thins density).
+            if params.voxel_downsample_m > 0:
+                _emit(job_id, "ingest", "Voxel-downsampling cloud…", 0.135)
+                try:
+                    requested_voxel = float(params.voxel_downsample_m)
+                    if downsample_auto:
+                        downsample_result = downsample_mod.voxel_downsample_auto(
+                            pcd, initial_voxel_m=requested_voxel,
+                        )
+                    else:
+                        downsample_result = downsample_mod.voxel_downsample(
+                            pcd, voxel_m=requested_voxel,
+                        )
+                        # Dense multi-scan mosaics often keep 50–80 M points
+                        # at a fixed 5 mm voxel.  Escalate only up to the
+                        # 10 mm accuracy ceiling — never coarser.
+                        if (
+                            downsample_result.n_after
+                            > downsample_mod.DEFAULT_TARGET_MAX_POINTS
+                        ):
+                            _emit(
+                                job_id, "ingest",
+                                f"Still {downsample_result.n_after:,} points "
+                                f"after {requested_voxel * 1000:.0f} mm "
+                                f"voxel — escalating up to "
+                                f"{downsample_mod.ACCURACY_MAX_VOXEL_M * 1000:.0f} mm "
+                                f"accuracy ceiling…",
+                                0.14,
+                            )
+                            downsample_result = downsample_mod.voxel_downsample_auto(
+                                pcd, initial_voxel_m=requested_voxel,
+                            )
+                    pcd = downsample_result.pcd
+                    if (
+                        downsample_result.voxel_m > requested_voxel + 1e-9
+                        and requested_voxel > 0
+                    ):
+                        warnings.add(
+                            "voxel_escalated", "ingest",
+                            f"Dense scan: voxel raised from "
+                            f"{requested_voxel * 1000:.0f} mm to "
+                            f"{downsample_result.voxel_m * 1000:.0f} mm "
+                            f"({downsample_result.n_before:,} → "
+                            f"{downsample_result.n_after:,} points).  "
+                            f"Capped at the 10 mm accuracy ceiling so walls "
+                            f"≥ 1 cm and door frames are preserved.",
+                        )
+                    _emit(job_id, "ingest", downsample_result.summary(), 0.15)
+                except Exception as ds_err:
+                    # Downsampling should never fail on a non-empty cloud, but
+                    # if Open3D throws on some pathological input we'd rather
+                    # eat the runtime hit than abort the entire job.
+                    warnings.add(
+                        "downsample_failed", "ingest",
+                        f"Voxel downsample failed ({ds_err}); "
+                        f"ran at native resolution",
+                    )
+                    _emit(
+                        job_id, "ingest",
+                        f"Voxel downsample skipped: {ds_err} — running at native resolution",
+                        0.15,
+                    )
+            else:
+                _emit(job_id, "ingest", f"Loaded {raw_points:,} points (downsample disabled)", 0.15)
+
+            # Populate the downsample cache for the next reprocess (guarded:
+            # a cache-write failure must never fail the job).
+            if scan_hash is not None and downsample_result is not None:
+                try:
+                    _emit(
+                        job_id, "ingest",
+                        f"Caching downsampled cloud "
+                        f"({downsample_result.n_after:,} points)…",
+                        0.155,
+                    )
+                    downsample_cache_mod.store_cache(
+                        scan_hash,
+                        params.voxel_downsample_m,
+                        downsample_auto,
+                        pcd,
+                        effective_voxel_m=downsample_result.voxel_m,
+                        raw_points=raw_points,
+                        n_before=downsample_result.n_before,
+                    )
+                except Exception:
+                    pass
 
         points_after_downsample = int(len(pcd.points))
 
         # ── 2. Decide elevation ──────────────────────────────────────────
+        # Phase 4 state: gravity relevel transform (re-applied if the cloud
+        # is reloaded later) + adaptive slice-band plan.
+        relevel_transform: np.ndarray | None = None
+        relevel_tilt_deg: float | None = None
+        relevel_applied = False
+        band_plan: adaptive_band_mod.SliceBandPlan | None = None
         if params.elevation_m is None:
             _emit(job_id, "floor", "Detecting floor plane…", 0.20)
             from ..pipeline.slicing import detect_floor
             floor = detect_floor(pcd)
+            floor_z = float(floor.floor_z_estimate)
+            axis_idx = int(floor.axis_idx)
+
+            # ── 2-pre-a. Gravity re-level (Phase 4) ──────────────────────
+            # Rotate the cloud so the detected floor plane is exactly level
+            # at height 0 — a 3° scanner tilt smears a horizontal slice
+            # across 2 m of height on a 40 m floor plate.  Render/measure
+            # geometry all derives from the releveled frame consistently.
+            if getattr(params, "gravity_relevel", True):
+                try:
+                    from ..pipeline.relevel import gravity_relevel
+                    relevel = gravity_relevel(pcd, floor=floor)
+                    relevel_tilt_deg = float(relevel.tilt_deg)
+                    if relevel.applied:
+                        pcd = relevel.pcd
+                        relevel_transform = relevel.transform
+                        relevel_applied = True
+                        floor_z = 0.0
+                        _emit(
+                            job_id, "floor",
+                            f"Gravity re-level: corrected {relevel.tilt_deg:.2f}° "
+                            f"floor tilt (floor now level at 0.00 m)",
+                            0.22,
+                        )
+                    elif relevel.reason == "excessive_tilt":
+                        warnings.add(
+                            "gravity_relevel_excessive_tilt", "floor",
+                            f"Detected floor plane tilted {relevel.tilt_deg:.1f}° "
+                            f"— beyond the 15° re-level safety limit (likely a "
+                            f"mis-detected ramp/wall); cloud left as scanned",
+                        )
+                        _emit(
+                            job_id, "floor",
+                            f"Gravity re-level refused: {relevel.tilt_deg:.1f}° "
+                            f"tilt exceeds safety limit",
+                            0.22,
+                        )
+                except Exception as rl_err:
+                    warnings.add(
+                        "gravity_relevel_failed", "floor",
+                        f"Gravity re-level failed ({rl_err}); "
+                        f"cloud left as scanned",
+                    )
+                    _emit(
+                        job_id, "floor",
+                        f"Gravity re-level skipped: {rl_err}", 0.22,
+                    )
+
+            # ── 2-pre-b. Adaptive slice band (Phase 4) ───────────────────
+            # Measure the actual floor-to-ceiling clearance and scale the
+            # slice elevation + ceiling band down for low-clearance spaces
+            # (data centers, basements) where the defaults would straddle
+            # the ceiling.
+            if getattr(params, "adaptive_slice_band", True):
+                clearance = adaptive_band_mod.estimate_ceiling_clearance(
+                    np.asarray(pcd.points), floor_z=floor_z, axis_idx=axis_idx,
+                )
+                band_plan = adaptive_band_mod.choose_slice_band(
+                    clearance,
+                    default_ceiling_lo_m=params.ceiling_band_lo_m,
+                    default_ceiling_hi_m=params.ceiling_band_hi_m,
+                )
+                if band_plan.reason == "no_ceiling":
+                    warnings.add(
+                        "adaptive_band_no_ceiling", "floor",
+                        "No ceiling found in the height histogram — default "
+                        "slice bands kept; the ceiling gate may misfire on "
+                        "this scan",
+                    )
+                if band_plan.adjusted or band_plan.reason == "no_ceiling":
+                    _emit(
+                        job_id, "floor",
+                        adaptive_band_mod.band_summary(band_plan), 0.23,
+                    )
+
             # 1.6 m clears desks (~0.75 m), filing cabinets (~1.2 m), and most
             # cubicle dividers (~1.3–1.5 m) while staying below typical ceiling
             # fixtures, beams, and HVAC (≥ 2.1 m).  See VECTORIZE_SETTINGS.md.
-            shoulder_offset = 1.60
-            floor_z = float(floor.floor_z_estimate)
+            # The adaptive band plan lowers this for low-clearance spaces.
+            shoulder_offset = (
+                band_plan.slice_offset_m if band_plan is not None else 1.60
+            )
             elevation = floor_z + shoulder_offset
-            axis_idx = int(floor.axis_idx)
             _emit(
                 job_id, "floor",
                 f"Floor at {floor_z:.2f} m (axis="
@@ -232,6 +517,11 @@ def run_vectorize(
                     0.265,
                 )
             except Exception as env_err:
+                warnings.add(
+                    "envelope_failed", "envelope",
+                    f"Building envelope extraction failed ({env_err}); "
+                    f"no exterior-wall lock for this run",
+                )
                 _emit(
                     job_id, "envelope",
                     f"Envelope extraction skipped: {env_err}",
@@ -269,16 +559,40 @@ def run_vectorize(
                     )
             except Exception as filt_err:
                 # Reload the cloud to recover from any in-place filter damage.
+                warnings.add(
+                    "vertical_filter_fallback", "normals",
+                    f"Vertical-surface filter fell back to the unfiltered "
+                    f"cloud ({filt_err}); raster may contain horizontal-"
+                    f"surface noise",
+                )
                 _emit(
                     job_id, "normals",
                     f"Vertical-surface filter skipped: {filt_err}",
                     0.29,
                 )
-                pcd = load_point_cloud(scan_path)
+                pcd = load_point_cloud(scan_path, load_colors=False)
+                if relevel_transform is not None:
+                    # The reloaded cloud is in the ORIGINAL scan frame; all
+                    # geometry so far (floor_z=0, envelope) is in the
+                    # releveled frame — re-apply the transform.
+                    pcd.transform(relevel_transform)
 
         # ── 3. Slice (density-column / single / multi-elevation OR-fused) ─
         ceiling_band_points = 0
         wall_mask_pixels_after_gate = 0
+        # Adaptive-band overrides (Phase 4): the plan scales the density
+        # band top + ceiling gate down for low-clearance spaces.
+        density_z_hi = (
+            band_plan.density_band_hi_m if band_plan is not None else 2.20
+        )
+        ceiling_lo = (
+            band_plan.ceiling_band_lo_m if band_plan is not None
+            else params.ceiling_band_lo_m
+        )
+        ceiling_hi = (
+            band_plan.ceiling_band_hi_m if band_plan is not None
+            else params.ceiling_band_hi_m
+        )
         if params.use_density_slicer:
             # Vertical-column density score: every XY cell gets the fraction
             # of its vertical wall-band heights that have any point in them.
@@ -287,10 +601,11 @@ def run_vectorize(
             _emit(
                 job_id, "slice",
                 f"Building density raster (band {floor_z + 0.30:.2f}–"
-                f"{floor_z + 2.20:.2f} m)…",
+                f"{floor_z + density_z_hi:.2f} m)…",
                 0.30,
             )
             density_params = density_slicer_mod.DensitySliceParams(
+                z_hi_m=density_z_hi,
                 resolution_m_per_px=params.resolution_m_per_px,
             )
             slice_result = density_slicer_mod.slice_to_raster_density(
@@ -324,13 +639,13 @@ def run_vectorize(
                 try:
                     _emit(
                         job_id, "slice",
-                        f"Slicing ceiling band ({params.ceiling_band_lo_m:.2f}–"
-                        f"{params.ceiling_band_hi_m:.2f} m above floor)…",
+                        f"Slicing ceiling band ({ceiling_lo:.2f}–"
+                        f"{ceiling_hi:.2f} m above floor)…",
                         0.36,
                     )
                     ceiling_params = ceiling_band_mod.CeilingBandParams(
-                        z_lo_m=params.ceiling_band_lo_m,
-                        z_hi_m=params.ceiling_band_hi_m,
+                        z_lo_m=ceiling_lo,
+                        z_hi_m=ceiling_hi,
                         resolution_m_per_px=params.resolution_m_per_px,
                     )
                     ceiling_slice = ceiling_band_mod.slice_ceiling_band(
@@ -372,6 +687,12 @@ def run_vectorize(
 
                     if post_and == pre_and:
                         # Helper fell back — surface that explicitly.
+                        warnings.add(
+                            "ceiling_band_sparse", "slice",
+                            f"Ceiling-band gate skipped: intersection too "
+                            f"sparse ({ceiling_band_points:,} band points); "
+                            f"density mask used ungated",
+                        )
                         _emit(
                             job_id, "slice",
                             f"Ceiling band sparse ({ceiling_band_points:,} pts) "
@@ -387,6 +708,11 @@ def run_vectorize(
                             0.40,
                         )
                 except Exception as cb_err:
+                    warnings.add(
+                        "ceiling_band_failed", "slice",
+                        f"Ceiling-band slice failed ({cb_err}); density mask "
+                        f"used ungated",
+                    )
                     _emit(
                         job_id, "slice",
                         f"Ceiling-band slice skipped: {cb_err}",
@@ -441,7 +767,13 @@ def run_vectorize(
         # the gap-bridging CLOSE.  3-px elliptical kernel kills any cluster
         # smaller than ~3 px (≈ 3 cm at 1 cm/px) — that's isolated scanner
         # noise and furniture stippling, well below any real wall thickness.
+        # BricsCAD-style Gap close before vectors: heal dashed wall strokes
+        # in the density∩ceiling mask.  Default preprocess CLOSE is 3 px
+        # (~3 cm) — too small for this scan (~842 CCs).  Use ~9 px (~9 cm,
+        # ~½ interior wall) so findContours sees continuous wall ribbons.
         preprocess_params = preprocess.PreprocessParams(
+            close_kernel_px=9,
+            close_iterations=1,
             open_kernel_px=3 if params.remove_speckle else 0,
             open_iterations=1 if params.remove_speckle else 0,
         )
@@ -476,6 +808,11 @@ def run_vectorize(
                     simplify_eps_m=params.contour_simplify_eps_m,
                     min_perimeter_m=max(params.min_wall_length_m * 2, 0.30),
                     min_segment_length_m=max(params.min_wall_length_m * 0.20, 0.08),
+                    close_kernel_px=9,
+                    # Honour the existing merge_collinear flag — BricsCAD
+                    # OPTIMIZE equivalent (was previously a no-op on this path).
+                    merge_collinear=bool(params.merge_collinear),
+                    merge_endpoint_gap_m=max(params.snapping_distance_m, 0.60),
                 )
                 contour_result = walls_contour_mod.extract_wall_contours(
                     cleaned, slice_result.affine, params=contour_params,
@@ -488,12 +825,34 @@ def run_vectorize(
                     walls_contour_mod.contour_summary(contour_result),
                     0.65,
                 )
+                # Contour path still benefits from a light length filter so
+                # dust fragments don't drown pairing.  Full Hough regularize
+                # (Manhattan snap) is skipped — contours already carry
+                # correct angles from Douglas-Peucker.
+                if len(clean_segments) > 0:
+                    lens = np.linalg.norm(
+                        clean_segments[:, 1] - clean_segments[:, 0], axis=1,
+                    )
+                    keep = lens >= max(params.min_wall_length_m * 0.5, 0.20)
+                    clean_segments = clean_segments[keep]
+                segments_after_contour = int(len(clean_segments))
+                _emit(
+                    job_id, "regularize",
+                    f"Contour axes: {segments_detected} → {segments_after_contour} "
+                    f"after length filter (merge already applied in extractor)",
+                    0.72,
+                )
                 # Contour path has no "rejected" segments — every segment
                 # belongs to a kept contour by construction.  The downstream
                 # ghost-promotion code still expects a list, so we hand it
                 # an empty one rather than skipping the contract.
                 rejected_segments = []
             except Exception as cw_err:
+                warnings.add(
+                    "contour_walls_failed", "detect",
+                    f"Contour wall extraction failed ({cw_err}); fell back "
+                    f"to the legacy line detector",
+                )
                 _emit(
                     job_id, "detect",
                     f"Contour walls failed ({cw_err}) — falling back to "
@@ -527,6 +886,10 @@ def run_vectorize(
             elif params.detector.value == "fld":
                 seg_px = classical.detect_fld(cleaned, fld_params)
                 if len(seg_px) == 0:
+                    warnings.add(
+                        "fld_no_segments", "detect",
+                        "FLD detector returned no segments; fell back to Hough",
+                    )
                     _emit(job_id, "detect",
                           "FLD returned no segments — falling back to Hough", 0.58)
                     seg_px = classical.detect_hough(cleaned, hough_params)
@@ -549,6 +912,13 @@ def run_vectorize(
             reg_result = regularize.regularize_with_provenance(segments_world, reg_params)
             clean_segments = reg_result.kept
             rejected_segments = reg_result.rejected
+            if reg_result.manhattan_bailed:
+                warnings.add(
+                    "manhattan_bail", "regularize",
+                    "Manhattan filter would have dropped every segment "
+                    "(rotated or non-Manhattan building); segments kept "
+                    "unsnapped",
+                )
             _emit(
                 job_id, "regularize",
                 f"{int(len(clean_segments))} clean segments (from {segments_detected}, "
@@ -608,6 +978,11 @@ def run_vectorize(
                     0.82,
                 )
             except Exception as wp_err:
+                warnings.add(
+                    "wall_pairing_failed", "regularize",
+                    f"Wall-thickness pairing failed ({wp_err}); walls "
+                    f"emitted as unpaired centerlines",
+                )
                 _emit(
                     job_id, "regularize",
                     f"Wall pairing skipped: {wp_err}",
@@ -634,21 +1009,90 @@ def run_vectorize(
                     snapping_distance_m=params.snapping_distance_m,
                     wall_thickness_median_m=float(wall_pairing.median_thickness_m),
                 )
+                envelope_xy = (
+                    envelope_result.polygon_xy
+                    if envelope_result is not None else None
+                )
                 topology_result = topology_mod.build_topology(
                     wall_pairing.centerline_segments,
                     params=topology_params,
+                    envelope_xy=envelope_xy,
                 )
+                # Cloud2BIM: export finished wall axes (not pre-topology
+                # fragments).  Rebuild faces from the finished centerlines
+                # so the editor shows continuous CAD walls.
+                finished = topology_result.finished_wall_segments
+                if finished is not None and len(finished) > 0:
+                    wall_pairing = walls_mod.WallPairingResult(
+                        walls=wall_pairing.walls,
+                        face_segments=walls_mod.faces_from_centerlines(
+                            finished, wall_pairing.median_thickness_m,
+                        ),
+                        centerline_segments=finished,
+                        median_thickness_m=wall_pairing.median_thickness_m,
+                        n_paired=wall_pairing.n_paired,
+                        n_unpaired=wall_pairing.n_unpaired,
+                        n_orphans_dropped=wall_pairing.n_orphans_dropped,
+                    )
                 _emit(
                     job_id, "regularize",
                     topology_mod.topology_summary(topology_result),
                     0.84,
                 )
                 room_segments = topology_mod.rooms_to_segments(topology_result.rooms)
+                dangling = topology_mod.dangling_endpoints(topology_result)
+                # Persist open ends for the editor; clear when rooms closed so
+                # a prior failed run doesn't leave stale coral markers.
+                topology_mod.write_dangling_endpoints(
+                    result_dir,
+                    [] if topology_result.rooms else dangling,
+                )
+                if not topology_result.rooms:
+                    warnings.add(
+                        "rooms_not_closed", "regularize",
+                        "No enclosed rooms found from the wall network.  "
+                        "Close open wall ends in the editor (draw or drag "
+                        "endpoints until corners meet), then click "
+                        "Generate BOMA to produce floor geometry and the "
+                        "measurement report.",
+                    )
             except Exception as tp_err:
+                warnings.add(
+                    "room_inference_failed", "regularize",
+                    f"Room inference failed ({tp_err}); no room polygons "
+                    f"for this run",
+                )
                 _emit(
                     job_id, "regularize",
                     f"Room inference skipped: {tp_err}",
                     0.84,
+                )
+
+        # ── 6d. Per-room confidence (Phase 4) ────────────────────────────
+        # Boundary coverage against the observed raster + snap-correction
+        # magnitude, combined into one trust score per room.  Presentation
+        # only — never alters room geometry or areas.
+        room_confidences: list[room_confidence_mod.RoomConfidence] = []
+        if topology_result is not None and topology_result.rooms:
+            try:
+                room_confidences = room_confidence_mod.compute_room_confidences(
+                    topology_result.rooms,
+                    cleaned,
+                    slice_result.affine,
+                    detected_segments=wall_pairing.centerline_segments,
+                )
+                n_flagged = sum(1 for rc in room_confidences if rc.flagged)
+                if n_flagged:
+                    _emit(
+                        job_id, "regularize",
+                        f"Room confidence: {n_flagged} of "
+                        f"{len(room_confidences)} room(s) flagged for review",
+                        0.845,
+                    )
+            except Exception as rc_err:
+                _emit(
+                    job_id, "regularize",
+                    f"Room confidence scoring skipped: {rc_err}", 0.845,
                 )
 
         # ── 7. Overlay PNG ───────────────────────────────────────────────
@@ -708,6 +1152,7 @@ def run_vectorize(
         #     on the operator's chosen `elevation` knob).
         # Net: openings work on more scans, AND ~40 s faster.
         opening_segs: list[np.ndarray] = []
+        detected_openings: list[openings_mod.DetectedOpening] = []
         # v4 bug fix: the opening detector samples perpendicular to each
         # wall.  If we pass it the CONTOUR FACE segments (which sit on
         # either face of a real wall), the perpendicular band from the
@@ -745,12 +1190,18 @@ def run_vectorize(
                     params=op_params,
                 )
             except Exception as op_err:
+                warnings.add(
+                    "opening_detection_failed", "openings",
+                    f"Opening detection failed ({op_err}); no doors/gaps "
+                    f"for this run",
+                )
                 _emit(
                     job_id, "openings",
                     f"Opening detection failed: {op_err}", 0.92,
                 )
                 detected = []
 
+            detected_openings = list(detected)
             opening_segs = [d.seg for d in detected]
             _emit(
                 job_id, "openings",
@@ -1008,6 +1459,127 @@ def run_vectorize(
             json.dumps(rejected_payload, indent=2)
         )
 
+        # ── 8b. Canonical floor geometry + measurement report (Phase 1) ──
+        # Emit the standard-agnostic FloorGeometry, then run the pluggable
+        # measurement engine (BOMA Office 2024 A/B, REBNY, Gross) over it
+        # and persist a JSON + PDF report.  Guarded: measurement is a
+        # deliverable add-on, never a reason to fail the vectorize job.
+        floor_geometry_written = False
+        measurement_written = False
+        floor_validation_dict: dict | None = None
+        if topology_result is not None and topology_result.rooms:
+            try:
+                from ..geometry.adapters import floor_geometry_from_vectorize
+                from ..measurement import get_ruleset, list_rulesets
+                from ..measurement.report import (
+                    build_report,
+                    write_json_report,
+                    write_pdf_report,
+                )
+                _emit(job_id, "measure", "Building canonical floor geometry…", 0.935)
+                floor_geo = floor_geometry_from_vectorize(
+                    topology_result,
+                    wall_pairing,
+                    envelope_xy=(
+                        envelope_result.polygon_xy
+                        if envelope_result is not None else None
+                    ),
+                    openings=detected_openings,
+                    columns=column_objs,
+                    floor_id=job_id,
+                )
+                (result_dir / "floor_geometry.json").write_text(
+                    json.dumps(floor_geo.to_json_dict(), indent=2)
+                )
+                floor_geometry_written = True
+
+                # Phase 2: floor-closure validation — envelope vs rooms,
+                # perimeter closure, unscanned interior gaps > 2 m².
+                # Structured output, persisted next to the geometry.
+                from ..geometry.validation import validate_floor_closure
+                floor_validation = validate_floor_closure(floor_geo)
+                floor_validation_dict = floor_validation.to_json_dict()
+                (result_dir / "floor_validation.json").write_text(
+                    json.dumps(floor_validation_dict, indent=2)
+                )
+                if not floor_validation.passed:
+                    n_gaps = len(floor_validation.unscanned_gaps)
+                    gap_m2 = sum(
+                        g.area_m2 for g in floor_validation.unscanned_gaps
+                    )
+                    warnings.add(
+                        "floor_closure_failed", "measure",
+                        f"Floor-closure checks failed: "
+                        f"{len(floor_validation.warnings)} warning(s)"
+                        + (f", {n_gaps} unscanned gap(s) totalling "
+                           f"{gap_m2:.1f} m²" if n_gaps else "")
+                        + " — see floor_validation.json",
+                    )
+                    _emit(
+                        job_id, "measure",
+                        f"⚠ Floor-closure checks failed "
+                        f"({len(floor_validation.warnings)} warning(s)"
+                        + (f", {n_gaps} unscanned gap(s) totalling "
+                           f"{gap_m2:.1f} m²" if n_gaps else "")
+                        + ")",
+                        0.936,
+                    )
+
+                measurements = [
+                    get_ruleset(name).measure(floor_geo)
+                    for name in list_rulesets()
+                ]
+                report = build_report(floor_geo, measurements)
+                write_json_report(report, result_dir / "measurement_report.json")
+                write_pdf_report(report, result_dir / "measurement_report.pdf")
+                measurement_written = True
+                n_suites = len(measurements[0].suites) if measurements else 0
+                _emit(
+                    job_id, "measure",
+                    f"Measured {n_suites} suites under "
+                    f"{len(measurements)} standards (BOMA A/B, REBNY, Gross)",
+                    0.938,
+                )
+            except Exception as meas_err:
+                warnings.add(
+                    "measurement_failed", "measure",
+                    f"Measurement report failed ({meas_err}); no BOMA/REBNY "
+                    f"report for this run",
+                )
+                _emit(
+                    job_id, "measure",
+                    f"Measurement report skipped: {meas_err}", 0.938,
+                )
+
+        # ── 8c. Floor plan sheet (Phase 3): SVG + PDF + DXF dimensions ──
+        # Rendered from the canonical FloorGeometry.  Guarded like the
+        # measurement stage — a sheet failure never fails the job.
+        sheet_written = False
+        if floor_geometry_written:
+            try:
+                from ..sheet.dimensions import add_dimensions_to_dxf
+                from ..sheet.service import render_job_sheet
+                _emit(job_id, "sheet", "Rendering floor plan sheet…", 0.94)
+                sheet_render = render_job_sheet(result_dir, floor=floor_geo)
+                sheet_written = True
+                n_dims = add_dimensions_to_dxf(dxf_path, floor_geo)
+                _emit(
+                    job_id, "sheet",
+                    f"Sheet rendered at 1:{sheet_render.scale_denominator}"
+                    + (f" · {n_dims} dimensions added to DXF" if n_dims else ""),
+                    0.942,
+                )
+            except Exception as sheet_err:
+                warnings.add(
+                    "sheet_failed", "sheet",
+                    f"Sheet rendering failed ({sheet_err}); no sheet.svg/"
+                    f"sheet.pdf for this run",
+                )
+                _emit(
+                    job_id, "sheet",
+                    f"Sheet rendering skipped: {sheet_err}", 0.942,
+                )
+
         # ── 9. Persist metrics ──────────────────────────────────────────
         elapsed = time.time() - t0
         world_w = slice_result.affine.width_px * slice_result.affine.resolution_m_per_px
@@ -1047,6 +1619,26 @@ def run_vectorize(
                 int(topology_result.n_extended)
                 if topology_result is not None else 0
             ),
+            gaps_closed=(
+                int(topology_result.n_gaps_closed)
+                if topology_result is not None else 0
+            ),
+            envelope_projections=(
+                int(topology_result.n_envelope_projections)
+                if topology_result is not None else 0
+            ),
+            dangling_before=(
+                int(topology_result.n_dangling_before)
+                if topology_result is not None else 0
+            ),
+            dangling_after=(
+                int(topology_result.n_dangling_after)
+                if topology_result is not None else 0
+            ),
+            envelope_edges_injected=(
+                int(topology_result.n_envelope_edges_injected)
+                if topology_result is not None else 0
+            ),
             # v4 Phase A stats — voxel downsample + ceiling-band gate.
             points_after_downsample=points_after_downsample,
             downsample_voxel_m=(
@@ -1063,6 +1655,25 @@ def run_vectorize(
             contour_walls_detected=(
                 int(contour_walls_detected) if contour_walls_detected else None
             ),
+            # Phase 4: gravity re-level + adaptive band + room confidence.
+            gravity_relevel_applied=(
+                bool(relevel_applied) if relevel_tilt_deg is not None else None
+            ),
+            gravity_tilt_deg=(
+                float(relevel_tilt_deg) if relevel_tilt_deg is not None else None
+            ),
+            ceiling_clearance_m=(
+                float(band_plan.clearance_m)
+                if band_plan is not None and band_plan.clearance_m is not None
+                else None
+            ),
+            slice_band_adjusted=(
+                bool(band_plan.adjusted) if band_plan is not None else None
+            ),
+            rooms_flagged=(
+                sum(1 for rc in room_confidences if rc.flagged)
+                if room_confidences else None
+            ),
         )
 
         artifacts = {
@@ -1074,6 +1685,16 @@ def run_vectorize(
             "dxf": str(dxf_path),
             "segments_json": str(result_dir / "segments.json"),
         }
+        if floor_geometry_written:
+            artifacts["floor_geometry_json"] = str(result_dir / "floor_geometry.json")
+        if floor_validation_dict is not None:
+            artifacts["floor_validation_json"] = str(result_dir / "floor_validation.json")
+        if measurement_written:
+            artifacts["measurement_report_json"] = str(result_dir / "measurement_report.json")
+            artifacts["measurement_report_pdf"] = str(result_dir / "measurement_report.pdf")
+        if sheet_written:
+            artifacts["sheet_svg"] = str(result_dir / "sheet.svg")
+            artifacts["sheet_pdf"] = str(result_dir / "sheet.pdf")
         if opening_segs:
             artifacts["overlay_openings_png"] = str(artifact_dir / "overlay_openings.png")
         if column_objs:
@@ -1093,7 +1714,20 @@ def run_vectorize(
             "elevation_m": float(elevation),
             "axis_idx": int(axis_idx),
             "artifacts": artifacts,
+            # Phase 4: structured fallback warnings — one record per silent
+            # fallback that fired during this run (empty list = clean run).
+            "warnings": warnings.to_json_list(),
+            # Phase 4: per-room trust scores for the editor.
+            "room_confidence": [rc.to_json_dict() for rc in room_confidences],
         }
+        if relevel_transform is not None:
+            # The 4×4 that maps ORIGINAL scan coordinates to the releveled
+            # frame all outputs are expressed in.
+            result_payload["relevel_transform"] = [
+                [float(v) for v in row] for row in relevel_transform
+            ]
+        if floor_validation_dict is not None:
+            result_payload["floor_validation"] = floor_validation_dict
         (result_dir / "result.json").write_text(json.dumps(result_payload, indent=2))
 
         if on_complete is not None:
@@ -1122,16 +1756,20 @@ def _segments_world_to_pixels(
     segments_world: np.ndarray,
     affine: slicer.RasterAffine,
 ) -> np.ndarray:
-    """Inverse of :func:`classical.segments_pixels_to_world` for overlay rendering."""
+    """Inverse of :func:`classical.segments_pixels_to_world` for overlay rendering.
+
+    Pixel-centre convention: world = origin + (idx + 0.5) * res, so
+    idx = (world - origin) / res - 0.5, rounded to the nearest pixel.
+    """
     if len(segments_world) == 0:
         return np.zeros((0, 4), dtype=np.int32)
     res = affine.resolution_m_per_px
     seg = segments_world.astype(np.float64)
-    x1p = (seg[:, 0, 0] - affine.origin_x) / res
-    y1p = (seg[:, 0, 1] - affine.origin_y) / res
-    x2p = (seg[:, 1, 0] - affine.origin_x) / res
-    y2p = (seg[:, 1, 1] - affine.origin_y) / res
-    return np.stack([x1p, y1p, x2p, y2p], axis=1).astype(np.int32)
+    x1p = (seg[:, 0, 0] - affine.origin_x) / res - 0.5
+    y1p = (seg[:, 0, 1] - affine.origin_y) / res - 0.5
+    x2p = (seg[:, 1, 0] - affine.origin_x) / res - 0.5
+    y2p = (seg[:, 1, 1] - affine.origin_y) / res - 0.5
+    return np.rint(np.stack([x1p, y1p, x2p, y2p], axis=1)).astype(np.int32)
 
 
 async def run_vectorize_guarded(

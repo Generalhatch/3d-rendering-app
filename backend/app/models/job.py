@@ -22,8 +22,20 @@ class JobCreate(BaseModel):
     status: JobStatus
 
 
+def _identity_4x4() -> list[list[float]]:
+    return [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
 class AlignmentResultSchema(BaseModel):
-    transformation: list[list[float]]   # 4x4 as nested list
+    # 4x4 as nested list.  Defaults to identity so legacy / partial stored
+    # results (scan-only jobs written before the matrix was persisted) can
+    # still be loaded instead of failing job-detail reads.
+    transformation: list[list[float]] = Field(default_factory=_identity_4x4)
     residual_rmse: float = 0.0          # metres
     residual_rmse_mm: float = 0.0       # millimetres (convenience)
     confidence: float = 0.0             # 0.0 – 1.0

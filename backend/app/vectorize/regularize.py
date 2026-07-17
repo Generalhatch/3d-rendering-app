@@ -42,6 +42,26 @@ class RegularizeParams:
     merge_perpendicular_distance_m: float = 0.05    # max perp distance between two segments to merge
     merge_endpoint_gap_m: float = 0.30              # max endpoint-to-endpoint gap along the line
 
+    # ── Diagonal / curved wall protection (Phase 3.5) ──────────────────────
+    # Genuinely non-Manhattan geometry must survive regularization: the
+    # reference sheets preserve diagonal and curved facades faithfully.
+    keep_diagonal_min_length_m: float = 1.0
+    """Off-axis segments at least this long are KEPT unchanged instead of
+    being dropped by the Manhattan filter — a 5 m wall at 45° is a real
+    diagonal wall, not noise.  Shorter off-axis segments are still dropped
+    (unless part of a protected curve chain)."""
+
+    protect_curve_chains: bool = True
+    """Detect chains of end-to-end segments whose direction turns
+    progressively (chords of a curved wall) and exempt them from Manhattan
+    snapping entirely — snapping individual chords near the axes would
+    flatten the curve into a staircase."""
+
+    curve_chain_endpoint_tol_m: float = 0.15
+    curve_chain_min_segments: int = 3
+    curve_chain_min_step_deg: float = 2.0
+    curve_chain_max_step_deg: float = 30.0
+
 
 @dataclass
 class RejectedSegment:
@@ -66,6 +86,11 @@ class RejectedSegment:
 class RegularizeResult:
     kept: np.ndarray                          # (M, 2, 2)
     rejected: list[RejectedSegment] = field(default_factory=list)
+    # True when the Manhattan filter would have dropped EVERY segment and
+    # bailed out, returning the input unchanged (highly rotated or
+    # non-Manhattan building).  Surfaced as a structured pipeline warning —
+    # previously this fallback was completely silent.
+    manhattan_bailed: bool = False
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -97,6 +122,7 @@ def regularize_with_provenance(
         return RegularizeResult(kept=segments, rejected=[])
 
     rejected: list[RejectedSegment] = []
+    manhattan_bailed = False
     out = segments.astype(np.float64).copy()
 
     # Stage 1: drop short
@@ -105,14 +131,29 @@ def regularize_with_provenance(
     if len(out) == 0:
         return RegularizeResult(kept=out, rejected=rejected)
 
-    # Stage 2: Manhattan snap
+    # Stage 2: Manhattan snap (with diagonal / curve-chain protection)
     if params.manhattan_snap:
-        out, manhattan_rejected = _snap_to_manhattan_with_provenance(
-            out, params.manhattan_tolerance_deg,
+        protected: set[int] = set()
+        if params.protect_curve_chains:
+            protected = find_curve_chain_indices(
+                out,
+                endpoint_tol_m=params.curve_chain_endpoint_tol_m,
+                min_segments=params.curve_chain_min_segments,
+                min_step_deg=params.curve_chain_min_step_deg,
+                max_step_deg=params.curve_chain_max_step_deg,
+            )
+        out, manhattan_rejected, manhattan_bailed = (
+            _snap_to_manhattan_with_provenance(
+                out, params.manhattan_tolerance_deg,
+                protected_indices=protected,
+                keep_diagonal_min_length_m=params.keep_diagonal_min_length_m,
+            )
         )
         rejected.extend(manhattan_rejected)
         if len(out) == 0:
-            return RegularizeResult(kept=out, rejected=rejected)
+            return RegularizeResult(
+                kept=out, rejected=rejected, manhattan_bailed=manhattan_bailed,
+            )
 
     # Stage 3: merge collinear
     if params.merge_collinear:
@@ -124,7 +165,9 @@ def regularize_with_provenance(
         )
         rejected.extend(merged_rejected)
 
-    return RegularizeResult(kept=out, rejected=rejected)
+    return RegularizeResult(
+        kept=out, rejected=rejected, manhattan_bailed=manhattan_bailed,
+    )
 
 
 def _segment_length_angle(seg: np.ndarray) -> tuple[float, float]:
@@ -225,19 +268,144 @@ def snap_to_manhattan(
     return np.stack(kept, axis=0)
 
 
+def find_curve_chain_indices(
+    segments: np.ndarray,
+    endpoint_tol_m: float = 0.15,
+    min_segments: int = 3,
+    min_step_deg: float = 2.0,
+    max_step_deg: float = 30.0,
+) -> set[int]:
+    """Indices of segments that are chords of a curved wall.
+
+    A curved wall sliced into short chords appears as a chain of
+    end-to-end segments whose direction turns progressively — a small,
+    consistent-sign angle step from each chord to the next.  Snapping the
+    near-axis chords of such a chain to the Manhattan axes would flatten
+    the curve into a staircase, so these chains are exempted.
+
+    Detection: build endpoint-adjacency chains (segments joined end to end
+    within ``endpoint_tol_m``, path nodes only — junction segments with
+    3+ neighbours break chains), orient directions along each walk, and
+    protect every maximal run of ≥ ``min_segments`` segments whose
+    consecutive direction deltas all share one sign and lie within
+    ``[min_step_deg, max_step_deg]``.  A rectangle (±90° steps) or a long
+    straight run (~0° steps) never qualifies.
+    """
+    n = len(segments)
+    if n < min_segments:
+        return set()
+
+    ends = segments.reshape(n, 2, 2)
+    tol_sq = endpoint_tol_m * endpoint_tol_m
+
+    # adjacency[i] = list of (j, end_of_i, end_of_j) sharing an endpoint.
+    adjacency: dict[int, list[tuple[int, int, int]]] = {i: [] for i in range(n)}
+    for i in range(n):
+        for j in range(i + 1, n):
+            for ei in (0, 1):
+                for ej in (0, 1):
+                    d = ends[i, ei] - ends[j, ej]
+                    if float(d @ d) <= tol_sq:
+                        adjacency[i].append((j, ei, ej))
+                        adjacency[j].append((i, ej, ei))
+
+    # Path nodes only: a segment meeting 3+ others is a junction, not a
+    # curve chord link — chains break there.
+    degree = {i: len(adjacency[i]) for i in range(n)}
+
+    protected: set[int] = set()
+    visited: set[int] = set()
+    for start in range(n):
+        if start in visited:
+            continue
+        if degree[start] > 2:
+            visited.add(start)          # junction segment: never a chord
+            continue
+        if degree[start] == 2:
+            continue                    # mid-chain: reached from an end
+
+        # degree 0 or 1 → walk the chain from this end.
+        path: list[int] = [start]
+        dirs: list[np.ndarray] = []
+        visited.add(start)
+        cur = start
+        entry_end: int | None = None    # which end of `cur` we entered through
+        while True:
+            nbrs = [
+                (j, ei, ej) for j, ei, ej in adjacency[cur]
+                if j not in visited and degree[j] <= 2
+                and (entry_end is None or ei != entry_end)
+            ]
+            if not nbrs:
+                break
+            j, ei, ej = nbrs[0]
+            # Direction of `cur` oriented toward the shared endpoint.
+            d_cur = ends[cur, ei] - ends[cur, 1 - ei]
+            dirs.append(d_cur / max(float(np.hypot(*d_cur)), 1e-12))
+            path.append(j)
+            visited.add(j)
+            cur = j
+            entry_end = ej
+        if entry_end is not None:
+            # Final segment: oriented away from its entry endpoint.
+            d_last = ends[cur, 1 - entry_end] - ends[cur, entry_end]
+            dirs.append(d_last / max(float(np.hypot(*d_last)), 1e-12))
+
+        if len(path) < min_segments or len(dirs) != len(path):
+            continue
+
+        # Signed direction delta from each chord to the next.
+        steps: list[float] = []
+        for a, b in zip(dirs[:-1], dirs[1:]):
+            cross = float(a[0] * b[1] - a[1] * b[0])
+            dot = float(a @ b)
+            steps.append(float(np.degrees(np.arctan2(cross, dot))))
+
+        qualifies = [min_step_deg <= abs(s) <= max_step_deg for s in steps]
+
+        # Protect every maximal run of qualifying, same-sign steps that
+        # covers ≥ min_segments segments (a run of L steps spans L+1
+        # segments).
+        run_start = 0
+        for k in range(len(steps) + 1):
+            run_continues = (
+                k < len(steps)
+                and qualifies[k]
+                and (k == run_start or np.sign(steps[k]) == np.sign(steps[k - 1]))
+            )
+            if run_continues:
+                continue
+            if k > run_start and (k - run_start) + 1 >= min_segments:
+                protected.update(path[run_start:k + 1])
+            run_start = k if (k < len(steps) and qualifies[k]) else k + 1
+
+    return protected
+
+
 def _snap_to_manhattan_with_provenance(
     segments: np.ndarray,
     tolerance_deg: float = 12.0,
-) -> tuple[np.ndarray, list[RejectedSegment]]:
+    protected_indices: set[int] | None = None,
+    keep_diagonal_min_length_m: float = 0.0,
+) -> tuple[np.ndarray, list[RejectedSegment], bool]:
     """Provenance-aware ``snap_to_manhattan``.
 
-    Returns ``(snapped_kept, dropped)`` where ``dropped`` are the segments
-    that were too far from either dominant axis.  Snapped survivors are
-    returned in their snapped (axis-aligned) form, matching the legacy
-    behaviour.
+    Returns ``(snapped_kept, dropped, bailed)`` where ``dropped`` are the
+    segments that were too far from either dominant axis and ``bailed`` is
+    True when the filter would have wiped every segment and returned the
+    input unchanged instead.  Snapped survivors are returned in their
+    snapped (axis-aligned) form, matching the legacy behaviour, with two
+    Phase 3.5 protections:
+
+    - ``protected_indices`` (curve chords) pass through UNSNAPPED — never
+      rotated, never dropped.
+    - Off-axis segments of at least ``keep_diagonal_min_length_m`` pass
+      through unsnapped instead of being dropped (a long diagonal is a
+      real wall, not noise).
     """
     if len(segments) == 0:
-        return segments, []
+        return segments, [], False
+    protected_indices = protected_indices or set()
 
     deltas = segments[:, 1, :] - segments[:, 0, :]
     lengths = np.linalg.norm(deltas, axis=1)
@@ -255,7 +423,11 @@ def _snap_to_manhattan_with_provenance(
     kept: list[np.ndarray] = []
     rejected: list[RejectedSegment] = []
 
-    for seg, ang, length in zip(segments, angles, lengths):
+    for idx, (seg, ang, length) in enumerate(zip(segments, angles, lengths)):
+        if idx in protected_indices:
+            kept.append(seg.copy())     # curve chord: pass through untouched
+            continue
+
         d_dom = _diff(ang, dominant_angle)
         d_perp = _diff(ang, perp_angle)
 
@@ -263,6 +435,12 @@ def _snap_to_manhattan_with_provenance(
             snap_angle_rad = np.deg2rad(dominant_angle)
         elif d_perp <= tolerance_deg:
             snap_angle_rad = np.deg2rad(perp_angle)
+        elif (
+            keep_diagonal_min_length_m > 0.0
+            and length >= keep_diagonal_min_length_m
+        ):
+            kept.append(seg.copy())     # genuine diagonal wall: keep as-is
+            continue
         else:
             rejected.append(RejectedSegment(
                 seg=seg.copy(),
@@ -283,9 +461,10 @@ def _snap_to_manhattan_with_provenance(
 
     if not kept:
         # Bail out: filter wiped everything → return original input, drop
-        # the rejection list (legacy behaviour matched).
-        return segments, []
-    return np.stack(kept, axis=0), rejected
+        # the rejection list (legacy behaviour matched).  The ``bailed``
+        # flag lets the pipeline surface this as a structured warning.
+        return segments, [], True
+    return np.stack(kept, axis=0), rejected, False
 
 
 def merge_collinear_segments(

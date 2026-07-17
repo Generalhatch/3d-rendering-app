@@ -179,8 +179,9 @@ def detect_openings(
             for k in range(-perp_band_px, perp_band_px + 1):
                 px_world_x = sx + nx * (k * res)
                 px_world_y = sy + ny * (k * res)
-                col = int(round((px_world_x - affine.origin_x) / res))
-                row = int(round((px_world_y - affine.origin_y) / res))
+                # Pixel-centre convention: idx = (world - origin) / res - 0.5.
+                col = int(round((px_world_x - affine.origin_x) / res - 0.5))
+                row = int(round((px_world_y - affine.origin_y) / res - 0.5))
                 if 0 <= col < w and 0 <= row < h and cleaned_raster[row, col] > 0:
                     count += 1
                     if count >= params.min_support_pixels:

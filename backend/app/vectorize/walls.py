@@ -365,7 +365,33 @@ def _build_unpaired_wall(
     )
 
 
-# ── Reporting helpers ────────────────────────────────────────────────────────
+def faces_from_centerlines(
+    centerlines: np.ndarray,
+    thickness_m: float,
+) -> np.ndarray:
+    """Emit double-line faces for already-finished centerlines.
+
+    Used after topology finishes wall axes (Cloud2BIM § 2.8) so the editor
+    / DXF show continuous CAD walls instead of the pre-snap fragments.
+    """
+    segs = np.asarray(centerlines, dtype=float).reshape(-1, 2, 2)
+    if len(segs) == 0:
+        return np.zeros((0, 2, 2), dtype=np.float64)
+    thick = max(float(thickness_m), 0.05)
+    faces: list[np.ndarray] = []
+    for seg in segs:
+        d = seg[1] - seg[0]
+        L = float(np.linalg.norm(d))
+        if L < 1e-9:
+            continue
+        direction = d / L
+        wall = _build_unpaired_wall(seg, direction, thickness=thick)
+        faces.append(wall.face_a)
+        faces.append(wall.face_b)
+    if not faces:
+        return np.zeros((0, 2, 2), dtype=np.float64)
+    return np.stack(faces, axis=0)
+
 
 def pairing_summary(result: WallPairingResult) -> str:
     """One-line human-readable summary for SSE progress."""

@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     cleanup_enabled: bool = True           # run automatic cleanup on startup + every 24 h
     cleanup_max_age_days: int = 30         # remove upload files for jobs older than this
     cleanup_uploads_only: bool = True      # if True, only raw uploads are removed (artifacts/results kept)
+    # Size cap (GiB) for disposable derived data: artifacts/ + the downsample
+    # cache.  Least-recently-accessed entries are evicted first until under
+    # the cap.  results/ deliverables and uploads/ raw scans are never
+    # evicted by the cap.  <= 0 disables.
+    storage_cap_gb: float = 20.0
 
     @property
     def cors_origins_list(self) -> list[str]:

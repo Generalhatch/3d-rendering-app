@@ -19,27 +19,50 @@ def write_aligned_json(
 
 def write_aligned_dxf(
     original_dxf_path: Path,
-    transformation: np.ndarray,   # 4x4
+    transformation: np.ndarray,   # 4x4, column-vector convention (v' = T @ v)
     output_path: Path,
 ) -> Path:
-    """Write a DXF with all entities transformed by the alignment matrix.
+    """Write a DXF with all modelspace entities transformed by the alignment matrix.
 
-    The original plan entities are unchanged; a new layer "SCAN_OUTLINE"
-    is added with the transformed scan footprint bounding box.
-    (Full scan-point DXF export is deferred to v2.)
+    The 4x4 ``transformation`` (numpy column-vector convention) is converted
+    to an :class:`ezdxf.math.Matrix44` and applied to every entity that
+    supports transformation.  Entities that cannot be transformed (rare —
+    e.g. malformed proxies) are left in place and counted in the meta note.
     """
     import ezdxf
+    from ezdxf.math import Matrix44
 
     doc = ezdxf.readfile(str(original_dxf_path))
     msp = doc.modelspace()
 
-    # Store the alignment matrix as a XDATA / DICTIONARY entry for traceability
-    doc.layers.new("ALIGNAI_META", dxfattribs={"color": 7})
-    xdata_text = json.dumps({"transformation": transformation.tolist()})
+    # ezdxf's Matrix44 uses the row-vector convention (v' = v @ M), so the
+    # numpy column-vector matrix must be transposed.
+    m44 = Matrix44(np.asarray(transformation, dtype=np.float64).T.flatten())
 
-    # Add a note entity with the matrix — useful for downstream CAD tools
+    n_transformed = 0
+    n_skipped = 0
+    is_identity = np.allclose(transformation, np.eye(4))
+    if not is_identity:
+        for entity in list(msp):
+            try:
+                entity.transform(m44)
+                n_transformed += 1
+            except Exception:
+                # NotImplementedError / NonUniformScalingError / malformed
+                # entities — leave untouched rather than aborting the export.
+                n_skipped += 1
+
+    # Traceability note (added AFTER the transform so it stays at the origin
+    # on its own meta layer).
+    if "ALIGNAI_META" not in doc.layers:
+        doc.layers.new("ALIGNAI_META", dxfattribs={"color": 7})
+    note = (
+        f"AlignAI alignment applied to {n_transformed} entities"
+        + (f" ({n_skipped} skipped)" if n_skipped else "")
+        + " — see JSON export for full matrix"
+    )
     msp.add_text(
-        f"AlignAI alignment: see JSON export for full matrix",
+        note,
         dxfattribs={
             "insert": (0, 0, 0),
             "height": 0.1,

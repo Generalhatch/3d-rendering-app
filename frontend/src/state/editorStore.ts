@@ -281,7 +281,20 @@ const initialState = {
   mode: 'select' as EditorMode,
   drawLayer: 'walls' as SegmentLayer,
   layerVisibility: {
-    walls: true, openings: true, windows: true, columns: true,
+    // Centerlines stay off when faces exist — EditorSurface / loadSegments
+    // demote `walls` so the canvas shows CAD double-lines, not triple ribbons.
+    walls: false,
+    walls_faces: true,
+    openings: true,
+    windows: true,
+    columns: true,
+    // Exterior shell (envelope hull) is opt-in — often a bad scribble when
+    // rooms_detected === 0.  EditorSurface forces this off when rooms aren't
+    // closed; power users can re-enable via the Layers pill.
+    walls_exterior: false,
+    // Room rings are opt-in until topology emits isoperimetric-clean faces
+    // (Phase 3).  Spiky orange garbage was default-on and misleading.
+    rooms: false,
   } as Record<SegmentLayer, boolean>,
   originalSegments: [] as EditorSegment[],
   showOriginal: false,
@@ -325,12 +338,14 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
   loadSegments: (segments) => {
     const fresh = segments.map((s) => ({ ...s, status: 'active' as const }));
-    set({
+    const hasFaces = fresh.some((s) => s.layer === 'walls_faces');
+    const hasCenterlines = fresh.some((s) => s.layer === 'walls');
+    set((s) => ({
       segments: fresh,
       // Snapshot the just-loaded segments so "Show original" can render the
       // pre-edit pipeline output behind the operator's working set.  We deep-
       // copy because the active list will mutate in place over time.
-      originalSegments: fresh.map((s) => ({ ...s })),
+      originalSegments: fresh.map((seg) => ({ ...seg })),
       selectedIds: new Set<string>(),
       hoverId: null,
       editLog: [],
@@ -341,7 +356,15 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       measurement: null,
       measureAnchor: null,
       autoSaveError: null,
-    });
+      // Prefer double-line faces over centerlines when both exist — showing
+      // both is the triple-green "loop" look.  If only centerlines exist
+      // (legacy / unpaired-only), keep walls visible.
+      layerVisibility: {
+        ...s.layerVisibility,
+        walls_faces: hasFaces ? true : (s.layerVisibility.walls_faces ?? true),
+        walls: hasFaces ? false : hasCenterlines,
+      },
+    }));
   },
 
   reset: () =>

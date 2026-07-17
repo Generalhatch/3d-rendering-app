@@ -25,10 +25,23 @@ interface Props {
   onFindDuplicates: () => void;
   /** True while the duplicate-finder request is in flight. */
   finding: boolean;
+  /** Rebuild floor geometry + BOMA from the current wall network. */
+  onGenerateBoma: () => void;
+  generatingBoma: boolean;
+  /** True when the job already has a measurement report (button still re-runs). */
+  hasMeasurementReport: boolean;
+  /** True when exterior shell is unreliable (rooms not closed) — demote label. */
+  exteriorUnreliable?: boolean;
+  /** True when walls exist but rooms aren't closed — show close-gaps hint. */
+  showCloseGapsHint?: boolean;
+  /** Count of dangling wall endpoints (for the close-gaps hint). */
+  danglingCount?: number;
 }
 
 export function EditorToolbar({
   saving, onSave, lastSavedVersion, dirty, segmentCounts, onFindDuplicates, finding,
+  onGenerateBoma, generatingBoma, hasMeasurementReport,
+  exteriorUnreliable = false, showCloseGapsHint = false, danglingCount = 0,
 }: Props) {
   const undo = useEditorStore((s) => s.undo);
   const redo = useEditorStore((s) => s.redo);
@@ -117,12 +130,19 @@ export function EditorToolbar({
           const style = styleForLayer(layer);
           const n = segmentCounts.byLayer?.[layer] ?? 0;
           const visible = layerVisibility[layer] !== false;
+          const isExterior = layer === 'walls_exterior';
+          const label = isExterior && exteriorUnreliable
+            ? 'Exterior shell (unreliable)'
+            : style.label;
+          const title = isExterior && exteriorUnreliable
+            ? `Envelope hull is unreliable until rooms close — currently ${visible ? 'shown' : 'hidden'} (${n} segments). Opt-in for power users.`
+            : `Toggle ${style.label} visibility — currently ${visible ? 'shown' : 'hidden'} (${n} segments)`;
           return (
             <button
               key={`vis-${layer}`}
               onClick={() => toggleLayerVisible(layer)}
               disabled={n === 0 && layer !== 'walls' && layer !== 'openings'}
-              title={`Toggle ${style.label} visibility — currently ${visible ? 'shown' : 'hidden'} (${n} segments)`}
+              title={title}
               className={`px-2 py-0.5 rounded text-[11px] font-medium border transition-all ${
                 visible
                   ? 'text-gray-100'
@@ -134,11 +154,19 @@ export function EditorToolbar({
                 color: style.color,
               } : undefined}
             >
-              {style.label} <span className="opacity-60">·{n}</span>
+              {label} <span className="opacity-60">·{n}</span>
             </button>
           );
         })}
       </div>
+
+      {showCloseGapsHint && (
+        <div className="rounded-lg bg-amber-950/90 backdrop-blur-sm border border-amber-700/80 px-3 py-1.5 text-[11px] text-amber-100 max-w-md">
+          Close open wall ends
+          {danglingCount > 0 ? ` (${danglingCount} open)` : ''}
+          {' '}→ Generate BOMA. Green walls + scan underlay are the trusted draft.
+        </div>
+      )}
 
       {/* Tool selector + draw-layer selector + ghosts + duplicates + measure — the "fly-through" row */}
       <div className="rounded-lg bg-gray-900/85 backdrop-blur-sm border border-gray-700 p-1 flex items-center gap-1">
@@ -247,15 +275,38 @@ export function EditorToolbar({
       <div className="rounded-lg bg-gray-900/85 backdrop-blur-sm border border-gray-700 p-1 flex items-center gap-2">
         <button
           onClick={onSave}
-          disabled={saving || !dirty}
+          disabled={saving || !dirty || generatingBoma}
           className={`
             px-3 py-1.5 rounded text-xs font-semibold transition-colors
-            ${dirty && !saving
+            ${dirty && !saving && !generatingBoma
               ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
               : 'bg-gray-800 text-gray-500 cursor-not-allowed'}
           `}
         >
           {saving ? 'Saving…' : '💾 Save & Re-export DXF'}
+        </button>
+        <button
+          onClick={onGenerateBoma}
+          disabled={generatingBoma || saving || (segmentCounts.byLayer?.walls ?? 0) < 3}
+          title={
+            (segmentCounts.byLayer?.walls ?? 0) < 3
+              ? 'Need at least 3 active walls to form rooms'
+              : hasMeasurementReport
+                ? 'Re-run topology + BOMA from the current wall network'
+                : 'Close open wall ends, then generate floor geometry + BOMA'
+          }
+          className={`
+            px-3 py-1.5 rounded text-xs font-semibold transition-colors
+            ${!generatingBoma && !saving && (segmentCounts.byLayer?.walls ?? 0) >= 3
+              ? 'bg-amber-600 hover:bg-amber-500 text-white'
+              : 'bg-gray-800 text-gray-500 cursor-not-allowed'}
+          `}
+        >
+          {generatingBoma
+            ? 'Generating BOMA…'
+            : hasMeasurementReport
+              ? '↻ Re-generate BOMA'
+              : 'Generate BOMA'}
         </button>
         <span className="text-[11px] text-gray-500 pr-2">
           {dirty

@@ -26,6 +26,8 @@ dependencies = [
     "httpx>=0.27.0",
     "matplotlib>=3.8.0",
     "Pillow>=10.3.0",
+    "svglib>=1.5.0",
+    "reportlab>=4.0.0",
 ]
 
 [project.optional-dependencies]
